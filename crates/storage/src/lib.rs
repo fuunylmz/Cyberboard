@@ -26,14 +26,21 @@ pub const EIGHTH_MIGRATION: &str =
 pub const NINTH_MIGRATION_NAME: &str = "0009_agent_registration_token_lifecycle.sql";
 pub const NINTH_MIGRATION: &str =
     include_str!("../../../deploy/migrations/0009_agent_registration_token_lifecycle.sql");
+pub const TENTH_MIGRATION_NAME: &str = "0010_subscription_token_lifecycle.sql";
+pub const TENTH_MIGRATION: &str =
+    include_str!("../../../deploy/migrations/0010_subscription_token_lifecycle.sql");
+pub const ELEVENTH_MIGRATION_NAME: &str = "0011_agent_releases.sql";
+pub const ELEVENTH_MIGRATION: &str =
+    include_str!("../../../deploy/migrations/0011_agent_releases.sql");
 
 #[cfg(test)]
 mod tests {
     use super::{
-        EIGHTH_MIGRATION, EIGHTH_MIGRATION_NAME, FIFTH_MIGRATION, FOURTH_MIGRATION,
-        INITIAL_MIGRATION, INITIAL_MIGRATION_NAME, NINTH_MIGRATION, NINTH_MIGRATION_NAME,
-        SECOND_MIGRATION, SECOND_MIGRATION_NAME, SEVENTH_MIGRATION, SEVENTH_MIGRATION_NAME,
-        SIXTH_MIGRATION, THIRD_MIGRATION, THIRD_MIGRATION_NAME,
+        EIGHTH_MIGRATION, EIGHTH_MIGRATION_NAME, ELEVENTH_MIGRATION, ELEVENTH_MIGRATION_NAME,
+        FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, INITIAL_MIGRATION_NAME,
+        NINTH_MIGRATION, NINTH_MIGRATION_NAME, SECOND_MIGRATION, SECOND_MIGRATION_NAME,
+        SEVENTH_MIGRATION, SEVENTH_MIGRATION_NAME, SIXTH_MIGRATION, TENTH_MIGRATION,
+        TENTH_MIGRATION_NAME, THIRD_MIGRATION, THIRD_MIGRATION_NAME,
     };
 
     #[test]
@@ -117,5 +124,13 @@ mod tests {
             "0009_agent_registration_token_lifecycle.sql"
         );
         assert!(NINTH_MIGRATION.contains("agent_registration_token_expires_at"));
+        assert_eq!(
+            TENTH_MIGRATION_NAME,
+            "0010_subscription_token_lifecycle.sql"
+        );
+        assert!(TENTH_MIGRATION.contains("subscription_token_hash"));
+        assert_eq!(ELEVENTH_MIGRATION_NAME, "0011_agent_releases.sql");
+        assert!(ELEVENTH_MIGRATION.contains("agent_releases"));
+        assert!(ELEVENTH_MIGRATION.contains("agent_upgrade_results"));
     }
 }

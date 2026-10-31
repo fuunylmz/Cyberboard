@@ -305,7 +305,24 @@ impl AgentControl for AgentControlService {
             .map_err(|_| Status::invalid_argument("node_id is invalid"))?;
         self.authenticated(&request.agent_id, node_id, &request.agent_public_key)
             .await?;
-        Ok(Response::new(ReleaseManifestResponse::default()))
+        let Some(database) = &self.database else {
+            return Ok(Response::new(ReleaseManifestResponse::default()));
+        };
+        let Some(release) = database
+            .active_agent_release(self.tenant_id)
+            .await
+            .map_err(|_| Status::internal("release manifest lookup failed"))?
+        else {
+            return Ok(Response::new(ReleaseManifestResponse::default()));
+        };
+        Ok(Response::new(ReleaseManifestResponse {
+            version: release.version,
+            artifact_url: release.artifact_url,
+            sha256: release.sha256,
+            signature: release.signature,
+            signing_key_id: release.signing_key_id,
+            mandatory: release.mandatory,
+        }))
     }
 
     async fn report_upgrade_result(
@@ -317,6 +334,20 @@ impl AgentControl for AgentControlService {
             .map_err(|_| Status::invalid_argument("node_id is invalid"))?;
         self.authenticated(&request.agent_id, node_id, &request.agent_public_key)
             .await?;
+        if let Some(database) = &self.database {
+            database
+                .record_agent_upgrade_result(
+                    self.tenant_id,
+                    node_id,
+                    &request.agent_id,
+                    &request.target_version,
+                    request.success,
+                    (!request.error_code.is_empty()).then_some(request.error_code.as_str()),
+                    (!request.error_message.is_empty()).then_some(request.error_message.as_str()),
+                )
+                .await
+                .map_err(|_| Status::internal("upgrade result persistence failed"))?;
+        }
         Ok(Response::new(Ack {
             request_id: Uuid::new_v4().to_string(),
             accepted: true,
@@ -422,5 +453,23 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn release_manifest_is_explicitly_empty_when_unconfigured() {
+        let (service, node_id, agent_id) = registered().await;
+        let response = service
+            .get_release_manifest(Request::new(GetReleaseManifestRequest {
+                agent_id,
+                node_id: node_id.to_string(),
+                current_agent_version: "0.1.0".to_owned(),
+                agent_public_key: "test-public-key".to_owned(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.version.is_empty());
+        assert!(response.artifact_url.is_empty());
+        assert!(!response.mandatory);
     }
 }

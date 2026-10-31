@@ -1335,6 +1335,58 @@ fn subscription_summary_owned(
     }
 }
 
+fn new_subscription_token() -> String {
+    format!("cb_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+async fn rotate_my_subscription_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
+    if let Err(response) = require_portal_auth(&state, &headers) {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    let token = new_subscription_token();
+    match database
+        .rotate_subscription_token(
+            state.config.tenant_id,
+            identity.user_id,
+            &token,
+            &cyberboard_database::hash_session_token(&token),
+        )
+        .await
+    {
+        Ok(Some(record)) => Json(subscription_summary_owned(record, true)).into_response(),
+        Ok(None) => not_found_response("当前没有可轮换的生效订阅"),
+        Err(_) => internal_database_response(),
+    }
+}
+
+async fn revoke_my_subscription_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
+    if let Err(response) = require_portal_auth(&state, &headers) {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    match database
+        .revoke_subscription_token(state.config.tenant_id, identity.user_id)
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => not_found_response("当前没有可撤销的生效订阅"),
+        Err(_) => internal_database_response(),
+    }
+}
+
 async fn admin_plans(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2501,6 +2553,8 @@ async fn openapi() -> Json<Value> {
             "/api/v1/portal/subscription": {
                 "get": { "operationId": "getPortalSubscription", "security": [{"portalBearerAuth": []}], "responses": { "200": { "description": "Current portal subscription", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SubscriptionSummary" } } } }, "401": { "description": "Invalid portal token" }, "404": { "description": "No active subscription" }, "503": { "description": "Database unavailable" } } }
             },
+            "/api/v1/me/subscription-token/rotate": { "post": { "operationId":"rotateMySubscriptionToken", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Rotated subscription token","content":{"application/json":{"schema":{"$ref":"#/components/schemas/SubscriptionSummary"}}}},"401":{"description":"Invalid portal token"},"404":{"description":"No active subscription"},"503":{"description":"Database unavailable"}} } },
+            "/api/v1/me/subscription-token/revoke": { "delete": { "operationId":"revokeMySubscriptionToken", "security":[{"portalBearerAuth":[]}], "responses":{"204":{"description":"Subscription revoked"},"401":{"description":"Invalid portal token"},"404":{"description":"No active subscription"},"503":{"description":"Database unavailable"}} } },
             "/api/v1/portal/usage": {
                 "get": { "operationId": "getPortalUsage", "security": [{"portalBearerAuth": []}], "responses": { "200": { "description": "Current portal usage", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PortalUsage" } } } }, "401": { "description": "Invalid portal token" }, "404": { "description": "No usage available" }, "503": { "description": "Database unavailable" } } }
             },
@@ -2732,6 +2786,14 @@ fn router(state: AppState) -> Router {
 
     let portal = Router::new()
         .route("/api/v1/portal/subscription", get(portal_subscription))
+        .route(
+            "/api/v1/me/subscription-token/rotate",
+            post(rotate_my_subscription_token),
+        )
+        .route(
+            "/api/v1/me/subscription-token/revoke",
+            delete(revoke_my_subscription_token),
+        )
         .route("/api/v1/portal/usage", get(portal_usage))
         .route("/api/v1/me/plans", get(me_plans))
         .route("/api/v1/me/orders", get(me_orders).post(create_my_order))
@@ -3206,6 +3268,25 @@ mod tests {
         ] {
             let (status, _, body) =
                 get_json(path, Some("Bearer cyberboard-portal-dev-token")).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body["code"], "database_unavailable");
+        }
+
+        for request in [
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/me/subscription-token/rotate")
+                .header(header::AUTHORIZATION, "Bearer cyberboard-portal-dev-token")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/me/subscription-token/revoke")
+                .header(header::AUTHORIZATION, "Bearer cyberboard-portal-dev-token")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let (status, _, body) = request_json(request).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(body["code"], "database_unavailable");
         }

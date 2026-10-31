@@ -7,8 +7,9 @@
 use std::time::Duration;
 
 use cyberboard_storage::{
-    EIGHTH_MIGRATION, FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, NINTH_MIGRATION,
-    SECOND_MIGRATION, SEVENTH_MIGRATION, SIXTH_MIGRATION, THIRD_MIGRATION,
+    EIGHTH_MIGRATION, ELEVENTH_MIGRATION, FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION,
+    NINTH_MIGRATION, SECOND_MIGRATION, SEVENTH_MIGRATION, SIXTH_MIGRATION, TENTH_MIGRATION,
+    THIRD_MIGRATION,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -316,6 +317,36 @@ impl Database {
                 .await?;
             sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
                 .bind("0009_agent_registration_token_lifecycle")
+                .execute(&mut *transaction)
+                .await?;
+        }
+
+        let tenth: Option<String> =
+            sqlx::query_scalar("SELECT version FROM cyberboard_schema_migrations WHERE version=$1")
+                .bind("0010_subscription_token_lifecycle")
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if tenth.is_none() {
+            sqlx::raw_sql(TENTH_MIGRATION)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
+                .bind("0010_subscription_token_lifecycle")
+                .execute(&mut *transaction)
+                .await?;
+        }
+
+        let eleventh: Option<String> =
+            sqlx::query_scalar("SELECT version FROM cyberboard_schema_migrations WHERE version=$1")
+                .bind("0011_agent_releases")
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if eleventh.is_none() {
+            sqlx::raw_sql(ELEVENTH_MIGRATION)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
+                .bind("0011_agent_releases")
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -785,7 +816,7 @@ impl Database {
     ) -> DatabaseResult<Vec<SubscriptionRecord>> {
         let rows = sqlx::query(
             "SELECT s.id,u.email AS user_email,p.name AS plan,s.status,s.traffic_used_bytes,
-                    s.traffic_quota_bytes,s.expires_at::text AS expires_at,s.subscription_token
+                    s.traffic_quota_bytes,s.expires_at::text AS expires_at,s.subscription_token,s.subscription_token_version
              FROM subscriptions s JOIN users u ON u.tenant_id=s.tenant_id AND u.id=s.user_id
              JOIN plans p ON p.tenant_id=s.tenant_id AND p.id=s.plan_id
              WHERE s.tenant_id=$1 AND ($2::text IS NULL OR u.email ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%') AND ($3::text IS NULL OR s.status=$3) ORDER BY s.created_at DESC,s.id LIMIT $4 OFFSET $5",
@@ -801,7 +832,7 @@ impl Database {
         tenant_id: Uuid,
         user_id: Uuid,
     ) -> DatabaseResult<Option<SubscriptionRecord>> {
-        let row = sqlx::query("SELECT s.id,u.email AS user_email,p.name AS plan,s.status,s.traffic_used_bytes,s.traffic_quota_bytes,s.expires_at::text AS expires_at,s.subscription_token FROM subscriptions s JOIN users u ON u.tenant_id=s.tenant_id AND u.id=s.user_id JOIN plans p ON p.tenant_id=s.tenant_id AND p.id=s.plan_id WHERE s.tenant_id=$1 AND s.user_id=$2 AND s.status='active' ORDER BY s.created_at DESC LIMIT 1").bind(tenant_id).bind(user_id).fetch_optional(&self.pool).await?;
+        let row = sqlx::query("SELECT s.id,u.email AS user_email,p.name AS plan,s.status,s.traffic_used_bytes,s.traffic_quota_bytes,s.expires_at::text AS expires_at,s.subscription_token,s.subscription_token_version FROM subscriptions s JOIN users u ON u.tenant_id=s.tenant_id AND u.id=s.user_id JOIN plans p ON p.tenant_id=s.tenant_id AND p.id=s.plan_id WHERE s.tenant_id=$1 AND s.user_id=$2 AND s.status='active' ORDER BY s.created_at DESC LIMIT 1").bind(tenant_id).bind(user_id).fetch_optional(&self.pool).await?;
         Ok(row.map(SubscriptionRecord::from_row))
     }
 
@@ -866,6 +897,93 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn rotate_subscription_token(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        token: &str,
+        token_hash: &str,
+    ) -> DatabaseResult<Option<SubscriptionRecord>> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "UPDATE subscriptions
+             SET subscription_token=$3, subscription_token_hash=$4,
+                 subscription_token_version=subscription_token_version+1,
+                 subscription_token_revoked_at=NULL, updated_at=now()
+             WHERE tenant_id=$1 AND user_id=$2 AND status='active' AND expires_at>now()
+             RETURNING id",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(token)
+        .bind(token_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let subscription_id: Uuid = row.get("id");
+        sqlx::query(
+            "INSERT INTO audit_logs(tenant_id,actor_user_id,action,resource_type,resource_id,details)
+             VALUES($1,$2,'subscription_token.rotate','subscription',$3,jsonb_build_object('tokenVersion',(SELECT subscription_token_version FROM subscriptions WHERE tenant_id=$1 AND id=$3)))",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(subscription_id)
+        .execute(&mut *tx)
+        .await?;
+        let record = sqlx::query(
+            "SELECT s.id,u.email AS user_email,p.name AS plan,s.status,s.traffic_used_bytes,
+                    s.traffic_quota_bytes,s.expires_at::text AS expires_at,s.subscription_token,s.subscription_token_version
+             FROM subscriptions s JOIN users u ON u.tenant_id=s.tenant_id AND u.id=s.user_id
+             JOIN plans p ON p.tenant_id=s.tenant_id AND p.id=s.plan_id
+             WHERE s.tenant_id=$1 AND s.id=$2",
+        )
+        .bind(tenant_id)
+        .bind(subscription_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(SubscriptionRecord::from_row(record)))
+    }
+
+    pub async fn revoke_subscription_token(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> DatabaseResult<bool> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "UPDATE subscriptions SET subscription_token_revoked_at=now(),
+                    status='revoked',updated_at=now()
+             WHERE tenant_id=$1 AND user_id=$2 AND status='active' AND expires_at>now()
+             RETURNING id,subscription_token_version",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let subscription_id: Uuid = row.get("id");
+        let version: i64 = row.get("subscription_token_version");
+        sqlx::query(
+            "INSERT INTO audit_logs(tenant_id,actor_user_id,action,resource_type,resource_id,details)
+             VALUES($1,$2,'subscription_token.revoke','subscription',$3,jsonb_build_object('tokenVersion',$4))",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(subscription_id)
+        .bind(version)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     async fn get_subscription(
         &self,
         tenant_id: Uuid,
@@ -873,7 +991,7 @@ impl Database {
     ) -> DatabaseResult<Option<SubscriptionRecord>> {
         let row = sqlx::query(
             "SELECT s.id,u.email AS user_email,p.name AS plan,s.status,s.traffic_used_bytes,
-                    s.traffic_quota_bytes,s.expires_at::text AS expires_at,s.subscription_token
+                    s.traffic_quota_bytes,s.expires_at::text AS expires_at,s.subscription_token,s.subscription_token_version
              FROM subscriptions s JOIN users u ON u.tenant_id=s.tenant_id AND u.id=s.user_id
              JOIN plans p ON p.tenant_id=s.tenant_id AND p.id=s.plan_id
              WHERE s.tenant_id=$1 AND s.id=$2",
@@ -892,7 +1010,8 @@ impl Database {
     ) -> DatabaseResult<bool> {
         let active: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM subscriptions
-             WHERE tenant_id=$1 AND subscription_token=$2
+             WHERE tenant_id=$1 AND (subscription_token_hash=encode(digest($2,'sha256'),'hex')
+                 OR (subscription_token_hash IS NULL AND subscription_token=$2))
                AND status='active' AND expires_at > now() LIMIT 1",
         )
         .bind(tenant_id)
@@ -907,7 +1026,7 @@ impl Database {
         tenant_id: Uuid,
         token: &str,
     ) -> DatabaseResult<Vec<NodeRecord>> {
-        let rows = sqlx::query("SELECT n.id,n.name,n.region,n.address,n.status,n.core_type,n.core_version,n.agent_version,n.current_config_revision,last_heartbeat_at::text AS last_heartbeat_at,n.port,n.tags FROM nodes n JOIN subscription_nodes sn ON sn.tenant_id=n.tenant_id AND sn.node_id=n.id JOIN subscriptions s ON s.tenant_id=sn.tenant_id AND s.id=sn.subscription_id WHERE n.tenant_id=$1 AND s.subscription_token=$2 AND s.status='active' AND s.expires_at>now() ORDER BY n.created_at,n.id")
+        let rows = sqlx::query("SELECT n.id,n.name,n.region,n.address,n.status,n.core_type,n.core_version,n.agent_version,n.current_config_revision,last_heartbeat_at::text AS last_heartbeat_at,n.port,n.tags FROM nodes n JOIN subscription_nodes sn ON sn.tenant_id=n.tenant_id AND sn.node_id=n.id JOIN subscriptions s ON s.tenant_id=sn.tenant_id AND s.id=sn.subscription_id WHERE n.tenant_id=$1 AND (s.subscription_token_hash=encode(digest($2,'sha256'),'hex') OR (s.subscription_token_hash IS NULL AND s.subscription_token=$2)) AND s.status='active' AND s.expires_at>now() ORDER BY n.created_at,n.id")
             .bind(tenant_id).bind(token).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(NodeRecord::from_row).collect())
     }
@@ -1773,6 +1892,52 @@ impl Database {
         transaction.commit().await?;
         Ok(true)
     }
+
+    pub async fn active_agent_release(
+        &self,
+        tenant_id: Uuid,
+    ) -> DatabaseResult<Option<AgentReleaseRecord>> {
+        let row = sqlx::query(
+            "SELECT version,artifact_url,sha256,signature,signing_key_id,mandatory,
+                    published_at::text AS published_at
+             FROM agent_releases
+             WHERE tenant_id=$1 AND revoked_at IS NULL
+             ORDER BY published_at DESC
+             LIMIT 1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(AgentReleaseRecord::from_row))
+    }
+
+    pub async fn record_agent_upgrade_result(
+        &self,
+        tenant_id: Uuid,
+        node_id: Uuid,
+        agent_id: &str,
+        target_version: &str,
+        success: bool,
+        error_code: Option<&str>,
+        error_message: Option<&str>,
+    ) -> DatabaseResult<()> {
+        sqlx::query(
+            "INSERT INTO agent_upgrade_results
+                (tenant_id,node_id,agent_id,target_version,success,error_code,error_message)
+             SELECT $1,$2,$3,$4,$5,$6,$7
+             WHERE EXISTS (SELECT 1 FROM nodes WHERE tenant_id=$1 AND id=$2 AND agent_id=$3)",
+        )
+        .bind(tenant_id)
+        .bind(node_id)
+        .bind(agent_id)
+        .bind(target_version)
+        .bind(success)
+        .bind(error_code)
+        .bind(error_message)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1917,6 +2082,31 @@ pub struct DashboardStats {
     pub traffic_bytes_24h: i64,
     pub failed_tasks: i64,
     pub generated_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentReleaseRecord {
+    pub version: String,
+    pub artifact_url: String,
+    pub sha256: String,
+    pub signature: String,
+    pub signing_key_id: String,
+    pub mandatory: bool,
+    pub published_at: String,
+}
+
+impl AgentReleaseRecord {
+    fn from_row(row: sqlx::postgres::PgRow) -> Self {
+        Self {
+            version: row.get("version"),
+            artifact_url: row.get("artifact_url"),
+            sha256: row.get("sha256"),
+            signature: row.get("signature"),
+            signing_key_id: row.get("signing_key_id"),
+            mandatory: row.get("mandatory"),
+            published_at: row.get("published_at"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2101,6 +2291,7 @@ pub struct SubscriptionRecord {
     pub traffic_quota_bytes: i64,
     pub expires_at: String,
     pub subscription_token: Option<String>,
+    pub subscription_token_version: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -2306,6 +2497,7 @@ impl SubscriptionRecord {
             traffic_quota_bytes: row.get("traffic_quota_bytes"),
             expires_at: row.get("expires_at"),
             subscription_token: row.try_get("subscription_token").ok(),
+            subscription_token_version: row.try_get("subscription_token_version").unwrap_or(1),
         }
     }
 }

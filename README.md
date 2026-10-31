@@ -55,7 +55,7 @@ that explicit flag, login requires a matching active database user. Set
 UUID `00000000-0000-0000-0000-000000000001`).
 
 When `CYBERBOARD_DATABASE_URL` is set, API startup connects to PostgreSQL,
-executes the embedded migrations `0001` through the current `0009` release, and ensures the
+executes the embedded migrations `0001` through the current `0011` release, and ensures the
 configured tenant exists. A failed connection or migration stops startup.
 Without a URL, `/readyz` reports `memory_mode`; it does not claim database
 health, and resource writes return a clear `database_unavailable` response.

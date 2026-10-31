@@ -1,8 +1,9 @@
 use std::{fs, path::Path, time::Duration};
 
 use cyberboard_agent_protocol::generated::{
-    DesiredStateResponse, GetDesiredStateRequest, HeartbeatRequest, RegisterAgentRequest,
-    ReportApplyResultRequest, agent_control_client::AgentControlClient,
+    DesiredStateResponse, GetDesiredStateRequest, GetReleaseManifestRequest, HeartbeatRequest,
+    RegisterAgentRequest, ReleaseManifestResponse, ReportApplyResultRequest,
+    ReportUpgradeResultRequest, agent_control_client::AgentControlClient,
 };
 use cyberboard_config::AgentConfig;
 use tonic::{
@@ -91,6 +92,27 @@ impl TonicAgentTransport {
     pub async fn report_apply(&mut self, request: ReportApplyResultRequest) -> Result<(), Status> {
         self.client
             .report_apply_result(Request::new(request))
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn release_manifest(
+        &mut self,
+        request: GetReleaseManifestRequest,
+    ) -> Result<ReleaseManifestResponse, Status> {
+        Ok(self
+            .client
+            .get_release_manifest(Request::new(request))
+            .await?
+            .into_inner())
+    }
+
+    pub async fn report_upgrade(
+        &mut self,
+        request: ReportUpgradeResultRequest,
+    ) -> Result<(), Status> {
+        self.client
+            .report_upgrade_result(Request::new(request))
             .await
             .map(|_| ())
     }

@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use cyberboard_agent_protocol::generated::{
-    GetDesiredStateRequest, HeartbeatRequest, RegisterAgentRequest, ReportApplyResultRequest,
+    GetDesiredStateRequest, GetReleaseManifestRequest, HeartbeatRequest, RegisterAgentRequest,
+    ReportApplyResultRequest, ReportUpgradeResultRequest,
 };
 use cyberboard_config::AgentConfig;
 use cyberboard_config_compiler::SignedConfigEnvelope;
@@ -140,6 +141,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Err(error) => { warn!(%error, "control-plane heartbeat failed"); true }
                     };
                     if !heartbeat_failed {
+                        let manifest = client.release_manifest(GetReleaseManifestRequest {
+                            agent_id: agent_id.clone(),
+                            node_id: node_id.clone(),
+                            current_agent_version: env!("CARGO_PKG_VERSION").into(),
+                            agent_public_key: public_key.clone(),
+                        }).await;
+                        if let Ok(manifest) = manifest {
+                            if !manifest.version.is_empty() && manifest.version != env!("CARGO_PKG_VERSION") {
+                                let validation = validate_release_manifest(&manifest);
+                                if let Err(error) = &validation {
+                                    warn!(target_version = %manifest.version, %error, "agent release manifest rejected");
+                                } else {
+                                    warn!(target_version = %manifest.version, "agent release manifest is available; automatic binary replacement is disabled");
+                                }
+                                let _ = client.report_upgrade(ReportUpgradeResultRequest {
+                                    agent_id: agent_id.clone(),
+                                    node_id: node_id.clone(),
+                                    target_version: manifest.version,
+                                    success: validation.is_ok(),
+                                    error_code: if validation.is_ok() { "automatic_upgrade_disabled" } else { "invalid_release_manifest" }.into(),
+                                    error_message: validation.err().unwrap_or_else(|| "release manifest verification/download policy is not configured".into()),
+                                    agent_public_key: public_key.clone(),
+                                }).await;
+                            }
+                        }
                         let desired = client.desired_state(GetDesiredStateRequest { agent_id: agent_id.clone(), node_id: node_id.clone(), current_generation: String::new(), current_content_hash: String::new(), last_applied_generation: 0, agent_public_key: public_key.clone() }).await;
                         if let Ok(response) = desired {
                             if !response.signed_config.is_empty() {
@@ -185,6 +211,41 @@ fn agent_public_key() -> String {
     // sending a real Ed25519 public key instead of an empty placeholder.
     let signing_key = SigningKey::generate(&mut OsRng);
     BASE64.encode(signing_key.verifying_key().to_bytes())
+}
+
+fn validate_release_manifest(
+    manifest: &cyberboard_agent_protocol::generated::ReleaseManifestResponse,
+) -> Result<(), String> {
+    if manifest.artifact_url.trim().is_empty() {
+        return Err("artifact_url is empty".to_owned());
+    }
+    if manifest.sha256.len() != 64 || !manifest.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("sha256 must be a 64-character hexadecimal digest".to_owned());
+    }
+    if manifest.signature.trim().is_empty() || manifest.signing_key_id.trim().is_empty() {
+        return Err("signature and signing_key_id are required".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::validate_release_manifest;
+    use cyberboard_agent_protocol::generated::ReleaseManifestResponse;
+
+    #[test]
+    fn release_manifest_validation_rejects_missing_integrity_fields() {
+        let manifest = ReleaseManifestResponse {
+            version: "0.2.0".to_owned(),
+            artifact_url: "https://example.invalid/agent".to_owned(),
+            sha256: "bad".to_owned(),
+            signature: String::new(),
+            signing_key_id: String::new(),
+            mandatory: false,
+        };
+        assert!(validate_release_manifest(&manifest).is_err());
+    }
 }
 
 fn apply_desired(

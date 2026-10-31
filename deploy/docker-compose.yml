@@ -1,0 +1,63 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: cyberboard
+      POSTGRES_USER: cyberboard
+      POSTGRES_PASSWORD: change-me-in-development
+    volumes:
+      - cyberboard-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cyberboard -d cyberboard"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - cyberboard-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        APP: cyberboard-api
+    environment:
+      CYBERBOARD_BIND_ADDR: 0.0.0.0
+      CYBERBOARD_API_PORT: 8080
+      CYBERBOARD_DATABASE_URL: postgres://cyberboard:change-me-in-development@postgres:5432/cyberboard
+      CYBERBOARD_REDIS_URL: redis://redis:6379
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        APP: cyberboard-worker
+    environment:
+      CYBERBOARD_DATABASE_URL: postgres://cyberboard:change-me-in-development@postgres:5432/cyberboard
+      CYBERBOARD_REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  cyberboard-postgres:
+  cyberboard-redis:

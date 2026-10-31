@@ -1,0 +1,125 @@
+syntax = "proto3";
+
+package cyberboard.agent.v1;
+
+// Agent connections are intended to be initiated by the node and carried over
+// mTLS. The control plane must not require inbound access to a node.
+service AgentControl {
+  rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc GetDesiredState(GetDesiredStateRequest) returns (DesiredStateResponse);
+  rpc ReportApplyResult(ReportApplyResultRequest) returns (Ack);
+  rpc ReportUsage(ReportUsageRequest) returns (Ack);
+  rpc GetReleaseManifest(GetReleaseManifestRequest) returns (ReleaseManifestResponse);
+  rpc ReportUpgradeResult(ReportUpgradeResultRequest) returns (Ack);
+}
+
+message RegisterAgentRequest {
+  string one_time_registration_token = 1;
+  string agent_public_key = 2;
+  string agent_version = 3;
+  string platform = 4;
+  string architecture = 5;
+  int64 unix_time = 6;
+  string nonce = 7;
+}
+
+message RegisterAgentResponse {
+  string agent_id = 1;
+  string node_id = 2;
+  string certificate_pem = 3;
+  string certificate_authority_pem = 4;
+  int64 certificate_expires_at = 5;
+  string protocol_version = 6;
+}
+
+message HeartbeatRequest {
+  string agent_id = 1;
+  string node_id = 2;
+  string agent_version = 3;
+  repeated string core_versions = 4;
+  string platform = 5;
+  string architecture = 6;
+  string current_config_revision = 7;
+  string core_state = 8;
+  uint64 memory_bytes = 9;
+  uint64 disk_free_bytes = 10;
+  double cpu_percent = 11;
+  int64 unix_time = 12;
+  string nonce = 13;
+}
+
+message HeartbeatResponse {
+  string desired_state_revision = 1;
+  bool should_upgrade = 2;
+  string protocol_version = 3;
+}
+
+message GetDesiredStateRequest {
+  string agent_id = 1;
+  string node_id = 2;
+  string current_generation = 3;
+}
+
+message DesiredStateResponse {
+  string generation = 1;
+  string core_type = 2;
+  string core_version = 3;
+  bytes signed_config = 4;
+  string content_hash = 5;
+  string signature = 6;
+  string signing_key_id = 7;
+  int64 expires_at = 8;
+}
+
+message ReportApplyResultRequest {
+  string agent_id = 1;
+  string node_id = 2;
+  string generation = 3;
+  string previous_hash = 4;
+  string applied_hash = 5;
+  string phase = 6;
+  string error_code = 7;
+  string error_message = 8;
+  uint32 retry_count = 9;
+  int64 unix_time = 10;
+}
+
+message ReportUsageRequest {
+  string agent_id = 1;
+  string node_id = 2;
+  string batch_id = 3;
+  uint64 sequence = 4;
+  int64 window_start = 5;
+  int64 window_end = 6;
+  bytes usage_payload = 7;
+}
+
+message GetReleaseManifestRequest {
+  string agent_id = 1;
+  string node_id = 2;
+  string current_agent_version = 3;
+}
+
+message ReleaseManifestResponse {
+  string version = 1;
+  string artifact_url = 2;
+  string sha256 = 3;
+  string signature = 4;
+  string signing_key_id = 5;
+  bool mandatory = 6;
+}
+
+message ReportUpgradeResultRequest {
+  string agent_id = 1;
+  string node_id = 2;
+  string target_version = 3;
+  bool success = 4;
+  string error_code = 5;
+  string error_message = 6;
+}
+
+message Ack {
+  string request_id = 1;
+  bool accepted = 2;
+}

@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "apps/api",
+    "apps/worker",
+    "apps/agent",
+    "crates/agent-protocol",
+    "crates/config",
+    "crates/domain",
+    "crates/observability",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+axum = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tower = { version = "0.5", features = ["util"] }
+uuid = { version = "1.11", features = ["serde", "v4"] }
+
+cyberboard-agent-protocol = { path = "crates/agent-protocol" }
+cyberboard-config = { path = "crates/config" }
+cyberboard-domain = { path = "crates/domain" }
+cyberboard-observability = { path = "crates/observability" }

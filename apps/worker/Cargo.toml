@@ -1,0 +1,13 @@
+[package]
+name = "cyberboard-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cyberboard-config.workspace = true
+cyberboard-domain.workspace = true
+cyberboard-observability.workspace = true
+tokio.workspace = true
+tracing.workspace = true

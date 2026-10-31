@@ -1,0 +1,13 @@
+[package]
+name = "cyberboard-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cyberboard-agent-protocol.workspace = true
+cyberboard-config.workspace = true
+cyberboard-observability.workspace = true
+tokio.workspace = true
+tracing.workspace = true

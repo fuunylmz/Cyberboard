@@ -15,6 +15,7 @@ use axum::{
 };
 use cyberboard_config::ApiConfig;
 use cyberboard_database::{
+    ConfigRevisionRecord, ConfigTemplateInput, ConfigTemplateRecord, ConfigTemplateUpdate,
     Database, NodeInput, NodeRecord, NodeUpdate, PlanInput, PlanRecord, PlanUpdate,
     SubscriptionInput, SubscriptionRecord, SubscriptionUpdate, UserRecord,
 };
@@ -57,6 +58,11 @@ impl AppState {
     fn with_database(config: ApiConfig, database: Option<Arc<Database>>) -> Self {
         let mut state = Self::new(config);
         state.database = database;
+        if state.database.is_some() {
+            state.demo_access_token = Arc::from(format!("cb-admin-{}", uuid::Uuid::new_v4()));
+            state.demo_portal_access_token =
+                Arc::from(format!("cb-portal-{}", uuid::Uuid::new_v4()));
+        }
         state
     }
 
@@ -266,8 +272,7 @@ async fn credentials_match(
         if credentials.status != "active" {
             return false;
         }
-        let is_admin = credentials.roles.iter().any(|role| role == "admin");
-        if is_admin != require_admin {
+        if !role_allowed(&credentials.roles, require_admin) {
             return false;
         }
         return PasswordHash::new(&credentials.password_hash)
@@ -280,6 +285,11 @@ async fn credentials_match(
     }
 
     state.config.dev_mode && email == fallback_email && password == fallback_password
+}
+
+fn role_allowed(roles: &[String], require_admin: bool) -> bool {
+    let is_admin = roles.iter().any(|role| role == "admin");
+    if require_admin { is_admin } else { !is_admin }
 }
 
 fn invalid_credentials_response() -> Response {
@@ -1275,6 +1285,59 @@ async fn portal_usage(State(state): State<AppState>, headers: HeaderMap) -> Resp
     }
 }
 
+async fn me_orders(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_portal_auth(&state, &headers) {
+        return response;
+    }
+    let Some(identity) = state.portal_identity(&headers) else {
+        return unauthorized_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return Json(json!({"items": [], "total": 0, "page": 1, "pageSize": 50})).into_response();
+    };
+    match (uuid::Uuid::parse_str(&identity.user_id), database.list_orders(state.config.tenant_id, uuid::Uuid::parse_str(&identity.user_id).unwrap_or_default(), 50, 0).await, database.count_orders(state.config.tenant_id, uuid::Uuid::parse_str(&identity.user_id).unwrap_or_default()).await) {
+        (Ok(_), Ok(items), Ok(total)) => Json(json!({"items": items.iter().map(|item| json!({"id":item.id,"status":item.status,"amountCents":item.amount_cents,"currency":item.currency,"createdAt":item.created_at,"plan":item.plan})).collect::<Vec<_>>(),"total":total,"page":1,"pageSize":50})).into_response(),
+        _ => internal_database_response(),
+    }
+}
+
+async fn me_devices(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_portal_auth(&state, &headers) {
+        return response;
+    }
+    let Some(identity) = state.portal_identity(&headers) else {
+        return unauthorized_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return Json(json!({"items": [], "total": 0, "page": 1, "pageSize": 50})).into_response();
+    };
+    let user_id = match uuid::Uuid::parse_str(&identity.user_id) {
+        Ok(value) => value,
+        Err(_) => return unauthorized_response(),
+    };
+    match (database.list_devices(state.config.tenant_id, user_id, 50, 0).await, database.count_devices(state.config.tenant_id, user_id).await) {
+        (Ok(items), Ok(total)) => Json(json!({"items": items.iter().map(|item| json!({"id":item.id,"name":item.name,"lastSeenAt":item.last_seen_at,"createdAt":item.created_at,"revokedAt":item.revoked_at})).collect::<Vec<_>>(),"total":total,"page":1,"pageSize":50})).into_response(),
+        _ => internal_database_response(),
+    }
+}
+
+async fn me_usage(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_portal_auth(&state, &headers) {
+        return response;
+    }
+    let Some(identity) = state.portal_identity(&headers) else {
+        return unauthorized_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return Json(json!({"usedBytes": 0, "quotaBytes": 0, "todayBytes": 0, "projectedBytes": 0, "periodStart": "", "periodEnd": "", "daily": []})).into_response();
+    };
+    let user_id = match uuid::Uuid::parse_str(&identity.user_id) {
+        Ok(value) => value,
+        Err(_) => return unauthorized_response(),
+    };
+    match database.usage_summary(state.config.tenant_id, user_id).await { Ok(usage) => Json(json!({"usedBytes":usage.used_bytes,"quotaBytes":0,"todayBytes":0,"projectedBytes":usage.used_bytes,"periodStart":usage.period_start.unwrap_or_default(),"periodEnd":usage.period_end.unwrap_or_default(),"daily":[]})).into_response(), Err(_) => internal_database_response() }
+}
+
 async fn public_subscription(State(state): State<AppState>, Path(token): Path<String>) -> Response {
     let Some(database) = state.database.as_ref() else {
         return service_unavailable_response();
@@ -1326,6 +1389,214 @@ fn conflict_response(message: &'static str) -> Response {
         }),
     )
         .into_response()
+}
+
+fn feature_pending_response() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(ApiErrorResponse {
+            code: "feature_pending",
+            message: "配置持久化接口正在接入",
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigTemplateRequest {
+    name: Option<String>,
+    description: Option<String>,
+    core_type: Option<String>,
+    core_version_range: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ConfigRevisionAction {
+    expected_generation: Option<i64>,
+}
+
+fn config_template_json(record: ConfigTemplateRecord) -> Value {
+    json!({"id":record.id,"name":record.name,"description":record.description,"coreType":record.core_type,"coreVersionRange":record.core_version_range,"status":record.status,"updatedAt":record.updated_at,"updatedBy":record.updated_by})
+}
+
+fn config_revision_json(record: ConfigRevisionRecord) -> Value {
+    json!({"id":record.id,"templateId":record.template_id,"nodeId":record.node_id,"nodeName":record.node_name,"generation":record.generation,"coreVersion":record.core_version,"contentHash":record.content_hash,"signatureStatus":record.signature_status,"validationStatus":record.validation_status,"publishStatus":record.publish_status,"failureReason":record.failure_reason,"createdAt":record.created_at})
+}
+
+async fn list_config_templates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(pagination): Query<PaginationQuery>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    let Some(db) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    let limit = pagination.bounded_limit();
+    let offset = pagination.bounded_offset();
+    match (db.list_config_templates(state.config.tenant_id, limit, offset).await, db.count_config_templates(state.config.tenant_id).await) {
+        (Ok(items), Ok(total)) => Json(json!({"items":items.into_iter().map(config_template_json).collect::<Vec<_>>(),"total":total,"page":offset/limit+1,"pageSize":limit})).into_response(), _ => internal_database_response()
+    }
+}
+
+async fn create_config_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ConfigTemplateRequest>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    let Some(db) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    let input = ConfigTemplateInput {
+        name: req.name.unwrap_or_default(),
+        description: req.description.unwrap_or_default(),
+        core_type: req.core_type.unwrap_or_else(|| "sing-box".into()),
+        core_version_range: req.core_version_range.unwrap_or_else(|| "*".into()),
+        status: req.status.unwrap_or_else(|| "draft".into()),
+    };
+    if input.name.trim().is_empty() {
+        return invalid_input_response("配置模板名称不能为空");
+    }
+    match db
+        .create_config_template(state.config.tenant_id, &input)
+        .await
+    {
+        Ok(record) => (StatusCode::CREATED, Json(config_template_json(record))).into_response(),
+        Err(error) if error.is_conflict() => conflict_response("配置模板名称已存在"),
+        Err(_) => internal_database_response(),
+    }
+}
+
+async fn update_config_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+    Json(req): Json<ConfigTemplateRequest>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    let Some(db) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    let input = ConfigTemplateUpdate {
+        name: req.name,
+        description: req.description,
+        core_type: req.core_type,
+        core_version_range: req.core_version_range,
+        status: req.status,
+    };
+    match db
+        .update_config_template(state.config.tenant_id, id, &input)
+        .await
+    {
+        Ok(Some(record)) => Json(config_template_json(record)).into_response(),
+        Ok(None) => not_found_response("配置模板不存在"),
+        Err(_) => internal_database_response(),
+    }
+}
+
+async fn delete_config_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    let Some(db) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    match db.delete_config_template(state.config.tenant_id, id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => not_found_response("配置模板不存在"),
+        Err(_) => internal_database_response(),
+    }
+}
+
+async fn list_config_revisions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(pagination): Query<PaginationQuery>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    let Some(db) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    let limit = pagination.bounded_limit();
+    let offset = pagination.bounded_offset();
+    match (db.list_config_revisions(state.config.tenant_id,limit,offset).await,db.count_config_revisions(state.config.tenant_id).await) { (Ok(items),Ok(total))=>Json(json!({"items":items.into_iter().map(config_revision_json).collect::<Vec<_>>(),"total":total,"page":offset/limit+1,"pageSize":limit})).into_response(), _=>internal_database_response() }
+}
+
+async fn publish_config_revision(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+    Json(action): Json<ConfigRevisionAction>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    let Some(db) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    let Some(generation) = action.expected_generation else {
+        return invalid_input_response("expectedGeneration不能为空");
+    };
+    match db
+        .set_config_publish_status(state.config.tenant_id, id, generation, "published")
+        .await
+    {
+        Ok(Some(record)) => Json(config_revision_json(record)).into_response(),
+        Ok(None) => conflict_response("配置版本 generation 冲突或不存在"),
+        Err(_) => internal_database_response(),
+    }
+}
+
+async fn rollback_config_revision(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+    Json(action): Json<ConfigRevisionAction>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    let Some(db) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    let Some(generation) = action.expected_generation else {
+        return invalid_input_response("expectedGeneration不能为空");
+    };
+    match db
+        .set_config_publish_status(state.config.tenant_id, id, generation, "rolled_back")
+        .await
+    {
+        Ok(Some(record)) => Json(config_revision_json(record)).into_response(),
+        Ok(None) => conflict_response("配置版本 generation 冲突或不存在"),
+        Err(_) => internal_database_response(),
+    }
+}
+
+async fn config_boundary(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    if state.database.is_none() {
+        service_unavailable_response()
+    } else {
+        feature_pending_response()
+    }
 }
 
 async fn admin_subscriptions(
@@ -1457,12 +1728,20 @@ async fn openapi() -> Json<Value> {
             "/api/v1/portal/usage": {
                 "get": { "operationId": "getPortalUsage", "security": [{"portalBearerAuth": []}], "responses": { "200": { "description": "Current portal usage", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PortalUsage" } } } }, "401": { "description": "Invalid portal token" }, "404": { "description": "No usage available" }, "503": { "description": "Database unavailable" } } }
             },
+            "/api/v1/me/orders": { "get": { "operationId":"listMyOrders", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped order page"},"401":{"description":"Invalid portal token"},"501":{"description":"Database repository pending"}} } },
+            "/api/v1/me/devices": { "get": { "operationId":"listMyDevices", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped device page"},"401":{"description":"Invalid portal token"},"501":{"description":"Database repository pending"}} } },
+            "/api/v1/me/usage": { "get": { "operationId":"getMyUsage", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped usage"},"401":{"description":"Invalid portal token"},"501":{"description":"Database repository pending"}} } },
             "/subscribe/{token}": {
                 "get": { "operationId": "getSubscriptionConfig", "parameters": [{"name":"token","in":"path","required":true,"schema":{"type":"string"}}], "responses": { "200": { "description": "Sing-box compatible JSON configuration" }, "404": { "description": "Subscription missing or expired" }, "503": { "description": "Database unavailable" } } }
             },
             "/api/v1/admin/dashboard": {
                 "get": { "operationId": "getAdminDashboard", "security": [{"bearerAuth": []}], "responses": { "200": { "description": "Demo dashboard summary", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DashboardSummary" } } } }, "401": { "description": "Missing or invalid bearer token", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } } } }
             },
+            "/api/v1/admin/config-templates": { "get": {"operationId":"listConfigTemplates","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Config templates"},"401":{"description":"Invalid token"},"503":{"description":"Database unavailable"},"501":{"description":"Repository pending"}}}, "post": {"operationId":"createConfigTemplate","security":[{"bearerAuth":[]}],"responses":{"201":{"description":"Created template"},"401":{"description":"Invalid token"},"503":{"description":"Database unavailable"},"501":{"description":"Repository pending"}}} },
+            "/api/v1/admin/config-templates/{templateId}": { "patch":{"operationId":"updateConfigTemplate","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Updated template"},"501":{"description":"Repository pending"}}}, "delete":{"operationId":"deleteConfigTemplate","security":[{"bearerAuth":[]}],"responses":{"204":{"description":"Template deleted"},"501":{"description":"Repository pending"}}} },
+            "/api/v1/admin/config-revisions": { "get":{"operationId":"listConfigRevisions","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Config revisions"},"501":{"description":"Repository pending"}}} },
+            "/api/v1/admin/config-revisions/{revisionId}/publish": { "post":{"operationId":"publishConfigRevision","security":[{"bearerAuth":[]}],"responses":{"202":{"description":"Deployment queued"},"409":{"description":"Generation conflict"},"501":{"description":"Repository pending"}}} },
+            "/api/v1/admin/config-revisions/{revisionId}/rollback": { "post":{"operationId":"rollbackConfigRevision","security":[{"bearerAuth":[]}],"responses":{"202":{"description":"Rollback queued"},"409":{"description":"Generation conflict"},"501":{"description":"Repository pending"}}} },
             "/api/v1/admin/nodes": {
                 "get": { "operationId": "listAdminNodes", "security": [{"bearerAuth": []}], "parameters": [{"name":"page","in":"query","schema":{"type":"integer"}},{"name":"pageSize","in":"query","schema":{"type":"integer"}}], "responses": { "200": { "description": "Tenant-scoped node page", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NodeList" } } } }, "401": { "description": "Missing or invalid bearer token" }, "503": { "description": "Database unavailable" } } },
                 "post": { "operationId": "createAdminNode", "security": [{"bearerAuth": []}], "responses": { "201": { "description": "Created node" }, "401": { "description": "Missing or invalid bearer token" }, "503": { "description": "Database unavailable" } } }
@@ -1635,6 +1914,9 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/session", get(session))
         .route("/api/v1/portal/subscription", get(portal_subscription))
         .route("/api/v1/portal/usage", get(portal_usage))
+        .route("/api/v1/me/orders", get(me_orders))
+        .route("/api/v1/me/devices", get(me_devices))
+        .route("/api/v1/me/usage", get(me_usage))
         .route("/subscribe/{token}", get(public_subscription))
         .route("/api/v1/admin/dashboard", get(admin_dashboard))
         .route(
@@ -1668,6 +1950,23 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/v1/admin/subscriptions/{subscription_id}",
             patch(update_admin_subscription).delete(delete_admin_subscription),
+        )
+        .route(
+            "/api/v1/admin/config-templates",
+            get(list_config_templates).post(create_config_template),
+        )
+        .route(
+            "/api/v1/admin/config-templates/{template_id}",
+            patch(update_config_template).delete(delete_config_template),
+        )
+        .route("/api/v1/admin/config-revisions", get(list_config_revisions))
+        .route(
+            "/api/v1/admin/config-revisions/{revision_id}/publish",
+            post(publish_config_revision),
+        )
+        .route(
+            "/api/v1/admin/config-revisions/{revision_id}/rollback",
+            post(rollback_config_revision),
         )
         .with_state(state)
 }
@@ -1877,6 +2176,14 @@ mod tests {
         assert!(!state.is_authorized(&portal_headers));
         assert!(state.is_portal_authorized(&portal_headers));
         assert!(!state.is_portal_authorized(&admin_headers));
+    }
+
+    #[test]
+    fn ordinary_user_role_cannot_satisfy_admin_login_requirement() {
+        assert!(!super::role_allowed(&["user".to_owned()], true));
+        assert!(super::role_allowed(&["user".to_owned()], false));
+        assert!(super::role_allowed(&["admin".to_owned()], true));
+        assert!(!super::role_allowed(&["admin".to_owned()], false));
     }
 
     #[tokio::test]

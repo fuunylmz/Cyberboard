@@ -8,6 +8,9 @@ rust-version.workspace = true
 [dependencies]
 cyberboard-agent-protocol.workspace = true
 cyberboard-config.workspace = true
+cyberboard-config-compiler.workspace = true
 cyberboard-observability.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true

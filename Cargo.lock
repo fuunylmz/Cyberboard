@@ -263,9 +263,12 @@ version = "0.1.0"
 dependencies = [
  "cyberboard-agent-protocol",
  "cyberboard-config",
+ "cyberboard-config-compiler",
  "cyberboard-observability",
+ "thiserror",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

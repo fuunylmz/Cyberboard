@@ -9,11 +9,17 @@ pub const INITIAL_MIGRATION: &str = include_str!("../../../deploy/migrations/000
 pub const SECOND_MIGRATION_NAME: &str = "0002_resource_fields.sql";
 pub const SECOND_MIGRATION: &str =
     include_str!("../../../deploy/migrations/0002_resource_fields.sql");
+pub const THIRD_MIGRATION_NAME: &str = "0003_control_plane_resources.sql";
+pub const THIRD_MIGRATION: &str =
+    include_str!("../../../deploy/migrations/0003_control_plane_resources.sql");
+pub const FOURTH_MIGRATION: &str =
+    include_str!("../../../deploy/migrations/0004_config_revision_fields.sql");
 
 #[cfg(test)]
 mod tests {
     use super::{
-        INITIAL_MIGRATION, INITIAL_MIGRATION_NAME, SECOND_MIGRATION, SECOND_MIGRATION_NAME,
+        FOURTH_MIGRATION, INITIAL_MIGRATION, INITIAL_MIGRATION_NAME, SECOND_MIGRATION,
+        SECOND_MIGRATION_NAME, THIRD_MIGRATION, THIRD_MIGRATION_NAME,
     };
 
     #[test]
@@ -59,5 +65,30 @@ mod tests {
         ] {
             assert!(SECOND_MIGRATION.contains(field), "missing field {field}");
         }
+    }
+
+    #[test]
+    fn third_migration_contains_control_plane_tables() {
+        assert_eq!(THIRD_MIGRATION_NAME, "0003_control_plane_resources.sql");
+        for table in [
+            "config_templates",
+            "config_deployments",
+            "orders",
+            "payments",
+            "devices",
+        ] {
+            assert!(
+                THIRD_MIGRATION.contains(&format!("CREATE TABLE {table}")),
+                "missing table {table}"
+            );
+        }
+    }
+
+    #[test]
+    fn fourth_migration_contains_revision_contract() {
+        assert!(FOURTH_MIGRATION.contains("publish_status"));
+        assert!(FOURTH_MIGRATION.contains("validation_status"));
+        assert!(FOURTH_MIGRATION.contains("template_id"));
+        assert!(FOURTH_MIGRATION.contains("updated_by"));
     }
 }

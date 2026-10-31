@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use cyberboard_storage::{INITIAL_MIGRATION, SECOND_MIGRATION};
+use cyberboard_storage::{FOURTH_MIGRATION, INITIAL_MIGRATION, SECOND_MIGRATION, THIRD_MIGRATION};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use thiserror::Error;
 use uuid::Uuid;
@@ -92,6 +92,36 @@ impl Database {
                 .await?;
             sqlx::query("INSERT INTO cyberboard_schema_migrations (version) VALUES ($1)")
                 .bind("0002_resource_fields")
+                .execute(&mut *transaction)
+                .await?;
+        }
+
+        let third_applied: Option<String> = sqlx::query_scalar(
+            "SELECT version FROM cyberboard_schema_migrations WHERE version = $1",
+        )
+        .bind("0003_control_plane_resources")
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if third_applied.is_none() {
+            sqlx::raw_sql(THIRD_MIGRATION)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("INSERT INTO cyberboard_schema_migrations (version) VALUES ($1)")
+                .bind("0003_control_plane_resources")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        let fourth: Option<String> =
+            sqlx::query_scalar("SELECT version FROM cyberboard_schema_migrations WHERE version=$1")
+                .bind("0004_config_revision_fields")
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if fourth.is_none() {
+            sqlx::raw_sql(FOURTH_MIGRATION)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
+                .bind("0004_config_revision_fields")
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -579,6 +609,156 @@ impl Database {
         .await?;
         Ok(active.is_some())
     }
+
+    pub async fn list_orders(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> DatabaseResult<Vec<OrderRecord>> {
+        let rows = sqlx::query("SELECT o.id,o.status,o.amount_cents,o.currency,o.created_at::text AS created_at,p.name AS plan FROM orders o JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id WHERE o.tenant_id=$1 AND o.user_id=$2 ORDER BY o.created_at DESC,o.id LIMIT $3 OFFSET $4").bind(tenant_id).bind(user_id).bind(limit).bind(offset).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(OrderRecord::from_row).collect())
+    }
+    pub async fn count_orders(&self, tenant_id: Uuid, user_id: Uuid) -> DatabaseResult<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT count(*) FROM orders WHERE tenant_id=$1 AND user_id=$2")
+                .bind(tenant_id)
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+    pub async fn list_devices(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> DatabaseResult<Vec<DeviceRecord>> {
+        let rows = sqlx::query("SELECT id,name,last_seen_at::text AS last_seen_at,created_at::text AS created_at,revoked_at::text AS revoked_at FROM devices WHERE tenant_id=$1 AND user_id=$2 ORDER BY created_at DESC,id LIMIT $3 OFFSET $4").bind(tenant_id).bind(user_id).bind(limit).bind(offset).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(DeviceRecord::from_row).collect())
+    }
+    pub async fn count_devices(&self, tenant_id: Uuid, user_id: Uuid) -> DatabaseResult<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT count(*) FROM devices WHERE tenant_id=$1 AND user_id=$2")
+                .bind(tenant_id)
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+    pub async fn usage_summary(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> DatabaseResult<UsageRecord> {
+        let row = sqlx::query("SELECT COALESCE(sum(download_bytes+upload_bytes),0)::bigint AS used_bytes,min(window_start)::text AS period_start,max(window_end)::text AS period_end FROM usage_events WHERE tenant_id=$1 AND user_id=$2").bind(tenant_id).bind(user_id).fetch_one(&self.pool).await?;
+        Ok(UsageRecord {
+            used_bytes: row.get("used_bytes"),
+            period_start: row.try_get("period_start").ok(),
+            period_end: row.try_get("period_end").ok(),
+        })
+    }
+
+    pub async fn list_config_templates(
+        &self,
+        tenant_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> DatabaseResult<Vec<ConfigTemplateRecord>> {
+        let rows = sqlx::query("SELECT id,name,description,core_type,core_version_range,status,updated_at::text AS updated_at,COALESCE(updated_by::text,'') AS updated_by FROM config_templates WHERE tenant_id=$1 ORDER BY updated_at DESC,id LIMIT $2 OFFSET $3")
+            .bind(tenant_id).bind(limit).bind(offset).fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(ConfigTemplateRecord::from_row)
+            .collect())
+    }
+
+    pub async fn count_config_templates(&self, tenant_id: Uuid) -> DatabaseResult<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT count(*) FROM config_templates WHERE tenant_id=$1")
+                .bind(tenant_id)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn create_config_template(
+        &self,
+        tenant_id: Uuid,
+        input: &ConfigTemplateInput,
+    ) -> DatabaseResult<ConfigTemplateRecord> {
+        let row = sqlx::query("INSERT INTO config_templates (tenant_id,name,description,core_type,core_version_range,content,status) VALUES ($1,$2,$3,$4,$5,'{}'::jsonb,$6) RETURNING id,name,description,core_type,core_version_range,status,updated_at::text AS updated_at,'' AS updated_by")
+            .bind(tenant_id).bind(&input.name).bind(&input.description).bind(&input.core_type).bind(&input.core_version_range).bind(&input.status).fetch_one(&self.pool).await?;
+        Ok(ConfigTemplateRecord::from_row(row))
+    }
+
+    pub async fn update_config_template(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+        input: &ConfigTemplateUpdate,
+    ) -> DatabaseResult<Option<ConfigTemplateRecord>> {
+        let row = sqlx::query("UPDATE config_templates SET name=COALESCE($3,name),description=COALESCE($4,description),core_type=COALESCE($5,core_type),core_version_range=COALESCE($6,core_version_range),status=COALESCE($7,status),updated_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING id,name,description,core_type,core_version_range,status,updated_at::text AS updated_at,'' AS updated_by")
+            .bind(tenant_id).bind(id).bind(&input.name).bind(&input.description).bind(&input.core_type).bind(&input.core_version_range).bind(&input.status).fetch_optional(&self.pool).await?;
+        Ok(row.map(ConfigTemplateRecord::from_row))
+    }
+
+    pub async fn delete_config_template(&self, tenant_id: Uuid, id: Uuid) -> DatabaseResult<bool> {
+        let result = sqlx::query("UPDATE config_templates SET status='archived',updated_at=now() WHERE tenant_id=$1 AND id=$2 AND status <> 'archived'").bind(tenant_id).bind(id).execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn list_config_revisions(
+        &self,
+        tenant_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> DatabaseResult<Vec<ConfigRevisionRecord>> {
+        let rows = sqlx::query("SELECT r.id,COALESCE(r.template_id::text,'') AS template_id,r.node_id,n.name AS node_name,r.generation,r.core_version,r.content_hash,CASE WHEN r.signature='' THEN 'pending' ELSE 'valid' END AS signature_status,r.validation_status,r.publish_status,r.failure_reason,r.created_at::text AS created_at FROM config_revisions r JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id WHERE r.tenant_id=$1 ORDER BY r.created_at DESC,r.id LIMIT $2 OFFSET $3")
+            .bind(tenant_id).bind(limit).bind(offset).fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(ConfigRevisionRecord::from_row)
+            .collect())
+    }
+
+    pub async fn create_config_revision(
+        &self,
+        tenant_id: Uuid,
+        template_id: Uuid,
+        node_id: Uuid,
+        generation: i64,
+        core_version: &str,
+        payload: &serde_json::Value,
+        content_hash: &str,
+    ) -> DatabaseResult<ConfigRevisionRecord> {
+        let row = sqlx::query("INSERT INTO config_revisions (tenant_id,template_id,node_id,generation,core_type,core_version,content_hash,signature,validation_status,publish_status,payload) SELECT $1,$2,$3,$4,t.core_type,$5,$6,'','validated','draft',$7 FROM config_templates t WHERE t.tenant_id=$1 AND t.id=$2 RETURNING id,COALESCE(template_id::text,'') AS template_id,node_id,generation,core_version,content_hash,'pending' AS signature_status,validation_status,publish_status,failure_reason,created_at::text AS created_at")
+            .bind(tenant_id).bind(template_id).bind(node_id).bind(generation).bind(core_version).bind(content_hash).bind(payload).fetch_one(&self.pool).await?;
+        Ok(ConfigRevisionRecord::from_row(row))
+    }
+
+    pub async fn count_config_revisions(&self, tenant_id: Uuid) -> DatabaseResult<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT count(*) FROM config_revisions WHERE tenant_id=$1")
+                .bind(tenant_id)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn set_config_publish_status(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+        expected_generation: i64,
+        status: &str,
+    ) -> DatabaseResult<Option<ConfigRevisionRecord>> {
+        let row = sqlx::query("UPDATE config_revisions SET publish_status=$4, failure_reason=NULL WHERE tenant_id=$1 AND id=$2 AND generation=$3 AND validation_status='validated' RETURNING id,COALESCE(template_id::text,'') AS template_id,node_id,generation,core_version,content_hash,validation_status,publish_status,failure_reason,created_at::text AS created_at")
+            .bind(tenant_id).bind(id).bind(expected_generation).bind(status).fetch_optional(&self.pool).await?;
+        Ok(row.map(ConfigRevisionRecord::from_row))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -741,6 +921,128 @@ pub struct SubscriptionRecord {
     pub traffic_quota_bytes: i64,
     pub expires_at: String,
     pub subscription_token: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderRecord {
+    pub id: Uuid,
+    pub status: String,
+    pub amount_cents: i64,
+    pub currency: String,
+    pub created_at: String,
+    pub plan: String,
+}
+impl OrderRecord {
+    fn from_row(row: sqlx::postgres::PgRow) -> Self {
+        Self {
+            id: row.get("id"),
+            status: row.get("status"),
+            amount_cents: row.get("amount_cents"),
+            currency: row.get("currency"),
+            created_at: row.get("created_at"),
+            plan: row.get("plan"),
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub struct DeviceRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub last_seen_at: Option<String>,
+    pub created_at: String,
+    pub revoked_at: Option<String>,
+}
+impl DeviceRecord {
+    fn from_row(row: sqlx::postgres::PgRow) -> Self {
+        Self {
+            id: row.get("id"),
+            name: row.get("name"),
+            last_seen_at: row.try_get("last_seen_at").ok(),
+            created_at: row.get("created_at"),
+            revoked_at: row.try_get("revoked_at").ok(),
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub struct UsageRecord {
+    pub used_bytes: i64,
+    pub period_start: Option<String>,
+    pub period_end: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfigTemplateInput {
+    pub name: String,
+    pub description: String,
+    pub core_type: String,
+    pub core_version_range: String,
+    pub status: String,
+}
+#[derive(Clone, Debug, Default)]
+pub struct ConfigTemplateUpdate {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub core_type: Option<String>,
+    pub core_version_range: Option<String>,
+    pub status: Option<String>,
+}
+#[derive(Clone, Debug)]
+pub struct ConfigTemplateRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub description: String,
+    pub core_type: String,
+    pub core_version_range: String,
+    pub status: String,
+    pub updated_at: String,
+    pub updated_by: String,
+}
+impl ConfigTemplateRecord {
+    fn from_row(row: sqlx::postgres::PgRow) -> Self {
+        Self {
+            id: row.get("id"),
+            name: row.get("name"),
+            description: row.get("description"),
+            core_type: row.get("core_type"),
+            core_version_range: row.get("core_version_range"),
+            status: row.get("status"),
+            updated_at: row.get("updated_at"),
+            updated_by: row.try_get("updated_by").unwrap_or_default(),
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub struct ConfigRevisionRecord {
+    pub id: Uuid,
+    pub template_id: String,
+    pub node_id: Uuid,
+    pub node_name: String,
+    pub generation: i64,
+    pub core_version: String,
+    pub content_hash: String,
+    pub signature_status: String,
+    pub validation_status: String,
+    pub publish_status: String,
+    pub failure_reason: Option<String>,
+    pub created_at: String,
+}
+impl ConfigRevisionRecord {
+    fn from_row(row: sqlx::postgres::PgRow) -> Self {
+        Self {
+            id: row.get("id"),
+            template_id: row.try_get("template_id").unwrap_or_default(),
+            node_id: row.get("node_id"),
+            node_name: row.try_get("node_name").unwrap_or_default(),
+            generation: row.get("generation"),
+            core_version: row.get("core_version"),
+            content_hash: row.get("content_hash"),
+            signature_status: row.try_get("signature_status").unwrap_or_default(),
+            validation_status: row.get("validation_status"),
+            publish_status: row.get("publish_status"),
+            failure_reason: row.try_get("failure_reason").ok(),
+            created_at: row.get("created_at"),
+        }
+    }
 }
 
 impl SubscriptionRecord {

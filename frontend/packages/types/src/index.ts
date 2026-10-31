@@ -25,9 +25,9 @@ export interface ConfigTemplateCreateInput { name: string; description?: string;
 export type ConfigTemplateUpdateInput = Partial<ConfigTemplateCreateInput>
 export interface ConfigRevisionQuery extends PageQuery { templateId?: string; nodeId?: string }
 export interface ConfigPublishInput { targetNodeIds?: string[]; expectedGeneration?: number }
-export interface ConfigRollbackInput { targetGeneration?: number; reason?: string }
-export interface OrderSummary { id: string; plan: string; status: 'pending' | 'paid' | 'cancelled' | 'refunded' | 'failed'; amountCents: number; currency: string; createdAt: string; paidAt: string | null }
-export interface DeviceSummary { id: string; name: string; platform: string; status: 'active' | 'revoked' | 'unknown'; lastSeenAt: string | null; ipAddress?: string }
+export interface ConfigRollbackInput { expectedGeneration?: number; reason?: string }
+export interface OrderSummary { id: string; plan: string; status: 'pending' | 'paid' | 'cancelled' | 'refunded' | 'failed'; amountCents: number; currency: string; createdAt: string; paidAt?: string | null }
+export interface DeviceSummary { id: string; name: string; lastSeenAt: string | null; createdAt: string; revokedAt: string | null; platform?: string; status?: 'active' | 'revoked' | 'unknown'; ipAddress?: string }
 export interface NodeSummary { id: string; name: string; region: string; address: string; status: NodeStatus; core: string; coreVersion: string; agentVersion: string; currentConfigRevision: string | null; latencyMs: number | null; lastHeartbeatAt: string | null }
 export interface SubscriptionSummary { id: string; userEmail: string; plan: string; status: SubscriptionStatus; trafficUsedBytes: number; trafficQuotaBytes: number; expiresAt: string; tokenHint: string; subscriptionUrl?: string }
 export interface DashboardSummary { users: number; activeSubscriptions: number; onlineNodes: number; trafficBytes24h: number; failedTasks: number; generatedAt: string }

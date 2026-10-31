@@ -4,6 +4,9 @@ use cyberboard_config::AgentConfig;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{info, warn};
 
+mod control_plane;
+mod runtime;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     cyberboard_observability::init("cyberboard_agent");

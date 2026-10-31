@@ -1,0 +1,10 @@
+ALTER TABLE config_templates ADD COLUMN IF NOT EXISTS core_version_range TEXT NOT NULL DEFAULT '*';
+ALTER TABLE config_templates ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
+ALTER TABLE config_templates ADD COLUMN IF NOT EXISTS updated_by UUID;
+ALTER TABLE config_revisions ADD COLUMN IF NOT EXISTS template_id UUID;
+ALTER TABLE config_revisions ADD COLUMN IF NOT EXISTS validation_status TEXT NOT NULL DEFAULT 'validated';
+ALTER TABLE config_revisions ADD COLUMN IF NOT EXISTS publish_status TEXT NOT NULL DEFAULT 'draft';
+ALTER TABLE config_revisions ADD COLUMN IF NOT EXISTS failure_reason TEXT;
+ALTER TABLE config_revisions ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE config_revisions ADD CONSTRAINT config_revisions_template_fk FOREIGN KEY (tenant_id, template_id) REFERENCES config_templates(tenant_id, id);
+CREATE INDEX IF NOT EXISTS config_revisions_tenant_created_idx ON config_revisions(tenant_id, created_at DESC);

@@ -34,14 +34,17 @@ curl http://127.0.0.1:8080/openapi.json
 
 The API accepts `CYBERBOARD_BIND_ADDR`, `CYBERBOARD_API_PORT`,
 `CYBERBOARD_DATABASE_URL`, `CYBERBOARD_REDIS_URL`,
-`CYBERBOARD_DEMO_ADMIN_EMAIL`, and `CYBERBOARD_DEMO_ADMIN_PASSWORD`. The last
-two credentials default to `admin@example.com` and `password` for local
-development only. `POST /api/v1/auth/login` returns the fixed development
-Bearer token `cyberboard-dev-token` with `expiresIn: 3600` as a client hint;
-the static placeholder token is not expired server-side. This must be replaced
-with persistent users, hashed passwords, expiring sessions, and token rotation
-before any shared or production deployment. Database and Redis are reported as
-configuration state only until the persistence slice is added.
+`CYBERBOARD_DEMO_ADMIN_EMAIL`, `CYBERBOARD_DEMO_ADMIN_PASSWORD`,
+`CYBERBOARD_DEMO_USER_EMAIL`, and `CYBERBOARD_DEMO_USER_PASSWORD`. The admin
+credentials default to `admin@example.com`/`password`, and the portal user
+credentials default to `lin@example.com`/`password`, for local development
+only. `POST /api/v1/auth/login` returns `cyberboard-dev-token`, while
+`POST /api/v1/auth/portal-login` returns the separate
+`cyberboard-portal-dev-token`. Both return `expiresIn: 3600` as a client hint;
+the static placeholder tokens are not expired server-side. These must be
+replaced with persistent users, hashed passwords, expiring sessions, and token
+rotation before any shared or production deployment. Database and Redis are
+reported as configuration state only until the persistence slice is added.
 
 The read-only session and admin endpoints require
 `Authorization: Bearer cyberboard-dev-token` after a successful development
@@ -52,6 +55,20 @@ curl -s http://127.0.0.1:8080/api/v1/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"email":"admin@example.com","password":"password"}'
 ```
+
+The user portal login uses its own credentials and token namespace:
+
+```sh
+curl -s http://127.0.0.1:8080/api/v1/auth/portal-login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"lin@example.com","password":"password"}'
+```
+
+The first reviewable PostgreSQL schema is available at
+`deploy/migrations/0001_initial.sql`. It can be applied by a migration runner
+once the persistence layer is introduced. The `cyberboard-storage` crate embeds
+the SQL with `include_str!` and tests that the core tables and append-only
+guards are present; it does not open a database connection yet.
 
 Run the worker or agent in separate terminals:
 

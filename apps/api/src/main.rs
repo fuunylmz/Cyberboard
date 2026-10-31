@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 const DEMO_ACCESS_TOKEN: &str = "cyberboard-dev-token";
+const DEMO_PORTAL_ACCESS_TOKEN: &str = "cyberboard-portal-dev-token";
 const DEMO_TOKEN_TYPE: &str = "Bearer";
 const DEMO_TOKEN_EXPIRES_IN: u64 = 3600;
 
@@ -21,6 +22,7 @@ const DEMO_TOKEN_EXPIRES_IN: u64 = 3600;
 struct AppState {
     config: Arc<ApiConfig>,
     demo_access_token: Arc<str>,
+    demo_portal_access_token: Arc<str>,
 }
 
 impl AppState {
@@ -28,6 +30,7 @@ impl AppState {
         Self {
             config: Arc::new(config),
             demo_access_token: Arc::from(DEMO_ACCESS_TOKEN),
+            demo_portal_access_token: Arc::from(DEMO_PORTAL_ACCESS_TOKEN),
         }
     }
 
@@ -36,10 +39,11 @@ impl AppState {
         Self {
             config: Arc::new(config),
             demo_access_token: Arc::from(token),
+            demo_portal_access_token: Arc::from(DEMO_PORTAL_ACCESS_TOKEN),
         }
     }
 
-    fn is_authorized(&self, headers: &HeaderMap) -> bool {
+    fn is_authorized_with(&self, headers: &HeaderMap, expected_token: &str) -> bool {
         let authorization = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
@@ -50,7 +54,16 @@ impl AppState {
                 (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
             });
 
-        authorization == Some(self.demo_access_token.as_ref())
+        authorization == Some(expected_token)
+    }
+
+    fn is_authorized(&self, headers: &HeaderMap) -> bool {
+        self.is_authorized_with(headers, self.demo_access_token.as_ref())
+    }
+
+    #[allow(dead_code)]
+    fn is_portal_authorized(&self, headers: &HeaderMap) -> bool {
+        self.is_authorized_with(headers, self.demo_portal_access_token.as_ref())
     }
 }
 
@@ -87,6 +100,12 @@ struct SessionUserResponse {
 
 #[derive(Deserialize)]
 struct LoginRequest {
+    email: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct PortalLoginRequest {
     email: String,
     password: String,
 }
@@ -152,6 +171,16 @@ fn demo_user(config: &ApiConfig) -> SessionUserResponse {
     }
 }
 
+fn demo_portal_user(config: &ApiConfig) -> SessionUserResponse {
+    SessionUserResponse {
+        id: "demo-user".to_owned(),
+        email: config.demo_user_email.clone(),
+        display_name: "Lin".to_owned(),
+        roles: vec!["user".to_owned()],
+        permissions: vec!["subscription:read".to_owned()],
+    }
+}
+
 async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>) -> Response {
     if request.email != state.config.demo_admin_email
         || request.password != state.config.demo_admin_password
@@ -164,6 +193,25 @@ async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>)
         token_type: DEMO_TOKEN_TYPE,
         expires_in: DEMO_TOKEN_EXPIRES_IN,
         user: demo_user(&state.config),
+    })
+    .into_response()
+}
+
+async fn portal_login(
+    State(state): State<AppState>,
+    Json(request): Json<PortalLoginRequest>,
+) -> Response {
+    if request.email != state.config.demo_user_email
+        || request.password != state.config.demo_user_password
+    {
+        return invalid_credentials_response();
+    }
+
+    Json(LoginResponse {
+        access_token: state.demo_portal_access_token.to_string(),
+        token_type: DEMO_TOKEN_TYPE,
+        expires_in: DEMO_TOKEN_EXPIRES_IN,
+        user: demo_portal_user(&state.config),
     })
     .into_response()
 }
@@ -332,6 +380,16 @@ async fn openapi() -> Json<Value> {
                     }
                 }
             },
+            "/api/v1/auth/portal-login": {
+                "post": {
+                    "operationId": "portalLogin",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PortalLoginRequest" } } } },
+                    "responses": {
+                        "200": { "description": "Development portal session token", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PortalLoginResponse" } } } },
+                        "401": { "description": "Invalid credentials", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }
+                    }
+                }
+            },
             "/api/v1/session": {
                 "get": { "operationId": "getSession", "security": [{"bearerAuth": []}], "responses": { "200": { "description": "Demo session user", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionUser" } } } }, "401": { "description": "Missing or invalid bearer token", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } } } }
             },
@@ -360,12 +418,35 @@ async fn openapi() -> Json<Value> {
                         "email": { "type": "string", "format": "email" }, "password": { "type": "string", "format": "password" }
                     }
                 },
+                "PortalLoginRequest": {
+                    "type": "object",
+                    "required": ["email", "password"],
+                    "properties": {
+                        "email": { "type": "string", "format": "email" }, "password": { "type": "string", "format": "password" }
+                    }
+                },
                 "LoginResponse": {
                     "type": "object",
                     "required": ["accessToken", "tokenType", "expiresIn", "user"],
                     "properties": {
                         "accessToken": { "type": "string" }, "tokenType": { "type": "string", "enum": ["Bearer"] },
                         "expiresIn": { "type": "integer", "format": "int64", "description": "Development hint only; the static placeholder token is not expired server-side." }, "user": { "$ref": "#/components/schemas/SessionUser" }
+                    }
+                },
+                "PortalLoginResponse": {
+                    "type": "object",
+                    "required": ["accessToken", "tokenType", "expiresIn", "user"],
+                    "properties": {
+                        "accessToken": { "type": "string", "description": "Fixed development-only portal token." }, "tokenType": { "type": "string", "enum": ["Bearer"] },
+                        "expiresIn": { "type": "integer", "format": "int64", "description": "Development hint only; the static placeholder token is not expired server-side." }, "user": { "$ref": "#/components/schemas/PortalUser" }
+                    }
+                },
+                "PortalUser": {
+                    "type": "object",
+                    "required": ["id", "email", "displayName", "roles", "permissions"],
+                    "properties": {
+                        "id": { "type": "string", "example": "demo-user" }, "email": { "type": "string" }, "displayName": { "type": "string", "example": "Lin" },
+                        "roles": { "type": "array", "items": { "type": "string", "enum": ["user"] } }, "permissions": { "type": "array", "items": { "type": "string", "enum": ["subscription:read"] } }
                     }
                 },
                 "ApiError": {
@@ -431,6 +512,7 @@ fn router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/openapi.json", get(openapi))
         .route("/api/v1/auth/login", post(login))
+        .route("/api/v1/auth/portal-login", post(portal_login))
         .route("/api/v1/session", get(session))
         .route("/api/v1/admin/dashboard", get(admin_dashboard))
         .route("/api/v1/admin/nodes", get(admin_nodes))
@@ -465,7 +547,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEMO_ACCESS_TOKEN, DEMO_GENERATED_AT, router};
+    use super::{DEMO_ACCESS_TOKEN, DEMO_GENERATED_AT, DEMO_PORTAL_ACCESS_TOKEN, router};
     use axum::{
         body::{Body, to_bytes},
         http::{HeaderMap, Request, StatusCode, header},
@@ -499,6 +581,8 @@ mod tests {
                 redis_url: None,
                 demo_admin_email: "admin@example.com".to_owned(),
                 demo_admin_password: "password".to_owned(),
+                demo_user_email: "lin@example.com".to_owned(),
+                demo_user_password: "password".to_owned(),
             },
             DEMO_ACCESS_TOKEN,
         )
@@ -566,6 +650,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn portal_login_returns_a_distinct_user_token() {
+        let response = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/portal-login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"email":"lin@example.com","password":"password"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["accessToken"], DEMO_PORTAL_ACCESS_TOKEN);
+        assert_ne!(body["accessToken"], DEMO_ACCESS_TOKEN);
+        assert_eq!(body["tokenType"], "Bearer");
+        assert_eq!(body["expiresIn"], 3600);
+        assert_eq!(body["user"]["id"], "demo-user");
+        assert_eq!(body["user"]["email"], "lin@example.com");
+        assert_eq!(body["user"]["displayName"], "Lin");
+        assert_eq!(body["user"]["roles"], serde_json::json!(["user"]));
+        assert_eq!(
+            body["user"]["permissions"],
+            serde_json::json!(["subscription:read"])
+        );
+    }
+
+    #[tokio::test]
+    async fn portal_login_rejects_admin_credentials() {
+        let (status, _, body) = request_json(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/portal-login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"email":"admin@example.com","password":"password"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["code"], "invalid_credentials");
+    }
+
+    #[test]
+    fn admin_and_portal_tokens_are_not_interchangeable() {
+        let state = test_state();
+        let admin_headers = HeaderMap::from_iter([(
+            header::AUTHORIZATION,
+            format!("Bearer {DEMO_ACCESS_TOKEN}").parse().unwrap(),
+        )]);
+        let portal_headers = HeaderMap::from_iter([(
+            header::AUTHORIZATION,
+            format!("Bearer {DEMO_PORTAL_ACCESS_TOKEN}")
+                .parse()
+                .unwrap(),
+        )]);
+        assert!(state.is_authorized(&admin_headers));
+        assert!(!state.is_authorized(&portal_headers));
+        assert!(state.is_portal_authorized(&portal_headers));
+        assert!(!state.is_portal_authorized(&admin_headers));
+    }
+
+    #[tokio::test]
     async fn protected_endpoints_require_and_accept_bearer_token() {
         let (status, headers, body) = get_json("/api/v1/session", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -619,7 +772,10 @@ mod tests {
         let (status, _, document) = get_json("/openapi.json", None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(document["paths"]["/api/v1/auth/login"].is_object());
+        assert!(document["paths"]["/api/v1/auth/portal-login"].is_object());
         assert!(document["components"]["schemas"]["LoginResponse"].is_object());
+        assert!(document["components"]["schemas"]["PortalLoginRequest"].is_object());
+        assert!(document["components"]["schemas"]["PortalLoginResponse"].is_object());
         for path in [
             "/api/v1/session",
             "/api/v1/admin/dashboard",

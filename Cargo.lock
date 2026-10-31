@@ -144,6 +144,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyberboard-storage"
+version = "0.1.0"
+
+[[package]]
 name = "cyberboard-worker"
 version = "0.1.0"
 dependencies = [

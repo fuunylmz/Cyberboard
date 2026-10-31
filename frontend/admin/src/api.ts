@@ -1,13 +1,6 @@
-import { ApiClient, ApiError, createAdminApi } from '@cyberboard/api-client'
+import { ApiClient, ApiError, createAdminApi, normalizeApiBaseUrl } from '@cyberboard/api-client'
 
 export const adminAccessTokenKey = 'cyberboard.admin.accessToken'
-/** Accepts only a same-origin `/api` prefix or an absolute origin ending in `/api`. */
-export function normalizeApiBaseUrl(value: string | undefined): string {
-  const configured = (value || '/api').replace(/\/+$/, '')
-  if (configured === '/api' || configured.endsWith('/api')) return configured
-  if (/^https?:\/\/[^/]+$/.test(configured)) return `${configured}/api`
-  throw new Error('VITE_API_BASE_URL must be /api or an HTTP(S) origin ending in /api')
-}
 const baseUrl = normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL)
 
 export const adminApi = createAdminApi(new ApiClient({

@@ -61,6 +61,8 @@ pub struct ApiConfig {
     pub redis_url: Option<String>,
     pub demo_admin_email: String,
     pub demo_admin_password: String,
+    pub demo_user_email: String,
+    pub demo_user_password: String,
 }
 
 impl ApiConfig {
@@ -73,6 +75,10 @@ impl ApiConfig {
             demo_admin_email: optional_env("CYBERBOARD_DEMO_ADMIN_EMAIL")
                 .unwrap_or_else(|| "admin@example.com".to_owned()),
             demo_admin_password: optional_env("CYBERBOARD_DEMO_ADMIN_PASSWORD")
+                .unwrap_or_else(|| "password".to_owned()),
+            demo_user_email: optional_env("CYBERBOARD_DEMO_USER_EMAIL")
+                .unwrap_or_else(|| "lin@example.com".to_owned()),
+            demo_user_password: optional_env("CYBERBOARD_DEMO_USER_PASSWORD")
                 .unwrap_or_else(|| "password".to_owned()),
         })
     }

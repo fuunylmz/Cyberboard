@@ -8,6 +8,7 @@ members = [
     "crates/config-compiler",
     "crates/domain",
     "crates/observability",
+    "crates/payment-provider",
     "crates/storage",
 ]
 resolver = "2"

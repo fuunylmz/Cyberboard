@@ -446,6 +446,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyberboard-payment-provider"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "cyberboard-storage"
 version = "0.1.0"
 

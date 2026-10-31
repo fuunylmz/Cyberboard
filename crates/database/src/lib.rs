@@ -519,6 +519,44 @@ impl Database {
         })
     }
 
+    pub async fn list_audit_logs(
+        &self,
+        tenant_id: Uuid,
+        limit: i64,
+        offset: i64,
+        search: Option<&str>,
+        action: Option<&str>,
+    ) -> DatabaseResult<Vec<AuditLogRecord>> {
+        let rows = sqlx::query(
+            "SELECT a.id,a.action,a.resource_type,a.resource_id,a.request_id,
+                    a.details,a.created_at::text AS created_at,
+                    a.actor_user_id,u.email AS actor_email
+             FROM audit_logs a
+             LEFT JOIN users u ON u.tenant_id=a.tenant_id AND u.id=a.actor_user_id
+             WHERE a.tenant_id=$1
+               AND ($2::text IS NULL OR a.action ILIKE '%' || $2 || '%' OR a.resource_type ILIKE '%' || $2 || '%')
+               AND ($3::text IS NULL OR a.action=$3)
+             ORDER BY a.created_at DESC,a.id DESC LIMIT $4 OFFSET $5",
+        )
+        .bind(tenant_id).bind(search).bind(action).bind(limit).bind(offset)
+        .fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(AuditLogRecord::from_row).collect())
+    }
+
+    pub async fn count_audit_logs(
+        &self,
+        tenant_id: Uuid,
+        search: Option<&str>,
+        action: Option<&str>,
+    ) -> DatabaseResult<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT count(*) FROM audit_logs a
+             WHERE a.tenant_id=$1
+               AND ($2::text IS NULL OR a.action ILIKE '%' || $2 || '%' OR a.resource_type ILIKE '%' || $2 || '%')
+               AND ($3::text IS NULL OR a.action=$3)",
+        ).bind(tenant_id).bind(search).bind(action).fetch_one(&self.pool).await?)
+    }
+
     pub async fn create_user(
         &self,
         tenant_id: Uuid,
@@ -2082,6 +2120,35 @@ pub struct DashboardStats {
     pub traffic_bytes_24h: i64,
     pub failed_tasks: i64,
     pub generated_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AuditLogRecord {
+    pub id: Uuid,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: Option<Uuid>,
+    pub request_id: Option<String>,
+    pub details: serde_json::Value,
+    pub created_at: String,
+    pub actor_user_id: Option<Uuid>,
+    pub actor_email: Option<String>,
+}
+
+impl AuditLogRecord {
+    fn from_row(row: sqlx::postgres::PgRow) -> Self {
+        Self {
+            id: row.get("id"),
+            action: row.get("action"),
+            resource_type: row.get("resource_type"),
+            resource_id: row.try_get("resource_id").ok(),
+            request_id: row.try_get("request_id").ok(),
+            details: row.get("details"),
+            created_at: row.get("created_at"),
+            actor_user_id: row.try_get("actor_user_id").ok(),
+            actor_email: row.try_get("actor_email").ok(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

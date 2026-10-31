@@ -722,6 +722,20 @@ struct AdminOrderSummaryResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct AuditLogSummaryResponse {
+    id: String,
+    action: String,
+    resource_type: String,
+    resource_id: Option<String>,
+    request_id: Option<String>,
+    details: Value,
+    created_at: String,
+    actor_user_id: Option<String>,
+    actor_email: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SessionSummaryResponse {
     id: String,
     role: String,
@@ -1970,6 +1984,66 @@ async fn admin_orders(
     .into_response()
 }
 
+fn audit_log_summary(log: cyberboard_database::AuditLogRecord) -> AuditLogSummaryResponse {
+    AuditLogSummaryResponse {
+        id: log.id.to_string(),
+        action: log.action,
+        resource_type: log.resource_type,
+        resource_id: log.resource_id.map(|id| id.to_string()),
+        request_id: log.request_id,
+        details: log.details,
+        created_at: log.created_at,
+        actor_user_id: log.actor_user_id.map(|id| id.to_string()),
+        actor_email: log.actor_email,
+    }
+}
+
+async fn admin_audit_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(pagination): Query<PaginationQuery>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    let limit = pagination.bounded_limit();
+    let offset = pagination.bounded_offset();
+    let items = match database
+        .list_audit_logs(
+            state.config.tenant_id,
+            limit,
+            offset,
+            pagination.search.as_deref(),
+            pagination.status.as_deref(),
+        )
+        .await
+    {
+        Ok(items) => items.into_iter().map(audit_log_summary).collect(),
+        Err(_) => return internal_database_response(),
+    };
+    let total = match database
+        .count_audit_logs(
+            state.config.tenant_id,
+            pagination.search.as_deref(),
+            pagination.status.as_deref(),
+        )
+        .await
+    {
+        Ok(total) => total,
+        Err(_) => return internal_database_response(),
+    };
+    Json(ResourceListResponse {
+        items,
+        total,
+        page: offset / limit + 1,
+        page_size: limit,
+    })
+    .into_response()
+}
+
 async fn me_plans(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(response) = require_portal_auth(&state, &headers) {
         return response;
@@ -2568,6 +2642,9 @@ async fn openapi() -> Json<Value> {
             "/api/v1/admin/orders": {
                 "get": { "operationId":"listAdminOrders", "security":[{"bearerAuth":[]}], "parameters":[{"name":"page","in":"query","schema":{"type":"integer"}},{"name":"pageSize","in":"query","schema":{"type":"integer"}},{"name":"search","in":"query","schema":{"type":"string"}},{"name":"status","in":"query","schema":{"type":"string","enum":["pending","paid","cancelled","refunded"]}}], "responses":{"200":{"description":"Tenant-scoped order page","content":{"application/json":{"schema":{"$ref":"#/components/schemas/AdminOrderList"}}}},"401":{"description":"Invalid token"},"500":{"description":"Database error"},"503":{"description":"Database unavailable"}} }
             },
+            "/api/v1/admin/audit-logs": {
+                "get": { "operationId":"listAdminAuditLogs", "security":[{"bearerAuth":[]}], "parameters":[{"name":"page","in":"query","schema":{"type":"integer"}},{"name":"pageSize","in":"query","schema":{"type":"integer"}},{"name":"search","in":"query","schema":{"type":"string"}},{"name":"status","in":"query","schema":{"type":"string","description":"Exact audit action filter"}}], "responses":{"200":{"description":"Tenant-scoped audit log page"},"401":{"description":"Invalid token"},"500":{"description":"Database error"},"503":{"description":"Database unavailable"}} }
+            },
             "/api/v1/me/devices": { "get": { "operationId":"listMyDevices", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped device page"},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} } },
             "/api/v1/me/devices/{deviceId}": { "delete": { "operationId":"revokeMyDevice", "security":[{"portalBearerAuth":[]}], "parameters":[{"name":"deviceId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}], "responses":{"204":{"description":"Device revoked"},"401":{"description":"Invalid portal token"},"404":{"description":"Device not found or already revoked"},"503":{"description":"Database unavailable"}} } },
             "/api/v1/me/devices/{deviceId}/revoke": { "post": { "operationId":"revokeMyDeviceExplicit", "security":[{"portalBearerAuth":[]}], "parameters":[{"name":"deviceId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}], "responses":{"204":{"description":"Device revoked"},"401":{"description":"Invalid portal token"},"404":{"description":"Device not found or already revoked"},"503":{"description":"Database unavailable"}} } },
@@ -2756,6 +2833,8 @@ async fn openapi() -> Json<Value> {
                 "OrderSummary": { "type":"object", "required":["id","status","amountCents","currency","createdAt","plan"], "properties":{"id":{"type":"string","format":"uuid"},"status":{"type":"string","enum":["pending","paid","cancelled","refunded","failed"]},"amountCents":{"type":"integer","format":"int64"},"currency":{"type":"string"},"createdAt":{"type":"string","format":"date-time"},"paidAt":{"type":"string","format":"date-time","nullable":true},"plan":{"type":"string"}} },
                 "AdminOrderSummary": { "type":"object", "required":["id","userId","userEmail","plan","status","amountCents","currency","createdAt","paidAt"], "properties":{"id":{"type":"string","format":"uuid"},"userId":{"type":"string","format":"uuid"},"userEmail":{"type":"string","format":"email"},"plan":{"type":"string"},"status":{"type":"string","enum":["pending","paid","cancelled","refunded"]},"amountCents":{"type":"integer","format":"int64"},"currency":{"type":"string"},"createdAt":{"type":"string","format":"date-time"},"paidAt":{"type":["string","null"],"format":"date-time"}} },
                 "AdminOrderList": { "type":"object", "required":["items","total","page","pageSize"], "properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/AdminOrderSummary"}},"total":{"type":"integer","format":"int64"},"page":{"type":"integer"},"pageSize":{"type":"integer"}} },
+                "AuditLogSummary": { "type":"object", "required":["id","action","resourceType","details","createdAt"], "properties":{"id":{"type":"string","format":"uuid"},"action":{"type":"string"},"resourceType":{"type":"string"},"resourceId":{"type":["string","null"],"format":"uuid"},"requestId":{"type":["string","null"]},"details":{"type":"object"},"createdAt":{"type":"string","format":"date-time"},"actorUserId":{"type":["string","null"],"format":"uuid"},"actorEmail":{"type":["string","null"],"format":"email"}} },
+                "AuditLogList": { "type":"object", "required":["items","total","page","pageSize"], "properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/AuditLogSummary"}},"total":{"type":"integer","format":"int64"},"page":{"type":"integer"},"pageSize":{"type":"integer"}} },
                 "CreateOrderRequest": { "type":"object", "required":["planId"], "properties":{"planId":{"type":"string","format":"uuid"}} },
                 "ChangePasswordRequest": { "type":"object", "required":["currentPassword","newPassword"], "properties":{"currentPassword":{"type":"string","format":"password","minLength":1},"newPassword":{"type":"string","format":"password","minLength":8}} },
                 "SessionSummary": { "type":"object", "required":["id","role","issuedAt","expiresAt","revokedAt","active","current"], "properties":{"id":{"type":"string","format":"uuid"},"role":{"type":"string"},"issuedAt":{"type":"string","format":"date-time"},"expiresAt":{"type":"string","format":"date-time"},"revokedAt":{"type":["string","null"],"format":"date-time"},"active":{"type":"boolean"},"current":{"type":"boolean"}} },
@@ -2851,6 +2930,7 @@ fn router(state: AppState) -> Router {
             patch(update_admin_subscription).delete(delete_admin_subscription),
         )
         .route("/api/v1/admin/orders", get(admin_orders))
+        .route("/api/v1/admin/audit-logs", get(admin_audit_logs))
         .route(
             "/api/v1/admin/orders/{order_id}/mark-paid",
             post(mark_admin_order_paid),
@@ -3364,6 +3444,7 @@ mod tests {
             "SubscriptionList",
             "PortalUsage",
             "AdminOrderList",
+            "AuditLogList",
             "SessionList",
             "AgentRegistrationToken",
         ] {
@@ -3388,6 +3469,7 @@ mod tests {
             "/api/v1/admin/plans",
             "/api/v1/admin/subscriptions",
             "/api/v1/admin/orders",
+            "/api/v1/admin/audit-logs",
             "/api/v1/admin/config-revisions",
             "/api/v1/admin/plans/{planId}",
             "/api/v1/admin/nodes/{nodeId}",

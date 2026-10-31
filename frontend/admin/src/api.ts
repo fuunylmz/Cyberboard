@@ -1,5 +1,6 @@
 import { ApiClient, ApiError, createAdminApi, normalizeApiBaseUrl } from '@cyberboard/api-client'
 import type { ListResponse } from '@cyberboard/types'
+import type { AuditLogSummary } from '@cyberboard/types'
 
 export const adminAccessTokenKey = 'cyberboard.admin.accessToken'
 const baseUrl = normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL)
@@ -9,6 +10,15 @@ export const adminApi = createAdminApi(new ApiClient({
   getAccessToken: () => typeof window === 'undefined' ? null : localStorage.getItem(adminAccessTokenKey),
   onUnauthorized: () => window.dispatchEvent(new CustomEvent('cyberboard:unauthorized')),
 }))
+
+const auditClient = new ApiClient({
+  baseUrl,
+  getAccessToken: () => typeof window === 'undefined' ? null : localStorage.getItem(adminAccessTokenKey),
+  onUnauthorized: () => window.dispatchEvent(new CustomEvent('cyberboard:unauthorized')),
+})
+export const auditApi = {
+  list: (query: { page?: number; pageSize?: number; search?: string; action?: string }) => auditClient.get<ListResponse<AuditLogSummary>>(`/v1/admin/audit-logs?${new URLSearchParams(Object.entries(query).filter(([, value]) => value !== undefined).map(([key, value]) => [key, String(value)]))}`),
+}
 
 export function normalizePage<T>(response: ListResponse<T>, page = 1, pageSize = 20) {
   return Array.isArray(response) ? { items: response, total: response.length, page, pageSize } : response

@@ -32,6 +32,9 @@ pub const TENTH_MIGRATION: &str =
 pub const ELEVENTH_MIGRATION_NAME: &str = "0011_agent_releases.sql";
 pub const ELEVENTH_MIGRATION: &str =
     include_str!("../../../deploy/migrations/0011_agent_releases.sql");
+pub const TWELFTH_MIGRATION_NAME: &str = "0012_session_refresh.sql";
+pub const TWELFTH_MIGRATION: &str =
+    include_str!("../../../deploy/migrations/0012_session_refresh.sql");
 
 #[cfg(test)]
 mod tests {
@@ -40,7 +43,8 @@ mod tests {
         FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, INITIAL_MIGRATION_NAME,
         NINTH_MIGRATION, NINTH_MIGRATION_NAME, SECOND_MIGRATION, SECOND_MIGRATION_NAME,
         SEVENTH_MIGRATION, SEVENTH_MIGRATION_NAME, SIXTH_MIGRATION, TENTH_MIGRATION,
-        TENTH_MIGRATION_NAME, THIRD_MIGRATION, THIRD_MIGRATION_NAME,
+        TENTH_MIGRATION_NAME, THIRD_MIGRATION, THIRD_MIGRATION_NAME, TWELFTH_MIGRATION,
+        TWELFTH_MIGRATION_NAME,
     };
 
     #[test]
@@ -132,5 +136,7 @@ mod tests {
         assert_eq!(ELEVENTH_MIGRATION_NAME, "0011_agent_releases.sql");
         assert!(ELEVENTH_MIGRATION.contains("agent_releases"));
         assert!(ELEVENTH_MIGRATION.contains("agent_upgrade_results"));
+        assert_eq!(TWELFTH_MIGRATION_NAME, "0012_session_refresh.sql");
+        assert!(TWELFTH_MIGRATION.contains("refresh_token_hash"));
     }
 }

@@ -37,6 +37,8 @@ const DEMO_ACCESS_TOKEN: &str = "cyberboard-dev-token";
 const DEMO_PORTAL_ACCESS_TOKEN: &str = "cyberboard-portal-dev-token";
 const DEMO_TOKEN_TYPE: &str = "Bearer";
 const DEMO_TOKEN_EXPIRES_IN: u64 = 3600;
+const ACCESS_TOKEN_TTL_SECS: i64 = 900;
+const REFRESH_TOKEN_TTL_SECS: i64 = 2_592_000;
 const AGENT_REGISTRATION_TOKEN_TTL_SECS: i64 = 900;
 
 #[derive(Clone)]
@@ -268,6 +270,12 @@ struct PortalLoginRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RefreshRequest {
+    refresh_token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ChangePasswordRequest {
     current_password: String,
     new_password: String,
@@ -279,6 +287,7 @@ struct LoginResponse {
     access_token: String,
     token_type: &'static str,
     expires_in: u64,
+    refresh_token: Option<String>,
     user: SessionUserResponse,
 }
 
@@ -475,6 +484,18 @@ fn demo_portal_user(config: &ApiConfig) -> SessionUserResponse {
     }
 }
 
+fn new_refresh_token() -> String {
+    format!(
+        "cb-refresh-{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
+fn new_access_token(role: &str) -> String {
+    format!("cb-{role}-{}", Uuid::new_v4())
+}
+
 async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>) -> Response {
     if !credentials_match(
         &state,
@@ -488,8 +509,9 @@ async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>)
     {
         return invalid_credentials_response();
     }
+    let mut refresh_token_response = None;
     let access_token = if state.database.is_some() {
-        format!("cb-admin-{}", uuid::Uuid::new_v4())
+        new_access_token("admin")
     } else {
         state.demo_access_token.to_string()
     };
@@ -498,13 +520,17 @@ async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>)
             .find_user_credentials(state.config.tenant_id, &request.email)
             .await
         {
+            let refresh_token = new_refresh_token();
+            refresh_token_response = Some(refresh_token.clone());
             if database
-                .create_session(
+                .create_session_with_refresh(
                     state.config.tenant_id,
                     user.id,
                     &access_token,
+                    &refresh_token,
                     "admin",
-                    3600,
+                    ACCESS_TOKEN_TTL_SECS,
+                    REFRESH_TOKEN_TTL_SECS,
                 )
                 .await
                 .is_err()
@@ -517,7 +543,12 @@ async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>)
     Json(LoginResponse {
         access_token,
         token_type: DEMO_TOKEN_TYPE,
-        expires_in: DEMO_TOKEN_EXPIRES_IN,
+        expires_in: if state.database.is_some() {
+            ACCESS_TOKEN_TTL_SECS as u64
+        } else {
+            DEMO_TOKEN_EXPIRES_IN
+        },
+        refresh_token: refresh_token_response,
         user: demo_user(&state.config),
     })
     .into_response()
@@ -540,6 +571,7 @@ async fn portal_login(
         return invalid_credentials_response();
     }
 
+    let mut refresh_token_response = None;
     let (access_token, portal_user) = if let Some(database) = state.database.as_ref() {
         let credentials = match database
             .find_user_credentials(state.config.tenant_id, &request.email)
@@ -548,7 +580,9 @@ async fn portal_login(
             Ok(Some(value)) => value,
             _ => return invalid_credentials_response(),
         };
-        let token = format!("cb-portal-{}", uuid::Uuid::new_v4());
+        let token = new_access_token("portal");
+        let refresh_token = new_refresh_token();
+        refresh_token_response = Some(refresh_token.clone());
         if let Ok(mut sessions) = state.portal_sessions.write() {
             sessions.insert(
                 token.clone(),
@@ -559,7 +593,15 @@ async fn portal_login(
             );
         }
         if database
-            .create_session(state.config.tenant_id, credentials.id, &token, "user", 3600)
+            .create_session_with_refresh(
+                state.config.tenant_id,
+                credentials.id,
+                &token,
+                &refresh_token,
+                "user",
+                ACCESS_TOKEN_TTL_SECS,
+                REFRESH_TOKEN_TTL_SECS,
+            )
             .await
             .is_err()
         {
@@ -585,8 +627,71 @@ async fn portal_login(
     Json(LoginResponse {
         access_token,
         token_type: DEMO_TOKEN_TYPE,
-        expires_in: DEMO_TOKEN_EXPIRES_IN,
+        expires_in: if state.database.is_some() {
+            ACCESS_TOKEN_TTL_SECS as u64
+        } else {
+            DEMO_TOKEN_EXPIRES_IN
+        },
+        refresh_token: refresh_token_response,
         user: portal_user,
+    })
+    .into_response()
+}
+
+async fn refresh_session(
+    State(state): State<AppState>,
+    Json(request): Json<RefreshRequest>,
+) -> Response {
+    let Some(database) = state.database.as_ref() else {
+        return invalid_input_response("开发内存模式不支持 refresh token，请重新登录");
+    };
+    if request.refresh_token.trim().is_empty() {
+        return invalid_input_response("refreshToken 不能为空");
+    }
+    let access_token = new_access_token("refresh");
+    let next_refresh_token = new_refresh_token();
+    let Some(session) = (match database
+        .rotate_session_refresh(
+            state.config.tenant_id,
+            &request.refresh_token,
+            &access_token,
+            &next_refresh_token,
+            ACCESS_TOKEN_TTL_SECS,
+            REFRESH_TOKEN_TTL_SECS,
+        )
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => return internal_database_response(),
+    }) else {
+        return invalid_credentials_response();
+    };
+    let Some(credentials) = (match database
+        .find_user_credentials_by_id(state.config.tenant_id, session.user_id)
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => return internal_database_response(),
+    }) else {
+        return invalid_credentials_response();
+    };
+    let user = SessionUserResponse {
+        id: credentials.id.to_string(),
+        email: credentials.email,
+        display_name: credentials.display_name,
+        roles: vec![session.role.clone()],
+        permissions: if session.role == "admin" {
+            vec!["*".to_owned()]
+        } else {
+            vec!["subscription:read".to_owned()]
+        },
+    };
+    Json(LoginResponse {
+        access_token,
+        token_type: DEMO_TOKEN_TYPE,
+        expires_in: ACCESS_TOKEN_TTL_SECS as u64,
+        refresh_token: Some(next_refresh_token),
+        user,
     })
     .into_response()
 }
@@ -2621,6 +2726,9 @@ async fn openapi() -> Json<Value> {
                     }
                 }
             },
+            "/api/v1/auth/refresh": {
+                "post": { "operationId":"refreshSession", "requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/RefreshRequest"}}}}, "responses":{"200":{"description":"Rotated access and refresh tokens","content":{"application/json":{"schema":{"$ref":"#/components/schemas/LoginResponse"}}}},"400":{"description":"Invalid refresh request"},"401":{"description":"Refresh token is invalid or expired"}} }
+            },
             "/api/v1/session": {
                 "get": { "operationId": "getSession", "security": [{"bearerAuth": []}], "responses": { "200": { "description": "Demo session user", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionUser" } } } }, "401": { "description": "Missing or invalid bearer token", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } } } }
             },
@@ -2727,7 +2835,7 @@ async fn openapi() -> Json<Value> {
                     "required": ["accessToken", "tokenType", "expiresIn", "user"],
                     "properties": {
                         "accessToken": { "type": "string" }, "tokenType": { "type": "string", "enum": ["Bearer"] },
-                        "expiresIn": { "type": "integer", "format": "int64", "description": "Development hint only; the static placeholder token is not expired server-side." }, "user": { "$ref": "#/components/schemas/SessionUser" }
+                        "expiresIn": { "type": "integer", "format": "int64" }, "refreshToken": { "type": ["string","null"] }, "user": { "$ref": "#/components/schemas/SessionUser" }
                     }
                 },
                 "PortalLoginResponse": {
@@ -2735,9 +2843,10 @@ async fn openapi() -> Json<Value> {
                     "required": ["accessToken", "tokenType", "expiresIn", "user"],
                     "properties": {
                         "accessToken": { "type": "string", "description": "Fixed development-only portal token." }, "tokenType": { "type": "string", "enum": ["Bearer"] },
-                        "expiresIn": { "type": "integer", "format": "int64", "description": "Development hint only; the static placeholder token is not expired server-side." }, "user": { "$ref": "#/components/schemas/PortalUser" }
+                        "expiresIn": { "type": "integer", "format": "int64" }, "refreshToken": { "type": ["string","null"] }, "user": { "$ref": "#/components/schemas/PortalUser" }
                     }
                 },
+                "RefreshRequest": { "type":"object", "required":["refreshToken"], "properties":{"refreshToken":{"type":"string","minLength":1}} },
                 "PortalUser": {
                     "type": "object",
                     "required": ["id", "email", "displayName", "roles", "permissions"],
@@ -2856,6 +2965,7 @@ fn router(state: AppState) -> Router {
         .route("/openapi.json", get(openapi))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/logout", post(logout))
+        .route("/api/v1/auth/refresh", post(refresh_session))
         .route("/api/v1/auth/portal-login", post(portal_login))
         .route("/subscribe/{token}", get(public_subscription));
 

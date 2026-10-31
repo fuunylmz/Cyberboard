@@ -9,7 +9,7 @@ use std::time::Duration;
 use cyberboard_storage::{
     EIGHTH_MIGRATION, ELEVENTH_MIGRATION, FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION,
     NINTH_MIGRATION, SECOND_MIGRATION, SEVENTH_MIGRATION, SIXTH_MIGRATION, TENTH_MIGRATION,
-    THIRD_MIGRATION,
+    THIRD_MIGRATION, TWELFTH_MIGRATION,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -72,6 +72,68 @@ impl Database {
         sqlx::query("INSERT INTO sessions(tenant_id,user_id,token_hash,role,expires_at) VALUES($1,$2,$3,$4,now()+make_interval(secs=>$5))")
             .bind(tenant_id).bind(user_id).bind(hash_session_token(token)).bind(role).bind(ttl_seconds as f64).execute(&self.pool).await?;
         Ok(())
+    }
+
+    pub async fn create_session_with_refresh(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        access_token: &str,
+        refresh_token: &str,
+        role: &str,
+        access_ttl_seconds: i64,
+        refresh_ttl_seconds: i64,
+    ) -> DatabaseResult<()> {
+        sqlx::query("INSERT INTO sessions(tenant_id,user_id,token_hash,role,expires_at,refresh_token_hash,refresh_expires_at) VALUES($1,$2,$3,$4,now()+make_interval(secs=>$5),$6,now()+make_interval(secs=>$7))")
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(hash_session_token(access_token))
+            .bind(role)
+            .bind(access_ttl_seconds as f64)
+            .bind(hash_session_token(refresh_token))
+            .bind(refresh_ttl_seconds as f64)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn rotate_session_refresh(
+        &self,
+        tenant_id: Uuid,
+        refresh_token: &str,
+        access_token: &str,
+        next_refresh_token: &str,
+        access_ttl_seconds: i64,
+        refresh_ttl_seconds: i64,
+    ) -> DatabaseResult<Option<SessionRecord>> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT id,user_id,role FROM sessions WHERE tenant_id=$1 AND refresh_token_hash=$2 AND refresh_expires_at>now() AND revoked_at IS NULL FOR UPDATE")
+            .bind(tenant_id)
+            .bind(hash_session_token(refresh_token))
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let session_id: Uuid = row.get("id");
+        sqlx::query("UPDATE sessions SET token_hash=$2,expires_at=now()+make_interval(secs=>$3),refresh_token_hash=$4,refresh_expires_at=now()+make_interval(secs=>$5),refresh_rotated_at=now() WHERE tenant_id=$1 AND id=$6")
+            .bind(tenant_id)
+            .bind(hash_session_token(access_token))
+            .bind(access_ttl_seconds as f64)
+            .bind(hash_session_token(next_refresh_token))
+            .bind(refresh_ttl_seconds as f64)
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        let result = SessionRecord {
+            id: session_id,
+            user_id: row.get("user_id"),
+            role: row.get("role"),
+            active: true,
+        };
+        tx.commit().await?;
+        Ok(Some(result))
     }
     pub async fn find_session(
         &self,
@@ -347,6 +409,21 @@ impl Database {
                 .await?;
             sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
                 .bind("0011_agent_releases")
+                .execute(&mut *transaction)
+                .await?;
+        }
+
+        let twelfth: Option<String> =
+            sqlx::query_scalar("SELECT version FROM cyberboard_schema_migrations WHERE version=$1")
+                .bind("0012_session_refresh")
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if twelfth.is_none() {
+            sqlx::raw_sql(TWELFTH_MIGRATION)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
+                .bind("0012_session_refresh")
                 .execute(&mut *transaction)
                 .await?;
         }

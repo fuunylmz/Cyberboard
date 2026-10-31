@@ -4,7 +4,7 @@ export type SubscriptionStatus = 'active' | 'pending' | 'expired' | 'revoked'
 
 export interface SessionUser { id: string; email: string; displayName: string; roles: string[]; permissions: string[] }
 export interface LoginCredentials { email: string; password: string }
-export interface LoginResponse { user: SessionUser; accessToken: string; tokenType: 'Bearer'; expiresIn: number }
+export interface LoginResponse { user: SessionUser; accessToken: string; tokenType: 'Bearer'; expiresIn: number; refreshToken?: string | null }
 export interface UserSummary { id: string; email: string; displayName: string; status: UserStatus; plan: string; usedBytes: number; quotaBytes: number; expiresAt: string; lastSeenAt: string | null }
 export interface PageQuery { page?: number; pageSize?: number; search?: string; status?: string }
 export interface PaginatedResponse<T> { items: T[]; total: number; page: number; pageSize: number }

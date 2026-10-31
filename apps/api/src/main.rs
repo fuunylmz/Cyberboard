@@ -2633,7 +2633,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.config.agent_grpc_server_key.as_deref(),
     ) {
         (Some(cert_path), Some(key_path)) => {
-            if !state.config.dev_mode && state.config.agent_grpc_client_ca.is_none() {
+            if state.database.is_some()
+                && !state.config.dev_mode
+                && state.config.agent_grpc_client_ca.is_none()
+            {
                 return Err(
                     "Agent gRPC client CA is required for mutual TLS outside development mode"
                         .into(),
@@ -2651,7 +2654,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             grpc_builder = grpc_builder.tls_config(tls)?;
         }
-        (None, None) if state.config.dev_mode => {
+        (None, None) if state.config.dev_mode || state.database.is_none() => {
             tracing::warn!("Agent gRPC is running without TLS in explicit development mode");
         }
         _ => {

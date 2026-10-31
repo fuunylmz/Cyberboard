@@ -8,6 +8,10 @@ pub const PROTOCOL_PACKAGE: &str = "cyberboard.agent.v1";
 pub const PROTOCOL_VERSION: &str = "v1";
 pub const PROTOCOL_SCHEMA: &str = include_str!("../proto/agent.proto");
 
+pub mod generated {
+    tonic::include_proto!("cyberboard.agent.v1");
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PROTOCOL_PACKAGE, PROTOCOL_SCHEMA, PROTOCOL_VERSION};

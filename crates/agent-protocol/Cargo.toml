@@ -6,3 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+prost.workspace = true
+tonic.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+tonic-build = "0.12"

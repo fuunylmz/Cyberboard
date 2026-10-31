@@ -136,6 +136,10 @@ pub struct AgentConfig {
     pub control_plane_url: String,
     pub node_id: Option<Uuid>,
     pub interval_secs: u64,
+    pub ca_cert_path: Option<String>,
+    pub client_cert_path: Option<String>,
+    pub client_key_path: Option<String>,
+    pub tls_server_name: Option<String>,
 }
 
 impl AgentConfig {
@@ -149,6 +153,10 @@ impl AgentConfig {
                 .unwrap_or_else(|| "https://127.0.0.1:8080".to_owned()),
             node_id,
             interval_secs: env_u64("CYBERBOARD_AGENT_INTERVAL_SECS", 30)?.max(1),
+            ca_cert_path: optional_env("CYBERBOARD_AGENT_CA_CERT"),
+            client_cert_path: optional_env("CYBERBOARD_AGENT_CLIENT_CERT"),
+            client_key_path: optional_env("CYBERBOARD_AGENT_CLIENT_KEY"),
+            tls_server_name: optional_env("CYBERBOARD_AGENT_TLS_SERVER_NAME"),
         })
     }
 }

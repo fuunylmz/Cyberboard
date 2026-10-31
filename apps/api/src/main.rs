@@ -14,6 +14,9 @@ use axum::{
     routing::{get, patch, post},
 };
 use cyberboard_config::ApiConfig;
+use cyberboard_config_compiler::{
+    ConfigProfile, Credential, Inbound, Outbound, Route, TlsConfig, Transport,
+};
 use cyberboard_database::{
     ConfigRevisionRecord, ConfigTemplateInput, ConfigTemplateRecord, ConfigTemplateUpdate,
     Database, NodeInput, NodeRecord, NodeUpdate, PlanInput, PlanRecord, PlanUpdate,
@@ -1343,15 +1346,44 @@ async fn public_subscription(State(state): State<AppState>, Path(token): Path<St
         return service_unavailable_response();
     };
     match database
-        .subscription_token_active(state.config.tenant_id, &token)
+        .nodes_for_subscription_token(state.config.tenant_id, &token)
         .await
     {
-        Ok(true) => {
+        Ok(nodes) if !nodes.is_empty() => {
+            let inbounds = nodes
+                .iter()
+                .map(|node| Inbound {
+                    tag: format!("node-{}", node.id.simple()),
+                    listen: node.address.clone(),
+                    listen_port: node.port as u16,
+                    inbound_type: "mixed".into(),
+                    transport: Transport::Tcp,
+                    tls: None::<TlsConfig>,
+                    credential: Credential::None,
+                })
+                .collect();
+            let profile = ConfigProfile {
+                schema_version: 1,
+                node_id: nodes[0].id,
+                generation: 1,
+                inbounds,
+                outbounds: vec![Outbound {
+                    outbound_type: "direct".into(),
+                    tag: "direct".into(),
+                }],
+                route: Route {
+                    final_tag: Some("direct".into()),
+                },
+            };
+            let config = match profile.render_sing_box() {
+                Ok(value) => value,
+                Err(_) => return internal_database_response(),
+            };
             let mut response = Json(json!({
                 "version": 1,
                 "experimental": false,
-                "outbounds": [],
-                "route": {"final": "direct"}
+                "outbounds": config["inbounds"],
+                "route": config["route"]
             }))
             .into_response();
             response.headers_mut().insert(
@@ -1364,7 +1396,7 @@ async fn public_subscription(State(state): State<AppState>, Path(token): Path<St
             );
             response
         }
-        Ok(false) => not_found_response("订阅不存在或已过期"),
+        Ok(_) => not_found_response("订阅不存在、已过期或没有可用节点"),
         Err(_) => internal_database_response(),
     }
 }

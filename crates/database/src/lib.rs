@@ -6,7 +6,9 @@
 
 use std::time::Duration;
 
-use cyberboard_storage::{FOURTH_MIGRATION, INITIAL_MIGRATION, SECOND_MIGRATION, THIRD_MIGRATION};
+use cyberboard_storage::{
+    FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, SECOND_MIGRATION, THIRD_MIGRATION,
+};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use thiserror::Error;
 use uuid::Uuid;
@@ -122,6 +124,20 @@ impl Database {
                 .await?;
             sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
                 .bind("0004_config_revision_fields")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        let fifth: Option<String> =
+            sqlx::query_scalar("SELECT version FROM cyberboard_schema_migrations WHERE version=$1")
+                .bind("0005_subscription_nodes")
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if fifth.is_none() {
+            sqlx::raw_sql(FIFTH_MIGRATION)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
+                .bind("0005_subscription_nodes")
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -608,6 +624,16 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
         Ok(active.is_some())
+    }
+
+    pub async fn nodes_for_subscription_token(
+        &self,
+        tenant_id: Uuid,
+        token: &str,
+    ) -> DatabaseResult<Vec<NodeRecord>> {
+        let rows = sqlx::query("SELECT n.id,n.name,n.region,n.address,n.status,n.core_type,n.core_version,n.agent_version,n.current_config_revision,last_heartbeat_at::text AS last_heartbeat_at,n.port,n.tags FROM nodes n JOIN subscription_nodes sn ON sn.tenant_id=n.tenant_id AND sn.node_id=n.id JOIN subscriptions s ON s.tenant_id=sn.tenant_id AND s.id=sn.subscription_id WHERE n.tenant_id=$1 AND s.subscription_token=$2 AND s.status='active' AND s.expires_at>now() ORDER BY n.created_at,n.id")
+            .bind(tenant_id).bind(token).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(NodeRecord::from_row).collect())
     }
 
     pub async fn list_orders(

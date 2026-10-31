@@ -283,6 +283,7 @@ dependencies = [
  "axum",
  "cyberboard-agent-protocol",
  "cyberboard-config",
+ "cyberboard-config-compiler",
  "cyberboard-database",
  "cyberboard-domain",
  "cyberboard-observability",

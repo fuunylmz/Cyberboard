@@ -14,12 +14,14 @@ pub const THIRD_MIGRATION: &str =
     include_str!("../../../deploy/migrations/0003_control_plane_resources.sql");
 pub const FOURTH_MIGRATION: &str =
     include_str!("../../../deploy/migrations/0004_config_revision_fields.sql");
+pub const FIFTH_MIGRATION: &str =
+    include_str!("../../../deploy/migrations/0005_subscription_nodes.sql");
 
 #[cfg(test)]
 mod tests {
     use super::{
-        FOURTH_MIGRATION, INITIAL_MIGRATION, INITIAL_MIGRATION_NAME, SECOND_MIGRATION,
-        SECOND_MIGRATION_NAME, THIRD_MIGRATION, THIRD_MIGRATION_NAME,
+        FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, INITIAL_MIGRATION_NAME,
+        SECOND_MIGRATION, SECOND_MIGRATION_NAME, THIRD_MIGRATION, THIRD_MIGRATION_NAME,
     };
 
     #[test]
@@ -90,5 +92,6 @@ mod tests {
         assert!(FOURTH_MIGRATION.contains("validation_status"));
         assert!(FOURTH_MIGRATION.contains("template_id"));
         assert!(FOURTH_MIGRATION.contains("updated_by"));
+        assert!(FIFTH_MIGRATION.contains("subscription_nodes"));
     }
 }

@@ -17,13 +17,16 @@ pub const FOURTH_MIGRATION: &str =
 pub const FIFTH_MIGRATION: &str =
     include_str!("../../../deploy/migrations/0005_subscription_nodes.sql");
 pub const SIXTH_MIGRATION: &str = include_str!("../../../deploy/migrations/0006_sessions.sql");
+pub const SEVENTH_MIGRATION_NAME: &str = "0007_payment_fields.sql";
+pub const SEVENTH_MIGRATION: &str =
+    include_str!("../../../deploy/migrations/0007_payment_fields.sql");
 
 #[cfg(test)]
 mod tests {
     use super::{
         FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, INITIAL_MIGRATION_NAME,
-        SECOND_MIGRATION, SECOND_MIGRATION_NAME, SIXTH_MIGRATION, THIRD_MIGRATION,
-        THIRD_MIGRATION_NAME,
+        SECOND_MIGRATION, SECOND_MIGRATION_NAME, SEVENTH_MIGRATION, SEVENTH_MIGRATION_NAME,
+        SIXTH_MIGRATION, THIRD_MIGRATION, THIRD_MIGRATION_NAME,
     };
 
     #[test]
@@ -96,5 +99,8 @@ mod tests {
         assert!(FOURTH_MIGRATION.contains("updated_by"));
         assert!(FIFTH_MIGRATION.contains("subscription_nodes"));
         assert!(SIXTH_MIGRATION.contains("token_hash"));
+        assert_eq!(SEVENTH_MIGRATION_NAME, "0007_payment_fields.sql");
+        assert!(SEVENTH_MIGRATION.contains("provider_event_id"));
+        assert!(SEVENTH_MIGRATION.contains("idempotency_key"));
     }
 }

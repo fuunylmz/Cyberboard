@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use cyberboard_storage::{
-    FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, SECOND_MIGRATION, SIXTH_MIGRATION,
-    THIRD_MIGRATION,
+    FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, SECOND_MIGRATION, SEVENTH_MIGRATION,
+    SIXTH_MIGRATION, THIRD_MIGRATION,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
@@ -28,6 +28,8 @@ pub fn hash_session_token(token: &str) -> String {
 pub enum DatabaseError {
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),
+    #[error("invalid payment order state")]
+    InvalidState,
 }
 
 impl DatabaseError {
@@ -191,6 +193,20 @@ impl Database {
                 .await?;
             sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
                 .bind("0006_sessions")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        let seventh: Option<String> =
+            sqlx::query_scalar("SELECT version FROM cyberboard_schema_migrations WHERE version=$1")
+                .bind("0007_payment_fields")
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if seventh.is_none() {
+            sqlx::raw_sql(SEVENTH_MIGRATION)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
+                .bind("0007_payment_fields")
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -717,6 +733,49 @@ impl Database {
                 .await?,
         )
     }
+
+    pub async fn create_order(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        plan_id: Uuid,
+        idempotency_key: &str,
+    ) -> DatabaseResult<OrderRecord> {
+        if let Some(existing) = sqlx::query("SELECT o.id,o.status,o.amount_cents,o.currency,o.created_at::text AS created_at,p.name AS plan FROM orders o JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id WHERE o.tenant_id=$1 AND o.user_id=$2 AND o.idempotency_key=$3")
+            .bind(tenant_id).bind(user_id).bind(idempotency_key).fetch_optional(&self.pool).await? {
+            return Ok(OrderRecord::from_row(existing));
+        }
+        let row = sqlx::query("INSERT INTO orders (tenant_id,user_id,plan_id,status,amount_cents,currency,idempotency_key) SELECT $1,$2,id,'pending',price_cents,currency,$4 FROM plans WHERE tenant_id=$1 AND id=$3 RETURNING id,status,amount_cents,currency,created_at::text AS created_at, (SELECT name FROM plans WHERE tenant_id=$1 AND id=$3) AS plan")
+            .bind(tenant_id).bind(user_id).bind(plan_id).bind(idempotency_key).fetch_one(&self.pool).await?;
+        Ok(OrderRecord::from_row(row))
+    }
+
+    pub async fn mark_order_paid_v2(
+        &self,
+        tenant_id: Uuid,
+        order_id: Uuid,
+        provider: &str,
+        provider_payment_id: &str,
+        event_id: &str,
+    ) -> DatabaseResult<OrderRecord> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("UPDATE orders SET status='paid',provider=$3,provider_payment_id=$4,paid_at=now(),updated_at=now() WHERE tenant_id=$1 AND id=$2 AND status='pending' RETURNING id,user_id,plan_id,status,amount_cents,currency,created_at::text AS created_at")
+            .bind(tenant_id).bind(order_id).bind(provider).bind(provider_payment_id).fetch_optional(&mut *tx).await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Err(DatabaseError::Sqlx(sqlx::Error::RowNotFound));
+        };
+        sqlx::query("INSERT INTO payments (tenant_id,order_id,provider,provider_payment_id,provider_event_id,status) VALUES($1,$2,$3,$4,$5,'succeeded') ON CONFLICT (tenant_id,provider,provider_event_id) DO NOTHING")
+            .bind(tenant_id).bind(order_id).bind(provider).bind(provider_payment_id).bind(event_id).execute(&mut *tx).await?;
+        let user_id: Uuid = row.get("user_id");
+        let plan_id: Uuid = row.get("plan_id");
+        sqlx::query("INSERT INTO subscriptions (tenant_id,user_id,plan_id,status,traffic_quota_bytes,starts_at,expires_at,subscription_token) SELECT $1,$2,id,'active',traffic_quota_bytes,now(),now()+make_interval(days=>duration_days),concat('cb_',replace(gen_random_uuid()::text,'-','')) FROM plans WHERE tenant_id=$1 AND id=$3")
+            .bind(tenant_id).bind(user_id).bind(plan_id).execute(&mut *tx).await?;
+        let result = sqlx::query("SELECT o.id,o.status,o.amount_cents,o.currency,o.created_at::text AS created_at,p.name AS plan FROM orders o JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id WHERE o.tenant_id=$1 AND o.id=$2")
+            .bind(tenant_id).bind(order_id).fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(OrderRecord::from_row(result))
+    }
     pub async fn list_devices(
         &self,
         tenant_id: Uuid,
@@ -904,6 +963,76 @@ impl Database {
         tx.commit().await?;
         Ok(Some(ConfigRevisionRecord::from_row(row)))
     }
+
+    pub async fn create_order_idempotent(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        plan_id: Uuid,
+        idempotency_key: &str,
+    ) -> DatabaseResult<PaymentOrderRecord> {
+        if let Some(row) = sqlx::query("SELECT id,user_id,plan_id,status,amount_cents,currency,provider,provider_payment_id,paid_at::text AS paid_at FROM orders WHERE tenant_id=$1 AND user_id=$2 AND idempotency_key=$3")
+            .bind(tenant_id).bind(user_id).bind(idempotency_key).fetch_optional(&self.pool).await? { return Ok(PaymentOrderRecord::from_row(row)); }
+        let row = sqlx::query("INSERT INTO orders (tenant_id,user_id,plan_id,status,amount_cents,currency,provider,idempotency_key) SELECT $1,$2,id,'pending',price_cents,currency,'manual',$3 FROM plans WHERE tenant_id=$1 AND id=$4 RETURNING id,user_id,plan_id,status,amount_cents,currency,provider,provider_payment_id,paid_at::text AS paid_at")
+            .bind(tenant_id).bind(user_id).bind(idempotency_key).bind(plan_id).fetch_one(&self.pool).await?;
+        Ok(PaymentOrderRecord::from_row(row))
+    }
+
+    pub async fn mark_order_paid(
+        &self,
+        tenant_id: Uuid,
+        order_id: Uuid,
+        provider_event_id: &str,
+    ) -> DatabaseResult<PaymentOrderRecord> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT id,user_id,plan_id,status,amount_cents,currency,provider,provider_payment_id,paid_at::text AS paid_at FROM orders WHERE tenant_id=$1 AND id=$2 FOR UPDATE").bind(tenant_id).bind(order_id).fetch_one(&mut *tx).await?;
+        let current = PaymentOrderRecord::from_row(row);
+        if current.status == "paid" {
+            tx.commit().await?;
+            return Ok(current);
+        }
+        if current.status != "pending" {
+            tx.rollback().await?;
+            return Err(DatabaseError::InvalidState);
+        }
+        sqlx::query("INSERT INTO payments (tenant_id,order_id,provider,provider_payment_id,provider_event_id,status,raw_event) VALUES ($1,$2,'manual',$3,$4,'succeeded','{}'::jsonb) ON CONFLICT (tenant_id,provider,provider_event_id) DO NOTHING").bind(tenant_id).bind(order_id).bind(format!("manual-{order_id}")).bind(provider_event_id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE orders SET status='paid',provider_payment_id=$3,paid_at=now(),updated_at=now() WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(order_id).bind(format!("manual-{order_id}")).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO subscriptions (tenant_id,user_id,plan_id,status,traffic_quota_bytes,starts_at,expires_at,subscription_token) SELECT $1,o.user_id,o.plan_id,'active',p.traffic_quota_bytes,now(),now()+make_interval(days=>p.duration_days),concat('cb_',replace(gen_random_uuid()::text,'-','')) FROM orders o JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id WHERE o.tenant_id=$1 AND o.id=$2").bind(tenant_id).bind(order_id).execute(&mut *tx).await?;
+        let updated = sqlx::query("SELECT id,user_id,plan_id,status,amount_cents,currency,provider,provider_payment_id,paid_at::text AS paid_at FROM orders WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(order_id).fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(PaymentOrderRecord::from_row(updated))
+    }
+
+    pub async fn refund_order(
+        &self,
+        tenant_id: Uuid,
+        order_id: Uuid,
+        provider_event_id: &str,
+    ) -> DatabaseResult<PaymentOrderRecord> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT id,user_id,plan_id,status,amount_cents,currency,provider,provider_payment_id,paid_at::text AS paid_at FROM orders WHERE tenant_id=$1 AND id=$2 FOR UPDATE").bind(tenant_id).bind(order_id).fetch_one(&mut *tx).await?;
+        let current = PaymentOrderRecord::from_row(row);
+        if current.status == "refunded" {
+            tx.commit().await?;
+            return Ok(current);
+        }
+        if current.status != "paid" {
+            tx.rollback().await?;
+            return Err(DatabaseError::InvalidState);
+        }
+        sqlx::query("INSERT INTO payments (tenant_id,order_id,provider,provider_payment_id,provider_event_id,status,raw_event) VALUES ($1,$2,'manual',$3,$4,'refunded','{}'::jsonb) ON CONFLICT (tenant_id,provider,provider_event_id) DO NOTHING").bind(tenant_id).bind(order_id).bind(current.provider_payment_id.clone()).bind(provider_event_id).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE orders SET status='refunded',updated_at=now() WHERE tenant_id=$1 AND id=$2",
+        )
+        .bind(tenant_id)
+        .bind(order_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE subscriptions SET status='revoked',updated_at=now() WHERE tenant_id=$1 AND user_id=$2 AND plan_id=$3 AND status='active'").bind(tenant_id).bind(current.user_id).bind(current.plan_id).execute(&mut *tx).await?;
+        let updated = sqlx::query("SELECT id,user_id,plan_id,status,amount_cents,currency,provider,provider_payment_id,paid_at::text AS paid_at FROM orders WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(order_id).fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(PaymentOrderRecord::from_row(updated))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1084,6 +1213,35 @@ pub struct OrderRecord {
     pub currency: String,
     pub created_at: String,
     pub plan: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PaymentOrderRecord {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub plan_id: Uuid,
+    pub status: String,
+    pub amount_cents: i64,
+    pub currency: String,
+    pub provider: String,
+    pub provider_payment_id: Option<String>,
+    pub paid_at: Option<String>,
+}
+
+impl PaymentOrderRecord {
+    fn from_row(row: sqlx::postgres::PgRow) -> Self {
+        Self {
+            id: row.get("id"),
+            user_id: row.get("user_id"),
+            plan_id: row.get("plan_id"),
+            status: row.get("status"),
+            amount_cents: row.get("amount_cents"),
+            currency: row.get("currency"),
+            provider: row.get("provider"),
+            provider_payment_id: row.try_get("provider_payment_id").ok(),
+            paid_at: row.try_get("paid_at").ok(),
+        }
+    }
 }
 impl OrderRecord {
     fn from_row(row: sqlx::postgres::PgRow) -> Self {

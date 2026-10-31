@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tracing::info;
+use uuid::Uuid;
 
 const DEMO_ACCESS_TOKEN: &str = "cyberboard-dev-token";
 const DEMO_PORTAL_ACCESS_TOKEN: &str = "cyberboard-portal-dev-token";
@@ -1423,6 +1424,110 @@ async fn portal_usage(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateOrderRequest {
+    plan_id: Uuid,
+}
+
+fn order_json(order: &cyberboard_database::OrderRecord) -> Value {
+    json!({
+        "id": order.id,
+        "status": order.status,
+        "amountCents": order.amount_cents,
+        "currency": order.currency,
+        "createdAt": order.created_at,
+        "plan": order.plan
+    })
+}
+
+async fn create_my_order(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(request): Json<CreateOrderRequest>,
+) -> Response {
+    let Some(idempotency_key) = headers
+        .get("Idempotency-Key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return invalid_input_response("Idempotency-Key 不能为空");
+    };
+    let Some(database) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    match database
+        .create_order(
+            identity.tenant_id,
+            identity.user_id,
+            request.plan_id,
+            idempotency_key.trim(),
+        )
+        .await
+    {
+        Ok(order) => (StatusCode::CREATED, Json(order_json(&order))).into_response(),
+        Err(error) if error.is_conflict() => conflict_response("Idempotency-Key 已被其他订单使用"),
+        Err(_) => internal_database_response(),
+    }
+}
+
+async fn mark_admin_order_paid(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(order_id): Path<Uuid>,
+) -> Response {
+    let event_id = headers
+        .get("Idempotency-Key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("manual-payment");
+    let Some(database) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    match database
+        .mark_order_paid_v2(
+            state.config.tenant_id,
+            order_id,
+            "manual",
+            &format!("manual-{order_id}"),
+            event_id,
+        )
+        .await
+    {
+        Ok(order) => Json(order_json(&order)).into_response(),
+        Err(cyberboard_database::DatabaseError::InvalidState) => {
+            conflict_response("订单状态不允许支付")
+        }
+        Err(_) => internal_database_response(),
+    }
+}
+
+async fn refund_admin_order(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(order_id): Path<Uuid>,
+) -> Response {
+    let event_id = headers
+        .get("Idempotency-Key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("manual-refund");
+    let Some(database) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    match database
+        .refund_order(state.config.tenant_id, order_id, event_id)
+        .await
+    {
+        Ok(order) => Json(json!({"id": order.id, "status": order.status})).into_response(),
+        Err(cyberboard_database::DatabaseError::InvalidState) => {
+            conflict_response("订单状态不允许退款")
+        }
+        Err(_) => internal_database_response(),
+    }
+}
+
 async fn me_orders(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2069,7 +2174,7 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/session", get(session))
         .route("/api/v1/portal/subscription", get(portal_subscription))
         .route("/api/v1/portal/usage", get(portal_usage))
-        .route("/api/v1/me/orders", get(me_orders))
+        .route("/api/v1/me/orders", get(me_orders).post(create_my_order))
         .route("/api/v1/me/devices", get(me_devices))
         .route("/api/v1/me/usage", get(me_usage))
         .route_layer(from_fn_with_state(state.clone(), portal_auth_middleware));
@@ -2107,6 +2212,14 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/v1/admin/subscriptions/{subscription_id}",
             patch(update_admin_subscription).delete(delete_admin_subscription),
+        )
+        .route(
+            "/api/v1/admin/orders/{order_id}/mark-paid",
+            post(mark_admin_order_paid),
+        )
+        .route(
+            "/api/v1/admin/orders/{order_id}/refund",
+            post(refund_admin_order),
         )
         .route(
             "/api/v1/admin/config-templates",

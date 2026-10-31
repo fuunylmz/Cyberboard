@@ -17,7 +17,7 @@ const auditClient = new ApiClient({
   onUnauthorized: () => window.dispatchEvent(new CustomEvent('cyberboard:unauthorized')),
 })
 export const auditApi = {
-  list: (query: { page?: number; pageSize?: number; search?: string; action?: string }) => auditClient.get<ListResponse<AuditLogSummary>>(`/v1/admin/audit-logs?${new URLSearchParams(Object.entries(query).filter(([, value]) => value !== undefined).map(([key, value]) => [key, String(value)]))}`),
+  list: (query: { page?: number; pageSize?: number; search?: string; action?: string }) => auditClient.get<ListResponse<AuditLogSummary>>(`/v1/admin/audit-logs?${new URLSearchParams(Object.entries({ ...query, status: query.action, action: undefined }).filter(([, value]) => value !== undefined).map(([key, value]) => [key, String(value)]))}`),
 }
 
 export function normalizePage<T>(response: ListResponse<T>, page = 1, pageSize = 20) {

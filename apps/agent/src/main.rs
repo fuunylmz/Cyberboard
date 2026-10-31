@@ -51,10 +51,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     unix_time: 0,
                     nonce: String::new(),
                 };
-                if let Err(error) = value.register(registration).await {
-                    warn!(%error, "agent registration failed");
+                match value.register(registration).await {
+                    Ok(agent_id) => {
+                        info!(%agent_id, "agent registered");
+                        Some((value, agent_id))
+                    }
+                    Err(error) => {
+                        warn!(%error, "agent registration failed");
+                        None
+                    }
                 }
-                Some(value)
             }
             Err(error) => {
                 warn!(%error, "control-plane connection failed; agent remains offline");
@@ -69,15 +75,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                if let Some(client) = transport.as_mut() {
-                    let heartbeat = HeartbeatRequest { agent_id: String::new(), node_id: node_id.clone(), agent_version: env!("CARGO_PKG_VERSION").into(), core_versions: vec!["sing-box".into()], platform: std::env::consts::OS.into(), architecture: std::env::consts::ARCH.into(), current_config_revision: String::new(), core_state: "unknown".into(), memory_bytes: 0, disk_free_bytes: 0, cpu_percent: 0.0, unix_time: 0, nonce: String::new() };
+                if let Some((client, agent_id)) = transport.as_mut() {
+                    let now = unix_now();
+                    let heartbeat = HeartbeatRequest { agent_id: agent_id.clone(), node_id: node_id.clone(), agent_version: env!("CARGO_PKG_VERSION").into(), core_versions: vec!["sing-box".into()], platform: std::env::consts::OS.into(), architecture: std::env::consts::ARCH.into(), current_config_revision: String::new(), core_state: "unknown".into(), memory_bytes: 0, disk_free_bytes: 0, cpu_percent: 0.0, unix_time: now, nonce: uuid::Uuid::new_v4().to_string() };
                     if let Err(error) = client.heartbeat(heartbeat).await { warn!(%error, "control-plane heartbeat failed"); }
-                    let desired = client.desired_state(GetDesiredStateRequest { agent_id: String::new(), node_id: node_id.clone(), current_generation: String::new(), current_content_hash: String::new(), last_applied_generation: 0 }).await;
+                    let desired = client.desired_state(GetDesiredStateRequest { agent_id: agent_id.clone(), node_id: node_id.clone(), current_generation: String::new(), current_content_hash: String::new(), last_applied_generation: 0 }).await;
                     if let Ok(response) = desired {
                         if !response.signed_config.is_empty() {
                             let result = apply_desired(&node_id, &response);
                             let (phase, code, hash, cas) = match result { Ok(hash) => ("applied", String::new(), hash, true), Err(error) => ("rejected", error, String::new(), false) };
-                            let _ = client.report_apply(ReportApplyResultRequest { agent_id: String::new(), node_id: node_id.clone(), generation: response.generation, previous_hash: response.expected_previous_hash.clone(), applied_hash: hash, phase: phase.into(), error_code: code, error_message: String::new(), retry_count: 0, unix_time: 0, expected_previous_hash: response.expected_previous_hash, compare_and_swap_ok: cas }).await;
+                            let _ = client.report_apply(ReportApplyResultRequest { agent_id: agent_id.clone(), node_id: node_id.clone(), generation: response.generation, previous_hash: response.expected_previous_hash.clone(), applied_hash: hash, phase: phase.into(), error_code: code, error_message: String::new(), retry_count: 0, unix_time: now, expected_previous_hash: response.expected_previous_hash, compare_and_swap_ok: cas }).await;
                         }
                     }
                 }
@@ -93,6 +100,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn apply_desired(

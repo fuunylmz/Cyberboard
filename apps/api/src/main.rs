@@ -8,7 +8,7 @@ use std::{
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::Request,
     http::{HeaderMap, StatusCode, header},
     middleware::Next,
@@ -128,6 +128,16 @@ async fn auth_middleware_role(
             && (state.is_portal_authorized(request.headers())
                 || state.is_authorized(request.headers())))
     {
+        let role = if state.is_authorized(request.headers()) {
+            "admin"
+        } else {
+            required_role
+        };
+        request.extensions_mut().insert(AuthIdentity {
+            user_id: uuid::Uuid::nil(),
+            tenant_id: state.config.tenant_id,
+            role: role.to_owned(),
+        });
         next.run(request).await
     } else {
         unauthorized_response()
@@ -458,6 +468,11 @@ async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>)
     {
         return invalid_credentials_response();
     }
+    let access_token = if state.database.is_some() {
+        format!("cb-admin-{}", uuid::Uuid::new_v4())
+    } else {
+        state.demo_access_token.to_string()
+    };
     if let Some(database) = state.database.as_ref() {
         if let Ok(Some(user)) = database
             .find_user_credentials(state.config.tenant_id, &request.email)
@@ -467,7 +482,7 @@ async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>)
                 .create_session(
                     state.config.tenant_id,
                     user.id,
-                    state.demo_access_token.as_ref(),
+                    &access_token,
                     "admin",
                     3600,
                 )
@@ -480,7 +495,7 @@ async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>)
     }
 
     Json(LoginResponse {
-        access_token: state.demo_access_token.to_string(),
+        access_token,
         token_type: DEMO_TOKEN_TYPE,
         expires_in: DEMO_TOKEN_EXPIRES_IN,
         user: demo_user(&state.config),
@@ -513,7 +528,7 @@ async fn portal_login(
             Ok(Some(value)) => value,
             _ => return invalid_credentials_response(),
         };
-        let token = format!("cyberboard-portal-{}", credentials.id);
+        let token = format!("cb-portal-{}", uuid::Uuid::new_v4());
         if let Ok(mut sessions) = state.portal_sessions.write() {
             sessions.insert(
                 token.clone(),
@@ -711,21 +726,14 @@ struct SubscriptionRequest {
 
 const DEMO_GENERATED_AT: &str = "1970-01-01T00:00:00Z";
 
-async fn session(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if state.is_authorized(&headers) {
+async fn session(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
+    if identity.role == "admin" {
         return Json(demo_user(&state.config)).into_response();
     }
-    if let Some(identity) = state.portal_identity(&headers) {
-        return Json(SessionUserResponse {
-            id: identity.user_id,
-            email: identity.email,
-            display_name: "Lin".to_owned(),
-            roles: vec!["user".to_owned()],
-            permissions: vec!["subscription:read".to_owned()],
-        })
-        .into_response();
-    }
-    unauthorized_response()
+    Json(demo_portal_user(&state.config)).into_response()
 }
 
 async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1358,115 +1366,104 @@ async fn delete_admin_subscription(
     }
 }
 
-async fn portal_subscription(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn portal_subscription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
     if let Err(response) = require_portal_auth(&state, &headers) {
         return response;
     }
-    let Some(identity) = state.portal_identity(&headers) else {
-        return unauthorized_response();
-    };
     let Some(database) = state.database.as_ref() else {
         return service_unavailable_response();
     };
     match database
-        .list_subscriptions(state.config.tenant_id, 100, 0, None, None)
+        .find_subscription_for_user(state.config.tenant_id, identity.user_id)
         .await
     {
-        Ok(items) => match items
-            .into_iter()
-            .find(|item| item.user_email == identity.email)
-        {
-            Some(record) => Json(subscription_summary_owned(record, true)).into_response(),
-            None => not_found_response("当前没有生效订阅"),
-        },
+        Ok(Some(record)) => Json(subscription_summary_owned(record, true)).into_response(),
+        Ok(None) => not_found_response("当前没有生效订阅"),
         Err(_) => internal_database_response(),
     }
 }
 
-async fn portal_usage(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn portal_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
     if let Err(response) = require_portal_auth(&state, &headers) {
         return response;
     }
-    let Some(identity) = state.portal_identity(&headers) else {
-        return unauthorized_response();
-    };
     let Some(database) = state.database.as_ref() else {
         return service_unavailable_response();
     };
     match database
-        .list_subscriptions(state.config.tenant_id, 100, 0, None, None)
+        .find_subscription_for_user(state.config.tenant_id, identity.user_id)
         .await
     {
-        Ok(items) => match items
-            .into_iter()
-            .find(|item| item.user_email == identity.email)
-        {
-            Some(record) => Json(PortalUsageResponse {
-                used_bytes: record.traffic_used_bytes,
-                quota_bytes: record.traffic_quota_bytes,
-                today_bytes: 0,
-                projected_bytes: record.traffic_used_bytes,
-                period_start: String::new(),
-                period_end: record.expires_at,
-                daily: Vec::new(),
-            })
-            .into_response(),
-            None => not_found_response("当前没有可用用量"),
-        },
+        Ok(Some(record)) => Json(PortalUsageResponse {
+            used_bytes: record.traffic_used_bytes,
+            quota_bytes: record.traffic_quota_bytes,
+            today_bytes: 0,
+            projected_bytes: record.traffic_used_bytes,
+            period_start: String::new(),
+            period_end: record.expires_at,
+            daily: Vec::new(),
+        })
+        .into_response(),
+        Ok(None) => not_found_response("当前没有可用用量"),
         Err(_) => internal_database_response(),
     }
 }
 
-async fn me_orders(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn me_orders(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
     if let Err(response) = require_portal_auth(&state, &headers) {
         return response;
     }
-    let Some(identity) = state.portal_identity(&headers) else {
-        return unauthorized_response();
-    };
     let Some(database) = state.database.as_ref() else {
         return Json(json!({"items": [], "total": 0, "page": 1, "pageSize": 50})).into_response();
     };
-    match (uuid::Uuid::parse_str(&identity.user_id), database.list_orders(state.config.tenant_id, uuid::Uuid::parse_str(&identity.user_id).unwrap_or_default(), 50, 0).await, database.count_orders(state.config.tenant_id, uuid::Uuid::parse_str(&identity.user_id).unwrap_or_default()).await) {
-        (Ok(_), Ok(items), Ok(total)) => Json(json!({"items": items.iter().map(|item| json!({"id":item.id,"status":item.status,"amountCents":item.amount_cents,"currency":item.currency,"createdAt":item.created_at,"plan":item.plan})).collect::<Vec<_>>(),"total":total,"page":1,"pageSize":50})).into_response(),
+    match (database.list_orders(state.config.tenant_id, identity.user_id, 50, 0).await, database.count_orders(state.config.tenant_id, identity.user_id).await) {
+        (Ok(items), Ok(total)) => Json(json!({"items": items.iter().map(|item| json!({"id":item.id,"status":item.status,"amountCents":item.amount_cents,"currency":item.currency,"createdAt":item.created_at,"plan":item.plan})).collect::<Vec<_>>(),"total":total,"page":1,"pageSize":50})).into_response(),
         _ => internal_database_response(),
     }
 }
 
-async fn me_devices(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn me_devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
     if let Err(response) = require_portal_auth(&state, &headers) {
         return response;
     }
-    let Some(identity) = state.portal_identity(&headers) else {
-        return unauthorized_response();
-    };
     let Some(database) = state.database.as_ref() else {
         return Json(json!({"items": [], "total": 0, "page": 1, "pageSize": 50})).into_response();
     };
-    let user_id = match uuid::Uuid::parse_str(&identity.user_id) {
-        Ok(value) => value,
-        Err(_) => return unauthorized_response(),
-    };
+    let user_id = identity.user_id;
     match (database.list_devices(state.config.tenant_id, user_id, 50, 0).await, database.count_devices(state.config.tenant_id, user_id).await) {
         (Ok(items), Ok(total)) => Json(json!({"items": items.iter().map(|item| json!({"id":item.id,"name":item.name,"lastSeenAt":item.last_seen_at,"createdAt":item.created_at,"revokedAt":item.revoked_at})).collect::<Vec<_>>(),"total":total,"page":1,"pageSize":50})).into_response(),
         _ => internal_database_response(),
     }
 }
 
-async fn me_usage(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn me_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
     if let Err(response) = require_portal_auth(&state, &headers) {
         return response;
     }
-    let Some(identity) = state.portal_identity(&headers) else {
-        return unauthorized_response();
-    };
     let Some(database) = state.database.as_ref() else {
         return Json(json!({"usedBytes": 0, "quotaBytes": 0, "todayBytes": 0, "projectedBytes": 0, "periodStart": "", "periodEnd": "", "daily": []})).into_response();
     };
-    let user_id = match uuid::Uuid::parse_str(&identity.user_id) {
-        Ok(value) => value,
-        Err(_) => return unauthorized_response(),
-    };
+    let user_id = identity.user_id;
     match database.usage_summary(state.config.tenant_id, user_id).await { Ok(usage) => Json(json!({"usedBytes":usage.used_bytes,"quotaBytes":0,"todayBytes":0,"projectedBytes":usage.used_bytes,"periodStart":usage.period_start.unwrap_or_default(),"periodEnd":usage.period_end.unwrap_or_default(),"daily":[]})).into_response(), Err(_) => internal_database_response() }
 }
 
@@ -1549,6 +1546,7 @@ struct ConfigTemplateRequest {
 #[serde(rename_all = "camelCase")]
 struct ConfigRevisionAction {
     expected_generation: Option<i64>,
+    expected_previous_hash: Option<String>,
 }
 
 fn config_template_json(record: ConfigTemplateRecord) -> Value {
@@ -1687,7 +1685,13 @@ async fn publish_config_revision(
         return invalid_input_response("expectedGeneration不能为空");
     };
     match db
-        .set_config_publish_status(state.config.tenant_id, id, generation, "published")
+        .set_config_publish_status(
+            state.config.tenant_id,
+            id,
+            generation,
+            "published",
+            action.expected_previous_hash.as_deref(),
+        )
         .await
     {
         Ok(Some(record)) => Json(config_revision_json(record)).into_response(),
@@ -1712,7 +1716,13 @@ async fn rollback_config_revision(
         return invalid_input_response("expectedGeneration不能为空");
     };
     match db
-        .set_config_publish_status(state.config.tenant_id, id, generation, "rolled_back")
+        .set_config_publish_status(
+            state.config.tenant_id,
+            id,
+            generation,
+            "rolled_back",
+            action.expected_previous_hash.as_deref(),
+        )
         .await
     {
         Ok(Some(record)) => Json(config_revision_json(record)).into_response(),

@@ -582,6 +582,15 @@ impl Database {
         Ok(rows.into_iter().map(SubscriptionRecord::from_row).collect())
     }
 
+    pub async fn find_subscription_for_user(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> DatabaseResult<Option<SubscriptionRecord>> {
+        let row = sqlx::query("SELECT s.id,u.email AS user_email,p.name AS plan,s.status,s.traffic_used_bytes,s.traffic_quota_bytes,s.expires_at::text AS expires_at,s.subscription_token FROM subscriptions s JOIN users u ON u.tenant_id=s.tenant_id AND u.id=s.user_id JOIN plans p ON p.tenant_id=s.tenant_id AND p.id=s.plan_id WHERE s.tenant_id=$1 AND s.user_id=$2 AND s.status='active' ORDER BY s.created_at DESC LIMIT 1").bind(tenant_id).bind(user_id).fetch_optional(&self.pool).await?;
+        Ok(row.map(SubscriptionRecord::from_row))
+    }
+
     pub async fn count_subscriptions(
         &self,
         tenant_id: Uuid,
@@ -833,10 +842,48 @@ impl Database {
         id: Uuid,
         expected_generation: i64,
         status: &str,
+        expected_previous_hash: Option<&str>,
     ) -> DatabaseResult<Option<ConfigRevisionRecord>> {
-        let row = sqlx::query("UPDATE config_revisions SET publish_status=$4, failure_reason=NULL WHERE tenant_id=$1 AND id=$2 AND generation=$3 AND validation_status='validated' RETURNING id,COALESCE(template_id::text,'') AS template_id,node_id,generation,core_version,content_hash,validation_status,publish_status,failure_reason,created_at::text AS created_at")
-            .bind(tenant_id).bind(id).bind(expected_generation).bind(status).fetch_optional(&self.pool).await?;
-        Ok(row.map(ConfigRevisionRecord::from_row))
+        let mut tx = self.pool.begin().await?;
+        let revision = sqlx::query("SELECT id,template_id,node_id,generation,core_version,content_hash,validation_status,publish_status,failure_reason,created_at::text AS created_at FROM config_revisions WHERE tenant_id=$1 AND id=$2 FOR UPDATE")
+            .bind(tenant_id).bind(id).fetch_optional(&mut *tx).await?;
+        let Some(revision) = revision else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let node_id: Uuid = revision.get("node_id");
+        let current: Option<Uuid> = sqlx::query_scalar(
+            "SELECT current_config_revision FROM nodes WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
+        )
+        .bind(tenant_id)
+        .bind(node_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let current_hash: Option<String> = if let Some(current_id) = current {
+            sqlx::query_scalar(
+                "SELECT content_hash FROM config_revisions WHERE tenant_id=$1 AND id=$2",
+            )
+            .bind(tenant_id)
+            .bind(current_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            None
+        };
+        if revision.get::<i64, _>("generation") != expected_generation
+            || revision.get::<String, _>("validation_status") != "validated"
+            || expected_previous_hash
+                .is_some_and(|expected| current_hash.as_deref() != Some(expected))
+        {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        sqlx::query("UPDATE config_revisions SET publish_status=$3,failure_reason=NULL WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(id).bind(status).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO config_deployments(tenant_id,config_revision_id,node_id,status,expected_generation,applied_generation) VALUES($1,$2,$3,$4,$5,$5)").bind(tenant_id).bind(id).bind(node_id).bind(if status=="published" {"applied"} else {"rolled_back"}).bind(expected_generation).execute(&mut *tx).await?;
+        sqlx::query("UPDATE nodes SET current_config_revision=$3,updated_at=now() WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(node_id).bind(if status=="published" {Some(id)} else {current}).execute(&mut *tx).await?;
+        let row = sqlx::query("SELECT r.id,COALESCE(r.template_id::text,'') AS template_id,r.node_id,n.name AS node_name,r.generation,r.core_version,r.content_hash,CASE WHEN r.signature='' THEN 'pending' ELSE 'valid' END AS signature_status,r.validation_status,r.publish_status,r.failure_reason,r.created_at::text AS created_at FROM config_revisions r JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id WHERE r.tenant_id=$1 AND r.id=$2").bind(tenant_id).bind(id).fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(Some(ConfigRevisionRecord::from_row(row)))
     }
 }
 

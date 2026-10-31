@@ -1,10 +1,9 @@
 # Cyberboard
 
-Cyberboard is a control-plane skeleton for managing users, subscriptions,
-nodes, traffic usage, and versioned sing-box-compatible configuration. The
-current repository contains the Rust process boundaries and protocol contract;
-business persistence and the mTLS transport are deliberately introduced in
-later milestones.
+Cyberboard is a Rust control plane for managing users, subscriptions, nodes,
+traffic usage, and versioned sing-box-compatible configuration. The API now
+has a SQLx/PostgreSQL persistence boundary while the agent mTLS execution path
+remains a later milestone.
 
 ## Workspace
 
@@ -15,6 +14,8 @@ later milestones.
 - `crates/config`: environment-backed service configuration.
 - `crates/agent-protocol`: versioned `proto/agent.proto` contract.
 - `crates/observability`: shared structured tracing setup.
+- `crates/database`: SQLx pool, migration execution, tenant-scoped repositories.
+- `crates/storage`: embedded migration resources and schema contract tests.
 
 ## Local development
 
@@ -43,8 +44,18 @@ only. `POST /api/v1/auth/login` returns `cyberboard-dev-token`, while
 `cyberboard-portal-dev-token`. Both return `expiresIn: 3600` as a client hint;
 the static placeholder tokens are not expired server-side. These must be
 replaced with persistent users, hashed passwords, expiring sessions, and token
-rotation before any shared or production deployment. Database and Redis are
-reported as configuration state only until the persistence slice is added.
+rotation before any shared or production deployment. Set `CYBERBOARD_DEV_MODE=1`
+to enable the credential fallback when no database URL is configured; without
+that explicit flag, login requires a matching active database user. Set
+`CYBERBOARD_TENANT_ID` to select the tenant scope (the development default is
+UUID `00000000-0000-0000-0000-000000000001`).
+
+When `CYBERBOARD_DATABASE_URL` is set, API startup connects to PostgreSQL,
+executes the embedded `0001_initial.sql` and `0002_resource_fields.sql`
+migrations, and ensures the configured tenant exists. A failed connection or
+migration stops startup. Without a URL, `/readyz` reports `memory_mode`; it
+does not claim database health, and resource writes return a clear
+`database_unavailable` response.
 
 The read-only session and admin endpoints require
 `Authorization: Bearer cyberboard-dev-token` after a successful development
@@ -64,11 +75,12 @@ curl -s http://127.0.0.1:8080/api/v1/auth/portal-login \
   -d '{"email":"lin@example.com","password":"password"}'
 ```
 
-The first reviewable PostgreSQL schema is available at
-`deploy/migrations/0001_initial.sql`. It can be applied by a migration runner
-once the persistence layer is introduced. The `cyberboard-storage` crate embeds
-the SQL with `include_str!` and tests that the core tables and append-only
-guards are present; it does not open a database connection yet.
+The reviewable PostgreSQL schema is available at
+`deploy/migrations/0001_initial.sql` and the additive resource fields at
+`deploy/migrations/0002_resource_fields.sql`. The `cyberboard-storage` crate
+embeds both SQL files with `include_str!`; `cyberboard-database` executes them
+with SQLx and exposes tenant-scoped CRUD repositories. `usage_events` and
+`audit_logs` are append-only; `usage_buckets` is a rebuildable aggregate.
 
 Run the worker or agent in separate terminals:
 

@@ -23,6 +23,9 @@ pub enum ConfigError {
 
     #[error("invalid bind address: {0}")]
     InvalidBindAddress(#[from] std::net::AddrParseError),
+
+    #[error("invalid boolean for {field}: {value}")]
+    InvalidBoolean { field: &'static str, value: String },
 }
 
 fn optional_env(name: &str) -> Option<String> {
@@ -49,6 +52,17 @@ fn env_u64(name: &'static str, default: u64) -> Result<u64, ConfigError> {
     }
 }
 
+fn env_bool(name: &'static str, default: bool) -> Result<bool, ConfigError> {
+    match optional_env(name) {
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(ConfigError::InvalidBoolean { field: name, value }),
+        },
+        None => Ok(default),
+    }
+}
+
 fn env_bind_addr() -> String {
     optional_env("CYBERBOARD_BIND_ADDR").unwrap_or_else(|| "0.0.0.0".to_owned())
 }
@@ -63,6 +77,8 @@ pub struct ApiConfig {
     pub demo_admin_password: String,
     pub demo_user_email: String,
     pub demo_user_password: String,
+    pub dev_mode: bool,
+    pub tenant_id: Uuid,
 }
 
 impl ApiConfig {
@@ -80,6 +96,11 @@ impl ApiConfig {
                 .unwrap_or_else(|| "lin@example.com".to_owned()),
             demo_user_password: optional_env("CYBERBOARD_DEMO_USER_PASSWORD")
                 .unwrap_or_else(|| "password".to_owned()),
+            dev_mode: env_bool("CYBERBOARD_DEV_MODE", false)?,
+            tenant_id: optional_env("CYBERBOARD_TENANT_ID")
+                .map(|value| Uuid::parse_str(&value))
+                .transpose()?
+                .unwrap_or_else(|| Uuid::from_u128(1)),
         })
     }
 

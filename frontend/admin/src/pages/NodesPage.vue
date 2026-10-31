@@ -1,29 +1,18 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import type { NodeSummary } from '@cyberboard/types'
+import { computed, onMounted, reactive, ref } from 'vue'
+import type { NodeCreateInput, NodeSummary } from '@cyberboard/types'
 import StatusBadge from '@cyberboard/ui/components/StatusBadge.vue'
 import StatePanel from '@cyberboard/ui/components/StatePanel.vue'
-import { adminApi, getApiErrorMessage } from '../api'
-
-const query = ref('')
-const statusFilter = ref('all')
-const loading = ref(true)
-const error = ref('')
-const nodes = ref<NodeSummary[]>([])
-const filtered = computed(() => nodes.value.filter((node) => {
-  const matchesQuery = `${node.name} ${node.region} ${node.address}`.toLowerCase().includes(query.value.toLowerCase())
-  return matchesQuery && (statusFilter.value === 'all' || node.status === statusFilter.value)
-}))
-
-async function load() {
-  loading.value = true
-  error.value = ''
-  try { nodes.value = await adminApi.listNodes() } catch (cause) { nodes.value = []; error.value = getApiErrorMessage(cause) } finally { loading.value = false }
-}
+import { adminApi, getApiErrorMessage, normalizePage } from '../api'
+const query=ref(''); const statusFilter=ref('all'); const page=ref(1); const pageSize=20; const total=ref(0); const loading=ref(true); const saving=ref(false); const error=ref(''); const formError=ref(''); const showForm=ref(false); const editingId=ref<string|null>(null); const nodes=ref<NodeSummary[]>([])
+const form=reactive<NodeCreateInput>({name:'',region:'',address:'',port:443,core:'sing-box',coreVersion:'',tags:[]})
+const filtered=computed(()=>nodes.value)
+function resetForm(){Object.assign(form,{name:'',region:'',address:'',port:443,core:'sing-box',coreVersion:'',tags:[]});editingId.value=null;showForm.value=false;formError.value=''}
+function edit(node:NodeSummary){Object.assign(form,{name:node.name,region:node.region,address:node.address,port:443,core:node.core,coreVersion:node.coreVersion,tags:[]});editingId.value=node.id;showForm.value=true}
+async function load(){loading.value=true;error.value='';try{const result=normalizePage(await adminApi.listNodes({page:page.value,pageSize,search:query.value,status:statusFilter.value==='all'?undefined:statusFilter.value}),page.value,pageSize);nodes.value=result.items;total.value=result.total}catch(cause){nodes.value=[];total.value=0;error.value=getApiErrorMessage(cause)}finally{loading.value=false}}
+async function save(){saving.value=true;formError.value='';try{if(editingId.value)await adminApi.updateNode(editingId.value,form);else await adminApi.createNode(form);resetForm();await load()}catch(cause){formError.value=getApiErrorMessage(cause)}finally{saving.value=false}}
+async function toggleStatus(node:NodeSummary){try{await adminApi.updateNode(node.id,{status:node.status==='maintenance'?'online':'maintenance'});await load()}catch(cause){error.value=getApiErrorMessage(cause)}}
+function search(){page.value=1;load()}
 onMounted(load)
 </script>
-
-<template>
-  <div class="page-heading"><div><p class="eyebrow">基础设施</p><h1>节点</h1><p>管理节点连接、内核版本和配置发布状态。</p></div><button class="primary-button" type="button">+ 注册节点</button></div>
-  <section class="panel"><div class="toolbar"><input v-model="query" class="search-input" placeholder="搜索名称、地域或地址" /><select v-model="statusFilter" aria-label="节点状态"><option value="all">全部状态</option><option value="online">在线</option><option value="maintenance">维护</option><option value="offline">离线</option><option value="error">异常</option></select><button class="button button--secondary" type="button" :disabled="loading" @click="load">{{ loading ? '加载中…' : '刷新' }}</button></div><StatePanel v-if="loading" title="正在加载节点" description="正在读取节点心跳和配置版本。" /><StatePanel v-else-if="error" title="节点加载失败" :description="error" action-label="重试" @action="load" /><StatePanel v-else-if="!nodes.length" title="暂无节点" description="控制面尚未注册任何节点。" action-label="刷新" @action="load" /><StatePanel v-else-if="!filtered.length" title="没有匹配的节点" description="尝试调整搜索或状态筛选条件。" action-label="清除筛选" @action="query=''; statusFilter='all'" /><div v-else class="table-wrap"><table><thead><tr><th>节点</th><th>状态</th><th>内核</th><th>Agent</th><th>心跳</th><th>配置</th><th></th></tr></thead><tbody><tr v-for="node in filtered" :key="node.id"><td><strong>{{ node.name }}</strong><small>{{ node.region }} · {{ node.address }}</small></td><td><StatusBadge :status="node.status" /></td><td>{{ node.core }}<small>{{ node.coreVersion }}</small></td><td class="mono">{{ node.agentVersion }}</td><td>{{ node.lastHeartbeatAt ? new Date(node.lastHeartbeatAt).toLocaleString() : '—' }}</td><td class="mono">{{ node.currentConfigRevision }}</td><td><button class="row-action" type="button">详情</button></td></tr></tbody></table></div></section>
-</template>
+<template><div class="page-heading"><div><p class="eyebrow">基础设施</p><h1>节点</h1><p>服务端分页管理节点、内核版本和维护状态。</p></div><button class="primary-button" type="button" @click="showForm=true;editingId=null">+ 注册节点</button></div><section v-if="showForm" class="panel form-panel"><div class="panel-heading"><div><h2>{{editingId?'编辑节点':'注册节点'}}</h2><p>注册凭证由控制面生成，不在浏览器展示。</p></div><button class="button button--secondary" type="button" @click="resetForm">取消</button></div><form class="resource-form" @submit.prevent="save"><label>名称<input v-model="form.name" required :disabled="saving" /></label><label>地域<input v-model="form.region" required :disabled="saving" /></label><label>地址<input v-model="form.address" required :disabled="saving" /></label><label>端口<input v-model.number="form.port" type="number" min="1" max="65535" required :disabled="saving" /></label><label>核心<input v-model="form.core" required :disabled="saving" /></label><label>核心版本<input v-model="form.coreVersion" required :disabled="saving" /></label><p v-if="formError" class="form-error" role="alert">{{formError}}</p><button class="primary-button" type="submit" :disabled="saving">{{saving?'保存中…':'保存节点'}}</button></form></section><section class="panel"><div class="toolbar"><input v-model="query" class="search-input" placeholder="搜索名称、地域或地址" @keyup.enter="search" /><select v-model="statusFilter" aria-label="节点状态" @change="search"><option value="all">全部状态</option><option value="online">在线</option><option value="maintenance">维护</option><option value="offline">离线</option><option value="error">异常</option></select><button class="button button--secondary" type="button" :disabled="loading" @click="search">{{loading?'加载中…':'查询'}}</button></div><StatePanel v-if="loading" title="正在加载节点" description="正在读取节点心跳和配置版本。"/><StatePanel v-else-if="error" title="节点加载失败" :description="error" action-label="重试" @action="load"/><StatePanel v-else-if="!filtered.length" title="暂无节点" description="当前筛选条件没有服务端数据。" action-label="清除筛选" @action="query='';statusFilter='all';search()"/><div v-else class="table-wrap"><table><thead><tr><th>节点</th><th>状态</th><th>内核</th><th>Agent</th><th>心跳</th><th>配置</th><th>操作</th></tr></thead><tbody><tr v-for="node in filtered" :key="node.id"><td><strong>{{node.name}}</strong><small>{{node.region}} · {{node.address}}</small></td><td><StatusBadge :status="node.status"/></td><td>{{node.core}}<small>{{node.coreVersion}}</small></td><td class="mono">{{node.agentVersion}}</td><td>{{node.lastHeartbeatAt?new Date(node.lastHeartbeatAt).toLocaleString():'—'}}</td><td class="mono">{{node.currentConfigRevision}}</td><td><button class="row-action" type="button" @click="edit(node)">编辑</button><button class="row-action" type="button" @click="toggleStatus(node)">{{node.status==='maintenance'?'上线':'维护'}}</button></td></tr></tbody></table><div class="pagination"><button class="button button--secondary" :disabled="page<=1||loading" @click="page--;load()">上一页</button><span>第 {{page}} 页 · 共 {{total}} 条</span><button class="button button--secondary" :disabled="page*pageSize>=total||loading" @click="page++;load()">下一页</button></div></div></section></template>

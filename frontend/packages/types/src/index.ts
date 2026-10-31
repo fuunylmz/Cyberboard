@@ -6,7 +6,20 @@ export interface SessionUser { id: string; email: string; displayName: string; r
 export interface LoginCredentials { email: string; password: string }
 export interface LoginResponse { user: SessionUser; accessToken: string; tokenType: 'Bearer'; expiresIn: number }
 export interface UserSummary { id: string; email: string; displayName: string; status: UserStatus; plan: string; usedBytes: number; quotaBytes: number; expiresAt: string; lastSeenAt: string | null }
-export interface NodeSummary { id: string; name: string; region: string; address: string; status: NodeStatus; core: string; coreVersion: string; agentVersion: string; currentConfigRevision: string; latencyMs: number | null; lastHeartbeatAt: string | null }
-export interface SubscriptionSummary { id: string; userEmail: string; plan: string; status: SubscriptionStatus; trafficUsedBytes: number; trafficQuotaBytes: number; expiresAt: string; tokenHint: string }
+export interface PageQuery { page?: number; pageSize?: number; search?: string; status?: string }
+export interface PaginatedResponse<T> { items: T[]; total: number; page: number; pageSize: number }
+export type ListResponse<T> = PaginatedResponse<T> | T[]
+export interface UserCreateInput { email: string; displayName: string; password: string; status?: UserStatus; planId?: string }
+export type UserUpdateInput = Partial<Omit<UserCreateInput, 'password'>> & { password?: string }
+export interface PlanSummary { id: string; name: string; description: string; priceCents: number; currency: string; durationDays: number; quotaBytes: number; deviceLimit: number; status: 'active' | 'draft' | 'archived'; nodeGroupIds: string[] }
+export interface PlanCreateInput { name: string; description?: string; priceCents: number; currency: string; durationDays: number; quotaBytes: number; deviceLimit: number; nodeGroupIds?: string[]; status?: PlanSummary['status'] }
+export type PlanUpdateInput = Partial<PlanCreateInput>
+export interface SubscriptionCreateInput { userId: string; planId: string; startsAt?: string }
+export type SubscriptionUpdateInput = Partial<Pick<SubscriptionCreateInput, 'planId' | 'startsAt'>> & { status?: SubscriptionStatus }
+export interface NodeCreateInput { name: string; region: string; address: string; port: number; core?: string; coreVersion?: string; tags?: string[] }
+export type NodeUpdateInput = Partial<NodeCreateInput> & { status?: NodeStatus }
+export interface UsageSummary { usedBytes: number; quotaBytes: number; todayBytes: number; projectedBytes: number; periodStart: string; periodEnd: string; daily: Array<{ date: string; bytes: number }> }
+export interface NodeSummary { id: string; name: string; region: string; address: string; status: NodeStatus; core: string; coreVersion: string; agentVersion: string; currentConfigRevision: string | null; latencyMs: number | null; lastHeartbeatAt: string | null }
+export interface SubscriptionSummary { id: string; userEmail: string; plan: string; status: SubscriptionStatus; trafficUsedBytes: number; trafficQuotaBytes: number; expiresAt: string; tokenHint: string; subscriptionUrl?: string }
 export interface DashboardSummary { users: number; activeSubscriptions: number; onlineNodes: number; trafficBytes24h: number; failedTasks: number; generatedAt: string }
 export interface ApiErrorBody { code: string; message: string; requestId?: string; fields?: Record<string, string> }

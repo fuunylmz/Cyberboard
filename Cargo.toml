@@ -19,8 +19,10 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 axum = "0.8"
+argon2 = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "json", "migrate"] }
 thiserror = "2.0"
 tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1"
@@ -30,6 +32,7 @@ uuid = { version = "1.11", features = ["serde", "v4"] }
 
 cyberboard-agent-protocol = { path = "crates/agent-protocol" }
 cyberboard-config = { path = "crates/config" }
+cyberboard-database = { path = "crates/database" }
 cyberboard-domain = { path = "crates/domain" }
 cyberboard-observability = { path = "crates/observability" }
 cyberboard-storage = { path = "crates/storage" }

@@ -1,30 +1,14 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import type { SubscriptionSummary } from '@cyberboard/types'
-import StatusBadge from '@cyberboard/ui/components/StatusBadge.vue'
-import StatePanel from '@cyberboard/ui/components/StatePanel.vue'
-import { adminApi, getApiErrorMessage } from '../api'
-
-const query = ref('')
-const statusFilter = ref('all')
-const loading = ref(true)
-const error = ref('')
-const subscriptions = ref<SubscriptionSummary[]>([])
-const filtered = computed(() => subscriptions.value.filter((subscription) => {
-  const matchesQuery = `${subscription.id} ${subscription.userEmail}`.toLowerCase().includes(query.value.toLowerCase())
-  return matchesQuery && (statusFilter.value === 'all' || subscription.status === statusFilter.value)
-}))
-const formatTraffic = (used: number, quota: number) => `${(used / 1e9).toFixed(0)} / ${(quota / 1e9).toFixed(0)} GB`
-
-async function load() {
-  loading.value = true
-  error.value = ''
-  try { subscriptions.value = await adminApi.listSubscriptions() } catch (cause) { subscriptions.value = []; error.value = getApiErrorMessage(cause) } finally { loading.value = false }
-}
-onMounted(load)
+import { computed, onMounted, reactive, ref } from 'vue'
+import type { SubscriptionCreateInput, SubscriptionStatus, SubscriptionSummary } from '@cyberboard/types'
+import StatusBadge from '@cyberboard/ui/components/StatusBadge.vue'; import StatePanel from '@cyberboard/ui/components/StatePanel.vue'; import { adminApi, getApiErrorMessage, normalizePage } from '../api'
+const query=ref(''); const statusFilter=ref('all'); const page=ref(1); const pageSize=20; const total=ref(0); const loading=ref(true); const saving=ref(false); const error=ref(''); const formError=ref(''); const showForm=ref(false); const editingId=ref<string|null>(null); const subscriptions=ref<SubscriptionSummary[]>([])
+const form=reactive<SubscriptionCreateInput>({userId:'',planId:'',startsAt:''}); const filtered=computed(()=>subscriptions.value); const formatTraffic=(used:number,quota:number)=>`${(used/1e9).toFixed(0)} / ${(quota/1e9).toFixed(0)} GB`
+function resetForm(){Object.assign(form,{userId:'',planId:'',startsAt:''});editingId.value=null;showForm.value=false;formError.value=''}
+function edit(subscription:SubscriptionSummary){Object.assign(form,{userId:'',planId:'',startsAt:''});editingId.value=subscription.id;showForm.value=true}
+async function load(){loading.value=true;error.value='';try{const result=normalizePage(await adminApi.listSubscriptions({page:page.value,pageSize,search:query.value,status:statusFilter.value==='all'?undefined:statusFilter.value}),page.value,pageSize);subscriptions.value=result.items;total.value=result.total}catch(cause){subscriptions.value=[];total.value=0;error.value=getApiErrorMessage(cause)}finally{loading.value=false}}
+async function save(){saving.value=true;formError.value='';try{if(editingId.value)await adminApi.updateSubscription(editingId.value,{planId:form.planId,startsAt:form.startsAt||undefined});else await adminApi.createSubscription(form);resetForm();await load()}catch(cause){formError.value=getApiErrorMessage(cause)}finally{saving.value=false}}
+async function toggleStatus(subscription:SubscriptionSummary){const status:SubscriptionStatus=subscription.status==='active'?'revoked':'active';try{await adminApi.updateSubscription(subscription.id,{status});await load()}catch(cause){error.value=getApiErrorMessage(cause)}}
+function search(){page.value=1;load()}; onMounted(load)
 </script>
-
-<template>
-  <div class="page-heading"><div><p class="eyebrow">访问凭证</p><h1>订阅</h1><p>管理订阅状态、令牌轮换和生效时间。</p></div><button class="primary-button" type="button">+ 新建订阅</button></div>
-  <section class="panel"><div class="toolbar"><input v-model="query" class="search-input" placeholder="搜索用户邮箱或订阅 ID" /><select v-model="statusFilter" aria-label="订阅状态"><option value="all">全部状态</option><option value="active">生效</option><option value="pending">待生效</option><option value="expired">过期</option><option value="revoked">撤销</option></select><button class="button button--secondary" type="button" :disabled="loading" @click="load">{{ loading ? '加载中…' : '刷新' }}</button></div><StatePanel v-if="loading" title="正在加载订阅" description="正在读取订阅状态和访问凭证。" /><StatePanel v-else-if="error" title="订阅加载失败" :description="error" action-label="重试" @action="load" /><StatePanel v-else-if="!subscriptions.length" title="暂无订阅" description="控制面尚未创建任何订阅。" action-label="刷新" @action="load" /><StatePanel v-else-if="!filtered.length" title="没有匹配的订阅" description="尝试调整搜索或状态筛选条件。" action-label="清除筛选" @action="query=''; statusFilter='all'" /><div v-else class="table-wrap"><table><thead><tr><th>订阅 ID</th><th>用户</th><th>套餐</th><th>状态</th><th>用量</th><th>到期时间</th><th>令牌</th><th></th></tr></thead><tbody><tr v-for="subscription in filtered" :key="subscription.id"><td class="mono">{{ subscription.id }}</td><td>{{ subscription.userEmail }}</td><td>{{ subscription.plan }}</td><td><StatusBadge :status="subscription.status" /></td><td class="mono">{{ formatTraffic(subscription.trafficUsedBytes, subscription.trafficQuotaBytes) }}</td><td>{{ subscription.expiresAt }}</td><td class="mono">{{ subscription.tokenHint }}</td><td><button class="row-action" type="button">管理</button></td></tr></tbody></table></div></section>
-</template>
+<template><div class="page-heading"><div><p class="eyebrow">访问凭证</p><h1>订阅</h1><p>服务端分页管理订阅状态、套餐和访问凭证。</p></div><button class="primary-button" type="button" @click="showForm=true;editingId=null">+ 新建订阅</button></div><section v-if="showForm" class="panel form-panel"><div class="panel-heading"><div><h2>{{editingId?'编辑订阅':'新建订阅'}}</h2><p>令牌由服务端生成，页面只展示脱敏提示。</p></div><button class="button button--secondary" type="button" @click="resetForm">取消</button></div><form class="resource-form" @submit.prevent="save"><label>用户 ID<input v-model="form.userId" required :disabled="saving||Boolean(editingId)" /></label><label>套餐 ID<input v-model="form.planId" required :disabled="saving" /></label><label>生效时间<input v-model="form.startsAt" type="datetime-local" :disabled="saving" /></label><p v-if="formError" class="form-error" role="alert">{{formError}}</p><button class="primary-button" type="submit" :disabled="saving">{{saving?'保存中…':'保存订阅'}}</button></form></section><section class="panel"><div class="toolbar"><input v-model="query" class="search-input" placeholder="搜索用户邮箱或订阅 ID" @keyup.enter="search"/><select v-model="statusFilter" aria-label="订阅状态" @change="search"><option value="all">全部状态</option><option value="active">生效</option><option value="pending">待生效</option><option value="expired">过期</option><option value="revoked">撤销</option></select><button class="button button--secondary" type="button" :disabled="loading" @click="search">{{loading?'加载中…':'查询'}}</button></div><StatePanel v-if="loading" title="正在加载订阅" description="正在读取订阅状态和访问凭证。"/><StatePanel v-else-if="error" title="订阅加载失败" :description="error" action-label="重试" @action="load"/><StatePanel v-else-if="!filtered.length" title="暂无订阅" description="当前筛选条件没有服务端数据。" action-label="清除筛选" @action="query='';statusFilter='all';search()"/><div v-else class="table-wrap"><table><thead><tr><th>订阅 ID</th><th>用户</th><th>套餐</th><th>状态</th><th>用量</th><th>到期时间</th><th>令牌</th><th>操作</th></tr></thead><tbody><tr v-for="subscription in filtered" :key="subscription.id"><td class="mono">{{subscription.id}}</td><td>{{subscription.userEmail}}</td><td>{{subscription.plan}}</td><td><StatusBadge :status="subscription.status"/></td><td class="mono">{{formatTraffic(subscription.trafficUsedBytes,subscription.trafficQuotaBytes)}}</td><td>{{subscription.expiresAt}}</td><td class="mono">{{subscription.tokenHint}}</td><td><button class="row-action" type="button" @click="edit(subscription)">编辑</button><button class="row-action" type="button" @click="toggleStatus(subscription)">{{subscription.status==='active'?'撤销':'恢复'}}</button></td></tr></tbody></table><div class="pagination"><button class="button button--secondary" :disabled="page<=1||loading" @click="page--;load()">上一页</button><span>第 {{page}} 页 · 共 {{total}} 条</span><button class="button button--secondary" :disabled="page*pageSize>=total||loading" @click="page++;load()">下一页</button></div></div></section></template>

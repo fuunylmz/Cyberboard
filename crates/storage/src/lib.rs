@@ -6,10 +6,15 @@
 
 pub const INITIAL_MIGRATION_NAME: &str = "0001_initial.sql";
 pub const INITIAL_MIGRATION: &str = include_str!("../../../deploy/migrations/0001_initial.sql");
+pub const SECOND_MIGRATION_NAME: &str = "0002_resource_fields.sql";
+pub const SECOND_MIGRATION: &str =
+    include_str!("../../../deploy/migrations/0002_resource_fields.sql");
 
 #[cfg(test)]
 mod tests {
-    use super::{INITIAL_MIGRATION, INITIAL_MIGRATION_NAME};
+    use super::{
+        INITIAL_MIGRATION, INITIAL_MIGRATION_NAME, SECOND_MIGRATION, SECOND_MIGRATION_NAME,
+    };
 
     #[test]
     fn initial_migration_is_embedded_and_covers_core_tables() {
@@ -39,5 +44,20 @@ mod tests {
         assert!(INITIAL_MIGRATION.contains("usage_events_append_only"));
         assert!(INITIAL_MIGRATION.contains("audit_logs_append_only"));
         assert!(INITIAL_MIGRATION.contains("RAISE EXCEPTION"));
+    }
+
+    #[test]
+    fn second_migration_contains_resource_fields() {
+        assert_eq!(SECOND_MIGRATION_NAME, "0002_resource_fields.sql");
+        for field in [
+            "description",
+            "price_cents",
+            "device_limit",
+            "node_group_ids",
+            "port",
+            "tags",
+        ] {
+            assert!(SECOND_MIGRATION.contains(field), "missing field {field}");
+        }
     }
 }

@@ -33,6 +33,7 @@ services:
     environment:
       CYBERBOARD_BIND_ADDR: 0.0.0.0
       CYBERBOARD_API_PORT: 8080
+      CYBERBOARD_DEV_MODE: "1"
       CYBERBOARD_DATABASE_URL: postgres://cyberboard:change-me-in-development@postgres:5432/cyberboard
       CYBERBOARD_REDIS_URL: redis://redis:6379
     ports:

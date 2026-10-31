@@ -3,7 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import type { DashboardSummary, NodeSummary, UserSummary } from '@cyberboard/types'
 import StatusBadge from '@cyberboard/ui/components/StatusBadge.vue'
 import StatePanel from '@cyberboard/ui/components/StatePanel.vue'
-import { adminApi, getApiErrorMessage } from '../api'
+import { adminApi, getApiErrorMessage, normalizePage } from '../api'
 
 const loading = ref(true)
 const error = ref('')
@@ -19,8 +19,8 @@ async function load() {
   try {
     const [summary, nodeList, userList] = await Promise.all([adminApi.getDashboard(), adminApi.listNodes(), adminApi.listUsers()])
     dashboard.value = summary
-    nodes.value = nodeList
-    users.value = userList
+    nodes.value = normalizePage(nodeList).items
+    users.value = normalizePage(userList).items
   } catch (cause) {
     dashboard.value = null
     nodes.value = []

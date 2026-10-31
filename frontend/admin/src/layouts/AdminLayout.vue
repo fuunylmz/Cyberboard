@@ -2,7 +2,7 @@
 import { RouterLink, RouterView, useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 const auth = useAuthStore(); const router = useRouter()
-const links = [{ to:'/admin/dashboard', label:'总览', icon:'⌂' }, { to:'/admin/nodes', label:'节点', icon:'◈' }, { to:'/admin/users', label:'用户', icon:'◎' }, { to:'/admin/subscriptions', label:'订阅', icon:'▣' }]
+const links = [{ to:'/admin/dashboard', label:'总览', icon:'⌂' }, { to:'/admin/nodes', label:'节点', icon:'◈' }, { to:'/admin/users', label:'用户', icon:'◎' }, { to:'/admin/plans', label:'套餐', icon:'◇' }, { to:'/admin/subscriptions', label:'订阅', icon:'▣' }]
 function logout() { auth.logout(); router.push('/login') }
 </script>
 <template>

@@ -18,5 +18,6 @@ thiserror.workspace = true
 uuid.workspace = true
 tonic.workspace = true
 prost.workspace = true
+rand_core.workspace = true
 tokio.workspace = true
 tracing.workspace = true

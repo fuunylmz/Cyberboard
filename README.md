@@ -37,6 +37,8 @@ curl http://127.0.0.1:8080/openapi.json
 ```
 
 The API accepts `CYBERBOARD_BIND_ADDR`, `CYBERBOARD_API_PORT`,
+`CYBERBOARD_AGENT_GRPC_ADDR`, `CYBERBOARD_AGENT_GRPC_SERVER_CERT`,
+`CYBERBOARD_AGENT_GRPC_SERVER_KEY`, and `CYBERBOARD_AGENT_GRPC_CLIENT_CA`,
 `CYBERBOARD_DATABASE_URL`, `CYBERBOARD_REDIS_URL`,
 `CYBERBOARD_DEMO_ADMIN_EMAIL`, `CYBERBOARD_DEMO_ADMIN_PASSWORD`,
 `CYBERBOARD_DEMO_USER_EMAIL`, and `CYBERBOARD_DEMO_USER_PASSWORD`. The admin
@@ -98,7 +100,12 @@ The agent accepts `CYBERBOARD_CONTROL_PLANE_URL`, `CYBERBOARD_NODE_ID`,
 credentials configured it connects outbound using the generated AgentControl
 client, registers, heartbeats, verifies signed desired state, applies the core
 configuration atomically, and reports the result. Without TLS credentials it
-stays in explicit local mode.
+stays in explicit local mode. The API exposes AgentControl gRPC on
+`CYBERBOARD_AGENT_GRPC_ADDR` (default `0.0.0.0:9090`). Server TLS credentials
+are mandatory when database mode is enabled outside `CYBERBOARD_DEV_MODE=1`;
+setting `CYBERBOARD_AGENT_GRPC_CLIENT_CA` additionally enables mutual TLS.
+Registration tokens use the `<node_uuid>:<secret>` form and are cleared after
+successful registration.
 
 ## Docker Compose
 

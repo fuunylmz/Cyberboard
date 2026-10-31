@@ -27,6 +27,8 @@ use tokio::net::TcpListener;
 use tracing::info;
 use uuid::Uuid;
 
+mod agent_control;
+
 const DEMO_ACCESS_TOKEN: &str = "cyberboard-dev-token";
 const DEMO_PORTAL_ACCESS_TOKEN: &str = "cyberboard-portal-dev-token";
 const DEMO_TOKEN_TYPE: &str = "Bearer";
@@ -2622,13 +2624,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let state = AppState::with_database(config, database);
+    let grpc_address: std::net::SocketAddr = state.config.agent_grpc_addr.parse()?;
+    let grpc_service =
+        agent_control::AgentControlService::new(state.config.tenant_id, state.database.clone());
+    let mut grpc_builder = tonic::transport::Server::builder();
+    match (
+        state.config.agent_grpc_server_cert.as_deref(),
+        state.config.agent_grpc_server_key.as_deref(),
+    ) {
+        (Some(cert_path), Some(key_path)) => {
+            if !state.config.dev_mode && state.config.agent_grpc_client_ca.is_none() {
+                return Err(
+                    "Agent gRPC client CA is required for mutual TLS outside development mode"
+                        .into(),
+                );
+            }
+            let identity = tonic::transport::Identity::from_pem(
+                std::fs::read(cert_path)?,
+                std::fs::read(key_path)?,
+            );
+            let mut tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+            if let Some(ca_path) = state.config.agent_grpc_client_ca.as_deref() {
+                tls = tls.client_ca_root(tonic::transport::Certificate::from_pem(std::fs::read(
+                    ca_path,
+                )?));
+            }
+            grpc_builder = grpc_builder.tls_config(tls)?;
+        }
+        (None, None) if state.config.dev_mode => {
+            tracing::warn!("Agent gRPC is running without TLS in explicit development mode");
+        }
+        _ => {
+            return Err(
+                "Agent gRPC server certificate/key are required outside development mode".into(),
+            );
+        }
+    }
     let app = router(state);
     let listener = TcpListener::bind(address).await?;
 
     info!(%address, "Cyberboard API listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    info!(%grpc_address, "Cyberboard Agent gRPC listening");
+    let http = async {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+    };
+    let grpc = async {
+        grpc_builder
+            .add_service(grpc_service.server())
+            .serve_with_shutdown(grpc_address, shutdown_signal())
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+    };
+    tokio::try_join!(http, grpc)?;
 
     Ok(())
 }
@@ -2679,6 +2729,10 @@ mod tests {
             ApiConfig {
                 bind_addr: "127.0.0.1".to_owned(),
                 port: 8080,
+                agent_grpc_addr: "127.0.0.1:9090".to_owned(),
+                agent_grpc_server_cert: None,
+                agent_grpc_server_key: None,
+                agent_grpc_client_ca: None,
                 database_url: None,
                 redis_url: None,
                 demo_admin_email: "admin@example.com".to_owned(),

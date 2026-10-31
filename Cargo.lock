@@ -354,6 +354,7 @@ dependencies = [
  "cyberboard-observability",
  "ed25519-dalek",
  "prost 0.13.5",
+ "rand_core",
  "serde",
  "serde_json",
  "thiserror",
@@ -388,6 +389,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tonic",
  "tower 0.5.3",
  "tracing",
  "uuid",
@@ -463,10 +465,12 @@ name = "cyberboard-worker"
 version = "0.1.0"
 dependencies = [
  "cyberboard-config",
+ "cyberboard-database",
  "cyberboard-domain",
  "cyberboard-observability",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

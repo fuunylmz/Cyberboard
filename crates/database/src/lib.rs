@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use cyberboard_storage::{
-    FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, SECOND_MIGRATION, SEVENTH_MIGRATION,
-    SIXTH_MIGRATION, THIRD_MIGRATION,
+    EIGHTH_MIGRATION, FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, SECOND_MIGRATION,
+    SEVENTH_MIGRATION, SIXTH_MIGRATION, THIRD_MIGRATION,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
@@ -283,6 +283,21 @@ impl Database {
                 .await?;
             sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
                 .bind("0007_payment_fields")
+                .execute(&mut *transaction)
+                .await?;
+        }
+
+        let eighth: Option<String> =
+            sqlx::query_scalar("SELECT version FROM cyberboard_schema_migrations WHERE version=$1")
+                .bind("0008_agent_control")
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if eighth.is_none() {
+            sqlx::raw_sql(EIGHTH_MIGRATION)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
+                .bind("0008_agent_control")
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -1074,6 +1089,94 @@ impl Database {
         })
     }
 
+    /// Rebuilds usage buckets and synchronizes subscription lifecycle state.
+    ///
+    /// Raw usage events are append-only, so the bucket values are overwritten
+    /// from the source of truth on every run. This makes retries safe and
+    /// avoids double counting after a worker restart.
+    pub async fn run_usage_maintenance(
+        &self,
+        tenant_id: Uuid,
+    ) -> DatabaseResult<UsageMaintenanceStats> {
+        let mut transaction = self.pool.begin().await?;
+        let bucket_result = sqlx::query(
+            "WITH aggregates AS (
+                 SELECT tenant_id,
+                        user_id,
+                        date_trunc('hour', window_start) AS bucket_start,
+                        date_trunc('hour', window_start) + interval '1 hour' AS bucket_end,
+                        COALESCE(sum(download_bytes), 0)::bigint AS download_bytes,
+                        COALESCE(sum(upload_bytes), 0)::bigint AS upload_bytes,
+                        count(*)::bigint AS event_count,
+                        min(received_at) AS first_received_at,
+                        max(received_at) AS last_received_at
+                 FROM usage_events
+                 WHERE tenant_id=$1 AND user_id IS NOT NULL
+                 GROUP BY tenant_id, user_id, date_trunc('hour', window_start)
+             )
+             INSERT INTO usage_buckets (
+                 tenant_id, user_id, bucket_start, bucket_end,
+                 download_bytes, upload_bytes, event_count,
+                 first_received_at, last_received_at
+             )
+             SELECT tenant_id, user_id, bucket_start, bucket_end,
+                    download_bytes, upload_bytes, event_count,
+                    first_received_at, last_received_at
+             FROM aggregates
+             ON CONFLICT (tenant_id, user_id, bucket_start) DO UPDATE SET
+                 bucket_end=EXCLUDED.bucket_end,
+                 download_bytes=EXCLUDED.download_bytes,
+                 upload_bytes=EXCLUDED.upload_bytes,
+                 event_count=EXCLUDED.event_count,
+                 first_received_at=EXCLUDED.first_received_at,
+                 last_received_at=EXCLUDED.last_received_at",
+        )
+        .bind(tenant_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        let usage_result = sqlx::query(
+            "UPDATE subscriptions AS s
+             SET traffic_used_bytes=COALESCE((
+                 SELECT sum(b.download_bytes + b.upload_bytes)::bigint
+                 FROM usage_buckets AS b
+                 WHERE b.tenant_id=s.tenant_id AND b.user_id=s.user_id
+             ), 0), updated_at=now()
+             WHERE s.tenant_id=$1",
+        )
+        .bind(tenant_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        let activated = sqlx::query(
+            "UPDATE subscriptions
+             SET status='active', updated_at=now()
+             WHERE tenant_id=$1 AND status='pending'
+               AND (starts_at IS NULL OR starts_at <= now())
+               AND expires_at > now()",
+        )
+        .bind(tenant_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        let expired = sqlx::query(
+            "UPDATE subscriptions
+             SET status='expired', updated_at=now()
+             WHERE tenant_id=$1 AND status='active' AND expires_at <= now()",
+        )
+        .bind(tenant_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        transaction.commit().await?;
+        Ok(UsageMaintenanceStats {
+            buckets_upserted: bucket_result.rows_affected(),
+            subscriptions_recalculated: usage_result.rows_affected(),
+            subscriptions_activated: activated.rows_affected(),
+            subscriptions_expired: expired.rows_affected(),
+        })
+    }
+
     pub async fn list_config_templates(
         &self,
         tenant_id: Uuid,
@@ -1310,6 +1413,194 @@ impl Database {
         tx.commit().await?;
         Ok(PaymentOrderRecord::from_row(updated))
     }
+
+    pub async fn register_agent(
+        &self,
+        tenant_id: Uuid,
+        registration_token: &str,
+        public_key: &str,
+        agent_version: &str,
+        platform: &str,
+        architecture: &str,
+    ) -> DatabaseResult<Option<AgentRegistrationRecord>> {
+        let Some((node_text, _secret)) = registration_token.split_once(':') else {
+            return Ok(None);
+        };
+        let Ok(node_id) = Uuid::parse_str(node_text) else {
+            return Ok(None);
+        };
+        let token_hash = hash_session_token(registration_token);
+        let agent_id = format!("agent-{}", Uuid::new_v4().simple());
+        let row = sqlx::query(
+            "UPDATE nodes
+             SET agent_id=$4, agent_registration_token_hash=NULL,
+                 agent_public_key=$5, agent_platform=$6, agent_architecture=$7,
+                 agent_version=$8, status='online', last_heartbeat_at=now(), updated_at=now()
+             WHERE tenant_id=$1 AND id=$2 AND agent_registration_token_hash=$3
+             RETURNING id,agent_id,agent_version,agent_platform,agent_architecture",
+        )
+        .bind(tenant_id)
+        .bind(node_id)
+        .bind(token_hash)
+        .bind(&agent_id)
+        .bind(public_key)
+        .bind(platform)
+        .bind(architecture)
+        .bind(agent_version)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| AgentRegistrationRecord {
+            node_id: row.get("id"),
+            agent_id: row.get("agent_id"),
+            agent_version: row.get("agent_version"),
+            platform: row.get("agent_platform"),
+            architecture: row.get("agent_architecture"),
+        }))
+    }
+
+    pub async fn update_agent_heartbeat(
+        &self,
+        tenant_id: Uuid,
+        agent_id: &str,
+        node_id: Uuid,
+        heartbeat: &AgentHeartbeatInput,
+    ) -> DatabaseResult<bool> {
+        let result = sqlx::query(
+            "UPDATE nodes SET status='online',agent_version=$4,agent_platform=$5,
+                    agent_architecture=$6,agent_core_state=$7,agent_memory_bytes=$8,
+                    agent_disk_free_bytes=$9,agent_cpu_percent=$10,
+                    current_config_revision=COALESCE(current_config_revision,current_config_revision),
+                    last_heartbeat_at=now(),updated_at=now()
+             WHERE tenant_id=$1 AND id=$2 AND agent_id=$3",
+        )
+        .bind(tenant_id)
+        .bind(node_id)
+        .bind(agent_id)
+        .bind(&heartbeat.agent_version)
+        .bind(&heartbeat.platform)
+        .bind(&heartbeat.architecture)
+        .bind(&heartbeat.core_state)
+        .bind(heartbeat.memory_bytes as i64)
+        .bind(heartbeat.disk_free_bytes as i64)
+        .bind(heartbeat.cpu_percent)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn desired_state_for_agent(
+        &self,
+        tenant_id: Uuid,
+        agent_id: &str,
+        node_id: Uuid,
+    ) -> DatabaseResult<Option<DesiredConfigRecord>> {
+        let row = sqlx::query(
+            "SELECT r.generation,r.core_type,r.core_version,r.payload,r.content_hash,
+                    r.signature,r.created_at::text AS issued_at,
+                    COALESCE(prev.content_hash,'') AS expected_previous_hash
+             FROM nodes n
+             JOIN config_revisions r ON r.tenant_id=n.tenant_id AND r.id=n.current_config_revision
+             LEFT JOIN config_revisions prev ON prev.tenant_id=r.tenant_id
+                    AND prev.node_id=r.node_id AND prev.generation < r.generation
+                    AND prev.publish_status='published'
+             WHERE n.tenant_id=$1 AND n.id=$2 AND n.agent_id=$3
+               AND r.publish_status='published' AND r.validation_status='validated'
+             ORDER BY prev.generation DESC NULLS LAST
+             LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(node_id)
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let signature: String = row.get("signature");
+        if signature.is_empty() {
+            return Ok(None);
+        }
+        let payload: serde_json::Value = row.get("payload");
+        Ok(Some(DesiredConfigRecord {
+            generation: row.get("generation"),
+            core_type: row.get("core_type"),
+            core_version: row.get("core_version"),
+            payload: serde_json::to_vec(&payload).unwrap_or_default(),
+            content_hash: row.get("content_hash"),
+            signature,
+            issued_at: row.get("issued_at"),
+            expected_previous_hash: row.get("expected_previous_hash"),
+        }))
+    }
+
+    pub async fn record_agent_apply_result(
+        &self,
+        tenant_id: Uuid,
+        agent_id: &str,
+        node_id: Uuid,
+        generation: i64,
+        phase: &str,
+        error_code: &str,
+        error_message: &str,
+    ) -> DatabaseResult<bool> {
+        let status = match phase {
+            "applied" | "succeeded" => "applied",
+            "rolled_back" => "rolled_back",
+            _ => "failed",
+        };
+        let error_detail = match (error_code.trim(), error_message.trim()) {
+            ("", message) => message.to_owned(),
+            (code, "") => code.to_owned(),
+            (code, message) => format!("{code}: {message}"),
+        };
+        let result = sqlx::query(
+            "UPDATE config_deployments d SET status=$5,error_code=NULLIF($6,''),updated_at=now()
+             FROM config_revisions r
+             JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id
+             WHERE d.tenant_id=$1 AND d.node_id=$2 AND n.agent_id=$3
+               AND r.id=d.config_revision_id AND r.generation=$4",
+        )
+        .bind(tenant_id)
+        .bind(node_id)
+        .bind(agent_id)
+        .bind(generation)
+        .bind(status)
+        .bind(error_detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn ingest_agent_usage(
+        &self,
+        tenant_id: Uuid,
+        agent_id: &str,
+        node_id: Uuid,
+        batch_id: &str,
+        sequence: i64,
+        window_start: i64,
+        window_end: i64,
+        payload: &serde_json::Value,
+    ) -> DatabaseResult<bool> {
+        let result = sqlx::query(
+            "INSERT INTO agent_usage_receipts
+                (tenant_id,node_id,agent_id,batch_id,sequence,window_start,window_end,usage_payload)
+             SELECT $1,$2,$3,$4,$5,to_timestamp($6),to_timestamp($7),$8
+             WHERE EXISTS (SELECT 1 FROM nodes WHERE tenant_id=$1 AND id=$2 AND agent_id=$3)
+             ON CONFLICT (tenant_id,agent_id,batch_id) DO NOTHING",
+        )
+        .bind(tenant_id)
+        .bind(node_id)
+        .bind(agent_id)
+        .bind(batch_id)
+        .bind(sequence)
+        .bind(window_start)
+        .bind(window_end)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1371,6 +1662,46 @@ pub struct DashboardStats {
     pub traffic_bytes_24h: i64,
     pub failed_tasks: i64,
     pub generated_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentRegistrationRecord {
+    pub node_id: Uuid,
+    pub agent_id: String,
+    pub agent_version: String,
+    pub platform: String,
+    pub architecture: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentHeartbeatInput {
+    pub agent_version: String,
+    pub platform: String,
+    pub architecture: String,
+    pub core_state: String,
+    pub memory_bytes: u64,
+    pub disk_free_bytes: u64,
+    pub cpu_percent: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct DesiredConfigRecord {
+    pub generation: i64,
+    pub core_type: String,
+    pub core_version: String,
+    pub payload: Vec<u8>,
+    pub content_hash: String,
+    pub signature: String,
+    pub issued_at: String,
+    pub expected_previous_hash: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UsageMaintenanceStats {
+    pub buckets_upserted: u64,
+    pub subscriptions_recalculated: u64,
+    pub subscriptions_activated: u64,
+    pub subscriptions_expired: u64,
 }
 
 #[derive(Clone, Debug)]

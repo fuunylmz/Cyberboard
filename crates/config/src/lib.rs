@@ -21,6 +21,9 @@ pub enum ConfigError {
     #[error("invalid node id: {0}")]
     InvalidNodeId(#[from] uuid::Error),
 
+    #[error("invalid tenant id: {0}")]
+    InvalidTenantId(uuid::Error),
+
     #[error("invalid bind address: {0}")]
     InvalidBindAddress(#[from] std::net::AddrParseError),
 
@@ -71,6 +74,10 @@ fn env_bind_addr() -> String {
 pub struct ApiConfig {
     pub bind_addr: String,
     pub port: u16,
+    pub agent_grpc_addr: String,
+    pub agent_grpc_server_cert: Option<String>,
+    pub agent_grpc_server_key: Option<String>,
+    pub agent_grpc_client_ca: Option<String>,
     pub database_url: Option<String>,
     pub redis_url: Option<String>,
     pub demo_admin_email: String,
@@ -86,6 +93,11 @@ impl ApiConfig {
         Ok(Self {
             bind_addr: env_bind_addr(),
             port: env_u16("CYBERBOARD_API_PORT", 8080)?,
+            agent_grpc_addr: optional_env("CYBERBOARD_AGENT_GRPC_ADDR")
+                .unwrap_or_else(|| "0.0.0.0:9090".to_owned()),
+            agent_grpc_server_cert: optional_env("CYBERBOARD_AGENT_GRPC_SERVER_CERT"),
+            agent_grpc_server_key: optional_env("CYBERBOARD_AGENT_GRPC_SERVER_KEY"),
+            agent_grpc_client_ca: optional_env("CYBERBOARD_AGENT_GRPC_CLIENT_CA"),
             database_url: optional_env("CYBERBOARD_DATABASE_URL"),
             redis_url: optional_env("CYBERBOARD_REDIS_URL"),
             demo_admin_email: optional_env("CYBERBOARD_DEMO_ADMIN_EMAIL")
@@ -119,6 +131,7 @@ pub struct WorkerConfig {
     pub interval_secs: u64,
     pub database_url: Option<String>,
     pub redis_url: Option<String>,
+    pub tenant_id: Uuid,
 }
 
 impl WorkerConfig {
@@ -127,6 +140,10 @@ impl WorkerConfig {
             interval_secs: env_u64("CYBERBOARD_WORKER_INTERVAL_SECS", 30)?.max(1),
             database_url: optional_env("CYBERBOARD_DATABASE_URL"),
             redis_url: optional_env("CYBERBOARD_REDIS_URL"),
+            tenant_id: optional_env("CYBERBOARD_TENANT_ID")
+                .map(|value| Uuid::parse_str(&value).map_err(ConfigError::InvalidTenantId))
+                .transpose()?
+                .unwrap_or_else(|| Uuid::from_u128(1)),
         })
     }
 }

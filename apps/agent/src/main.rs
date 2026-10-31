@@ -7,7 +7,8 @@ use cyberboard_agent_protocol::generated::{
 use cyberboard_config::AgentConfig;
 use cyberboard_config_compiler::SignedConfigEnvelope;
 use cyberboard_config_compiler::hex_hash;
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use rand_core::OsRng;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{info, warn};
 
@@ -44,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "CYBERBOARD_AGENT_REGISTRATION_TOKEN",
                     )
                     .unwrap_or_default(),
-                    agent_public_key: String::new(),
+                    agent_public_key: agent_public_key(),
                     agent_version: env!("CARGO_PKG_VERSION").into(),
                     platform: std::env::consts::OS.into(),
                     architecture: std::env::consts::ARCH.into(),
@@ -107,6 +108,19 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+fn agent_public_key() -> String {
+    if let Ok(value) = std::env::var("CYBERBOARD_AGENT_PUBLIC_KEY") {
+        if !value.trim().is_empty() {
+            return value;
+        }
+    }
+    // Production deployments should persist and provision this key through the
+    // node installer. The ephemeral fallback keeps local registration honest by
+    // sending a real Ed25519 public key instead of an empty placeholder.
+    let signing_key = SigningKey::generate(&mut OsRng);
+    BASE64.encode(signing_key.verifying_key().to_bytes())
 }
 
 fn apply_desired(

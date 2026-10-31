@@ -16,6 +16,7 @@ cyberboard-observability.workspace = true
 cyberboard-agent-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tonic.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true

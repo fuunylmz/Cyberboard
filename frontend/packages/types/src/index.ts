@@ -33,6 +33,7 @@ export interface DeviceSummary { id: string; name: string; lastSeenAt: string | 
 export interface SessionSummary { id: string; role: string; issuedAt: string; expiresAt: string; revokedAt: string | null; active: boolean; current: boolean }
 export interface PasswordChangeInput { currentPassword: string; newPassword: string }
 export interface NodeSummary { id: string; name: string; region: string; address: string; status: NodeStatus; core: string; coreVersion: string; agentVersion: string; currentConfigRevision: string | null; latencyMs: number | null; lastHeartbeatAt: string | null }
+export interface AgentRegistrationToken { nodeId: string; token: string; expiresAt: number; rotated: boolean }
 export interface SubscriptionSummary { id: string; userEmail: string; plan: string; status: SubscriptionStatus; trafficUsedBytes: number; trafficQuotaBytes: number; expiresAt: string; tokenHint: string; subscriptionUrl?: string }
 export interface DashboardSummary { users: number; activeSubscriptions: number; onlineNodes: number; trafficBytes24h: number; failedTasks: number; generatedAt: string }
 export interface ApiErrorBody { code: string; message: string; requestId?: string; fields?: Record<string, string> }

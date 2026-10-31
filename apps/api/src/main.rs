@@ -1,6 +1,9 @@
 #![recursion_limit = "512"]
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
@@ -31,6 +34,13 @@ struct AppState {
     demo_access_token: Arc<str>,
     demo_portal_access_token: Arc<str>,
     database: Option<Arc<Database>>,
+    portal_sessions: Arc<RwLock<HashMap<String, PortalIdentity>>>,
+}
+
+#[derive(Clone, Debug)]
+struct PortalIdentity {
+    user_id: String,
+    email: String,
 }
 
 impl AppState {
@@ -40,6 +50,7 @@ impl AppState {
             demo_access_token: Arc::from(DEMO_ACCESS_TOKEN),
             demo_portal_access_token: Arc::from(DEMO_PORTAL_ACCESS_TOKEN),
             database: None,
+            portal_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -56,21 +67,26 @@ impl AppState {
             demo_access_token: Arc::from(token),
             demo_portal_access_token: Arc::from(DEMO_PORTAL_ACCESS_TOKEN),
             database: None,
+            portal_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     fn is_authorized_with(&self, headers: &HeaderMap, expected_token: &str) -> bool {
-        let authorization = headers
+        self.bearer_token(headers)
+            .is_some_and(|token| token == expected_token)
+    }
+
+    fn bearer_token(&self, headers: &HeaderMap) -> Option<String> {
+        headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| {
                 let mut parts = value.splitn(2, |character: char| character.is_ascii_whitespace());
                 let scheme = parts.next().unwrap_or_default();
                 let token = parts.next().unwrap_or_default().trim();
-                (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
-            });
-
-        authorization == Some(expected_token)
+                (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty())
+                    .then_some(token.to_owned())
+            })
     }
 
     fn is_authorized(&self, headers: &HeaderMap) -> bool {
@@ -78,8 +94,19 @@ impl AppState {
     }
 
     #[allow(dead_code)]
+    fn portal_identity(&self, headers: &HeaderMap) -> Option<PortalIdentity> {
+        let token = self.bearer_token(headers)?;
+        if token == self.demo_portal_access_token.as_ref() {
+            return Some(PortalIdentity {
+                user_id: "demo-user".to_owned(),
+                email: self.config.demo_user_email.clone(),
+            });
+        }
+        self.portal_sessions.read().ok()?.get(&token).cloned()
+    }
+
     fn is_portal_authorized(&self, headers: &HeaderMap) -> bool {
-        self.is_authorized_with(headers, self.demo_portal_access_token.as_ref())
+        self.portal_identity(headers).is_some()
     }
 }
 
@@ -221,6 +248,7 @@ async fn credentials_match(
     password: &str,
     fallback_email: &str,
     fallback_password: &str,
+    require_admin: bool,
 ) -> bool {
     if let Some(database) = state.database.as_ref() {
         let credentials = match database
@@ -236,6 +264,10 @@ async fn credentials_match(
             Err(_) => return false,
         };
         if credentials.status != "active" {
+            return false;
+        }
+        let is_admin = credentials.roles.iter().any(|role| role == "admin");
+        if is_admin != require_admin {
             return false;
         }
         return PasswordHash::new(&credentials.password_hash)
@@ -320,6 +352,7 @@ async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>)
         &request.password,
         &state.config.demo_admin_email,
         &state.config.demo_admin_password,
+        true,
     )
     .await
     {
@@ -345,17 +378,53 @@ async fn portal_login(
         &request.password,
         &state.config.demo_user_email,
         &state.config.demo_user_password,
+        false,
     )
     .await
     {
         return invalid_credentials_response();
     }
 
+    let (access_token, portal_user) = if let Some(database) = state.database.as_ref() {
+        let credentials = match database
+            .find_user_credentials(state.config.tenant_id, &request.email)
+            .await
+        {
+            Ok(Some(value)) => value,
+            _ => return invalid_credentials_response(),
+        };
+        let token = format!("cyberboard-portal-{}", credentials.id);
+        if let Ok(mut sessions) = state.portal_sessions.write() {
+            sessions.insert(
+                token.clone(),
+                PortalIdentity {
+                    user_id: credentials.id.to_string(),
+                    email: credentials.email.clone(),
+                },
+            );
+        }
+        (
+            token,
+            SessionUserResponse {
+                id: credentials.id.to_string(),
+                email: credentials.email,
+                display_name: credentials.display_name,
+                roles: vec!["user".to_owned()],
+                permissions: vec!["subscription:read".to_owned()],
+            },
+        )
+    } else {
+        (
+            state.demo_portal_access_token.to_string(),
+            demo_portal_user(&state.config),
+        )
+    };
+
     Json(LoginResponse {
-        access_token: state.demo_portal_access_token.to_string(),
+        access_token,
         token_type: DEMO_TOKEN_TYPE,
         expires_in: DEMO_TOKEN_EXPIRES_IN,
-        user: demo_portal_user(&state.config),
+        user: portal_user,
     })
     .into_response()
 }
@@ -504,8 +573,15 @@ async fn session(State(state): State<AppState>, headers: HeaderMap) -> Response 
     if state.is_authorized(&headers) {
         return Json(demo_user(&state.config)).into_response();
     }
-    if state.is_portal_authorized(&headers) {
-        return Json(demo_portal_user(&state.config)).into_response();
+    if let Some(identity) = state.portal_identity(&headers) {
+        return Json(SessionUserResponse {
+            id: identity.user_id,
+            email: identity.email,
+            display_name: "Lin".to_owned(),
+            roles: vec!["user".to_owned()],
+            permissions: vec!["subscription:read".to_owned()],
+        })
+        .into_response();
     }
     unauthorized_response()
 }
@@ -1076,9 +1152,7 @@ async fn create_admin_subscription(
         user_id,
         plan_id,
         starts_at: request.starts_at,
-        expires_at: request
-            .expires_at
-            .unwrap_or_else(|| "2099-01-01T00:00:00Z".to_owned()),
+        expires_at: request.expires_at,
         subscription_token: format!("cb_{}", uuid::Uuid::new_v4().simple()),
     };
     match database
@@ -1146,6 +1220,9 @@ async fn portal_subscription(State(state): State<AppState>, headers: HeaderMap) 
     if let Err(response) = require_portal_auth(&state, &headers) {
         return response;
     }
+    let Some(identity) = state.portal_identity(&headers) else {
+        return unauthorized_response();
+    };
     let Some(database) = state.database.as_ref() else {
         return service_unavailable_response();
     };
@@ -1155,7 +1232,7 @@ async fn portal_subscription(State(state): State<AppState>, headers: HeaderMap) 
     {
         Ok(items) => match items
             .into_iter()
-            .find(|item| item.user_email == state.config.demo_user_email)
+            .find(|item| item.user_email == identity.email)
         {
             Some(record) => Json(subscription_summary_owned(record, true)).into_response(),
             None => not_found_response("当前没有生效订阅"),
@@ -1168,6 +1245,9 @@ async fn portal_usage(State(state): State<AppState>, headers: HeaderMap) -> Resp
     if let Err(response) = require_portal_auth(&state, &headers) {
         return response;
     }
+    let Some(identity) = state.portal_identity(&headers) else {
+        return unauthorized_response();
+    };
     let Some(database) = state.database.as_ref() else {
         return service_unavailable_response();
     };
@@ -1177,7 +1257,7 @@ async fn portal_usage(State(state): State<AppState>, headers: HeaderMap) -> Resp
     {
         Ok(items) => match items
             .into_iter()
-            .find(|item| item.user_email == state.config.demo_user_email)
+            .find(|item| item.user_email == identity.email)
         {
             Some(record) => Json(PortalUsageResponse {
                 used_bytes: record.traffic_used_bytes,
@@ -1402,6 +1482,14 @@ async fn openapi() -> Json<Value> {
             "/api/v1/admin/plans": {
                 "get": { "operationId": "listAdminPlans", "security": [{"bearerAuth": []}], "responses": { "200": { "description": "Tenant-scoped plan page", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PlanList" } } } }, "503": { "description": "Database unavailable" } } },
                 "post": { "operationId": "createAdminPlan", "security": [{"bearerAuth": []}], "responses": { "201": { "description": "Created plan" }, "503": { "description": "Database unavailable" } } }
+            },
+            "/api/v1/admin/plans/{planId}": {
+                "patch": { "operationId": "updateAdminPlan", "security": [{"bearerAuth": []}], "parameters": [{"name":"planId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}], "responses": { "200": { "description": "Updated plan" }, "404": { "description": "Plan not found" } } },
+                "delete": { "operationId": "deleteAdminPlan", "security": [{"bearerAuth": []}], "parameters": [{"name":"planId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}], "responses": { "204": { "description": "Plan archived" }, "404": { "description": "Plan not found" } } }
+            },
+            "/api/v1/admin/subscriptions/{subscriptionId}": {
+                "patch": { "operationId": "updateAdminSubscription", "security": [{"bearerAuth": []}], "parameters": [{"name":"subscriptionId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}], "responses": { "200": { "description": "Updated subscription" }, "404": { "description": "Subscription not found" } } },
+                "delete": { "operationId": "deleteAdminSubscription", "security": [{"bearerAuth": []}], "parameters": [{"name":"subscriptionId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}], "responses": { "204": { "description": "Subscription revoked" }, "404": { "description": "Subscription not found" } } }
             },
             "/api/v1/admin/nodes/{nodeId}": {
                 "patch": { "operationId": "updateAdminNode", "security": [{"bearerAuth": []}], "responses": { "200": { "description": "Updated node" }, "404": { "description": "Node not found" } } },
@@ -1940,6 +2028,9 @@ mod tests {
             "/api/v1/admin/users",
             "/api/v1/admin/plans",
             "/api/v1/admin/subscriptions",
+            "/api/v1/admin/plans/{planId}",
+            "/api/v1/admin/nodes/{nodeId}",
+            "/api/v1/admin/subscriptions/{subscriptionId}",
         ] {
             assert!(
                 document["paths"][path].is_object(),

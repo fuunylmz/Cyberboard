@@ -59,6 +59,8 @@ message GetDesiredStateRequest {
   string agent_id = 1;
   string node_id = 2;
   string current_generation = 3;
+  string current_content_hash = 4;
+  uint64 last_applied_generation = 5;
 }
 
 message DesiredStateResponse {
@@ -70,6 +72,8 @@ message DesiredStateResponse {
   string signature = 6;
   string signing_key_id = 7;
   int64 expires_at = 8;
+  string expected_previous_hash = 9;
+  uint64 generation_number = 10;
 }
 
 message ReportApplyResultRequest {
@@ -83,6 +87,8 @@ message ReportApplyResultRequest {
   string error_message = 8;
   uint32 retry_count = 9;
   int64 unix_time = 10;
+  string expected_previous_hash = 11;
+  bool compare_and_swap_ok = 12;
 }
 
 message ReportUsageRequest {

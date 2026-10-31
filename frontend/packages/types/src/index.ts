@@ -19,6 +19,15 @@ export type SubscriptionUpdateInput = Partial<Pick<SubscriptionCreateInput, 'pla
 export interface NodeCreateInput { name: string; region: string; address: string; port: number; core?: string; coreVersion?: string; tags?: string[] }
 export type NodeUpdateInput = Partial<NodeCreateInput> & { status?: NodeStatus }
 export interface UsageSummary { usedBytes: number; quotaBytes: number; todayBytes: number; projectedBytes: number; periodStart: string; periodEnd: string; daily: Array<{ date: string; bytes: number }> }
+export interface ConfigTemplateSummary { id: string; name: string; description: string; coreType: string; coreVersionRange: string; status: 'draft' | 'active' | 'archived'; updatedAt: string; updatedBy: string }
+export interface ConfigRevisionSummary { id: string; templateId: string; nodeId: string; nodeName: string; generation: number; coreVersion: string; contentHash: string; signatureStatus: 'pending' | 'valid' | 'invalid'; validationStatus: 'pending' | 'passed' | 'failed'; publishStatus: 'draft' | 'publishing' | 'published' | 'failed' | 'rolled_back'; failureReason?: string; createdAt: string }
+export interface ConfigTemplateCreateInput { name: string; description?: string; coreType: string; coreVersionRange: string; status?: ConfigTemplateSummary['status'] }
+export type ConfigTemplateUpdateInput = Partial<ConfigTemplateCreateInput>
+export interface ConfigRevisionQuery extends PageQuery { templateId?: string; nodeId?: string }
+export interface ConfigPublishInput { targetNodeIds?: string[]; expectedGeneration?: number }
+export interface ConfigRollbackInput { targetGeneration?: number; reason?: string }
+export interface OrderSummary { id: string; plan: string; status: 'pending' | 'paid' | 'cancelled' | 'refunded' | 'failed'; amountCents: number; currency: string; createdAt: string; paidAt: string | null }
+export interface DeviceSummary { id: string; name: string; platform: string; status: 'active' | 'revoked' | 'unknown'; lastSeenAt: string | null; ipAddress?: string }
 export interface NodeSummary { id: string; name: string; region: string; address: string; status: NodeStatus; core: string; coreVersion: string; agentVersion: string; currentConfigRevision: string | null; latencyMs: number | null; lastHeartbeatAt: string | null }
 export interface SubscriptionSummary { id: string; userEmail: string; plan: string; status: SubscriptionStatus; trafficUsedBytes: number; trafficQuotaBytes: number; expiresAt: string; tokenHint: string; subscriptionUrl?: string }
 export interface DashboardSummary { users: number; activeSubscriptions: number; onlineNodes: number; trafficBytes24h: number; failedTasks: number; generatedAt: string }

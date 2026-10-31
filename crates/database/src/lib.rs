@@ -120,9 +120,13 @@ impl Database {
         email: &str,
     ) -> DatabaseResult<Option<UserCredentials>> {
         let row = sqlx::query(
-            "SELECT id, email, display_name, password_hash, status
-             FROM users
-             WHERE tenant_id = $1 AND lower(email) = lower($2)
+            "SELECT u.id, u.email, u.display_name, u.password_hash, u.status,
+                    COALESCE(array_agg(r.name) FILTER (WHERE r.name IS NOT NULL), ARRAY[]::text[]) AS roles
+             FROM users u
+             LEFT JOIN user_roles ur ON ur.tenant_id=u.tenant_id AND ur.user_id=u.id
+             LEFT JOIN roles r ON r.tenant_id=ur.tenant_id AND r.id=ur.role_id
+             WHERE u.tenant_id = $1 AND lower(u.email) = lower($2)
+             GROUP BY u.id, u.email, u.display_name, u.password_hash, u.status
              LIMIT 1",
         )
         .bind(tenant_id)
@@ -136,6 +140,7 @@ impl Database {
             display_name: row.get("display_name"),
             password_hash: row.get("password_hash"),
             status: row.get("status"),
+            roles: row.get("roles"),
         }))
     }
 
@@ -499,7 +504,8 @@ impl Database {
     ) -> DatabaseResult<SubscriptionRecord> {
         let row = sqlx::query(
             "INSERT INTO subscriptions (tenant_id,user_id,plan_id,status,traffic_quota_bytes,starts_at,expires_at,subscription_token)
-             SELECT $1,$2,p.id,'active',p.traffic_quota_bytes,$4::timestamptz,$5::timestamptz,$6
+             SELECT $1,$2,p.id,'active',p.traffic_quota_bytes,$4::timestamptz,
+                    COALESCE($5::timestamptz, COALESCE($4::timestamptz, now()) + make_interval(days => p.duration_days)),$6
              FROM plans p WHERE p.tenant_id=$1 AND p.id=$3
              RETURNING id,user_id,plan_id,status,traffic_used_bytes,traffic_quota_bytes,expires_at::text AS expires_at,subscription_token",
         ).bind(tenant_id).bind(input.user_id).bind(input.plan_id).bind(&input.starts_at).bind(&input.expires_at).bind(&input.subscription_token)
@@ -582,6 +588,7 @@ pub struct UserCredentials {
     pub display_name: String,
     pub password_hash: String,
     pub status: String,
+    pub roles: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -713,7 +720,7 @@ pub struct SubscriptionInput {
     pub user_id: Uuid,
     pub plan_id: Uuid,
     pub starts_at: Option<String>,
-    pub expires_at: String,
+    pub expires_at: Option<String>,
     pub subscription_token: String,
 }
 

@@ -1,2 +1,19 @@
-import { createRouter, createWebHistory } from 'vue-router'; import { useAuthStore } from './stores/auth'; import PortalLayout from './layouts/PortalLayout.vue'; import LoginPage from './pages/LoginPage.vue'; import HomePage from './pages/HomePage.vue'; import SubscriptionPage from './pages/SubscriptionPage.vue'; import UsagePage from './pages/UsagePage.vue'; import SecurityPage from './pages/SecurityPage.vue'
-const router=createRouter({history:createWebHistory(),routes:[{path:'/login',component:LoginPage},{path:'/portal',component:PortalLayout,meta:{requiresAuth:true},children:[{path:'',redirect:'/portal/home'},{path:'home',name:'首页',component:HomePage},{path:'subscription',name:'我的订阅',component:SubscriptionPage},{path:'usage',name:'使用量',component:UsagePage},{path:'security',name:'安全设置',component:SecurityPage}]},{path:'/:pathMatch(.*)*',redirect:'/portal'}]}); router.beforeEach((to)=>{const auth=useAuthStore();if(to.meta.requiresAuth&&!auth.isAuthenticated)return'/login';if(to.path==='/login'&&auth.isAuthenticated)return'/portal'}); if(typeof window!=='undefined') window.addEventListener('cyberboard:portal-unauthorized',()=>{const auth=useAuthStore();auth.logout();if(router.currentRoute.value.path!=='/login')router.replace('/login')}); export default router
+import { createRouter, createWebHistory } from 'vue-router'
+import { useAuthStore } from './stores/auth'
+import PortalLayout from './layouts/PortalLayout.vue'
+import LoginPage from './pages/LoginPage.vue'
+import HomePage from './pages/HomePage.vue'
+import SubscriptionPage from './pages/SubscriptionPage.vue'
+import UsagePage from './pages/UsagePage.vue'
+import SecurityPage from './pages/SecurityPage.vue'
+import OrdersPage from './pages/OrdersPage.vue'
+import DevicesPage from './pages/DevicesPage.vue'
+const router = createRouter({ history: createWebHistory(), routes: [
+  { path: '/login', component: LoginPage },
+  { path: '/portal', component: PortalLayout, meta: { requiresAuth: true }, children: [
+    { path: '', redirect: '/portal/home' }, { path: 'home', name: '首页', component: HomePage }, { path: 'subscription', name: '我的订阅', component: SubscriptionPage }, { path: 'usage', name: '使用量', component: UsagePage }, { path: 'orders', name: '订单', component: OrdersPage }, { path: 'devices', name: '设备', component: DevicesPage }, { path: 'security', name: '安全设置', component: SecurityPage },
+  ] }, { path: '/:pathMatch(.*)*', redirect: '/portal' },
+] })
+router.beforeEach((to) => { const auth = useAuthStore(); if (to.meta.requiresAuth && !auth.isAuthenticated) return '/login'; if (to.path === '/login' && auth.isAuthenticated) return '/portal' })
+if (typeof window !== 'undefined') window.addEventListener('cyberboard:portal-unauthorized', () => { const auth = useAuthStore(); auth.logout(); if (router.currentRoute.value.path !== '/login') router.replace('/login') })
+export default router

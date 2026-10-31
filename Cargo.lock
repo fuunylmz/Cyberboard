@@ -424,6 +424,7 @@ dependencies = [
  "sha2",
  "sqlx",
  "thiserror",
+ "tokio",
  "uuid",
 ]
 

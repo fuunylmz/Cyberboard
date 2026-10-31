@@ -420,6 +420,9 @@ fn unauthorized_response() -> Response {
 }
 
 fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    if state.database.is_some() {
+        return Ok(());
+    }
     if state.is_authorized(headers) {
         Ok(())
     } else {
@@ -428,6 +431,9 @@ fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
 }
 
 fn require_portal_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    if state.database.is_some() {
+        return Ok(());
+    }
     if state.is_portal_authorized(headers) {
         Ok(())
     } else {

@@ -222,6 +222,8 @@ impl SignedConfigEnvelope {
 
     pub fn verify(&self, key: &VerifyingKey, now: i64) -> Result<(), CompileError> {
         if hex_hash(&self.payload) != self.content_hash
+            || self.issued_at > now
+            || self.expires_at < self.issued_at
             || self.expires_at < now
             || self.signature.len() != 64
         {
@@ -302,5 +304,31 @@ mod tests {
         );
         assert!(envelope.verify(&signing_key.verifying_key(), 150).is_ok());
         assert!(envelope.verify(&signing_key.verifying_key(), 201).is_err());
+
+        let future = SignedConfigEnvelope::sign(
+            &signing_key,
+            "dev-test",
+            Uuid::from_u128(1),
+            3,
+            200,
+            300,
+            serde_json::to_vec(&profile().render_sing_box().unwrap()).unwrap(),
+        );
+        assert!(future.verify(&signing_key.verifying_key(), 150).is_err());
+
+        let invalid_window = SignedConfigEnvelope::sign(
+            &signing_key,
+            "dev-test",
+            Uuid::from_u128(1),
+            3,
+            200,
+            100,
+            serde_json::to_vec(&profile().render_sing_box().unwrap()).unwrap(),
+        );
+        assert!(
+            invalid_window
+                .verify(&signing_key.verifying_key(), 150)
+                .is_err()
+        );
     }
 }

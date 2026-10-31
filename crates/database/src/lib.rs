@@ -880,7 +880,7 @@ impl Database {
         }
         sqlx::query("UPDATE config_revisions SET publish_status=$3,failure_reason=NULL WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(id).bind(status).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO config_deployments(tenant_id,config_revision_id,node_id,status,expected_generation,applied_generation) VALUES($1,$2,$3,$4,$5,$5)").bind(tenant_id).bind(id).bind(node_id).bind(if status=="published" {"applied"} else {"rolled_back"}).bind(expected_generation).execute(&mut *tx).await?;
-        sqlx::query("UPDATE nodes SET current_config_revision=$3,updated_at=now() WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(node_id).bind(if status=="published" {Some(id)} else {current}).execute(&mut *tx).await?;
+        sqlx::query("UPDATE nodes SET current_config_revision=$3,updated_at=now() WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(node_id).bind(Some(id)).execute(&mut *tx).await?;
         let row = sqlx::query("SELECT r.id,COALESCE(r.template_id::text,'') AS template_id,r.node_id,n.name AS node_name,r.generation,r.core_version,r.content_hash,CASE WHEN r.signature='' THEN 'pending' ELSE 'valid' END AS signature_status,r.validation_status,r.publish_status,r.failure_reason,r.created_at::text AS created_at FROM config_revisions r JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id WHERE r.tenant_id=$1 AND r.id=$2").bind(tenant_id).bind(id).fetch_one(&mut *tx).await?;
         tx.commit().await?;
         Ok(Some(ConfigRevisionRecord::from_row(row)))

@@ -23,14 +23,17 @@ pub const SEVENTH_MIGRATION: &str =
 pub const EIGHTH_MIGRATION_NAME: &str = "0008_agent_control.sql";
 pub const EIGHTH_MIGRATION: &str =
     include_str!("../../../deploy/migrations/0008_agent_control.sql");
+pub const NINTH_MIGRATION_NAME: &str = "0009_agent_registration_token_lifecycle.sql";
+pub const NINTH_MIGRATION: &str =
+    include_str!("../../../deploy/migrations/0009_agent_registration_token_lifecycle.sql");
 
 #[cfg(test)]
 mod tests {
     use super::{
         EIGHTH_MIGRATION, EIGHTH_MIGRATION_NAME, FIFTH_MIGRATION, FOURTH_MIGRATION,
-        INITIAL_MIGRATION, INITIAL_MIGRATION_NAME, SECOND_MIGRATION, SECOND_MIGRATION_NAME,
-        SEVENTH_MIGRATION, SEVENTH_MIGRATION_NAME, SIXTH_MIGRATION, THIRD_MIGRATION,
-        THIRD_MIGRATION_NAME,
+        INITIAL_MIGRATION, INITIAL_MIGRATION_NAME, NINTH_MIGRATION, NINTH_MIGRATION_NAME,
+        SECOND_MIGRATION, SECOND_MIGRATION_NAME, SEVENTH_MIGRATION, SEVENTH_MIGRATION_NAME,
+        SIXTH_MIGRATION, THIRD_MIGRATION, THIRD_MIGRATION_NAME,
     };
 
     #[test]
@@ -109,5 +112,10 @@ mod tests {
         assert_eq!(EIGHTH_MIGRATION_NAME, "0008_agent_control.sql");
         assert!(EIGHTH_MIGRATION.contains("agent_usage_receipts"));
         assert!(EIGHTH_MIGRATION.contains("agent_registration_token_hash"));
+        assert_eq!(
+            NINTH_MIGRATION_NAME,
+            "0009_agent_registration_token_lifecycle.sql"
+        );
+        assert!(NINTH_MIGRATION.contains("agent_registration_token_expires_at"));
     }
 }

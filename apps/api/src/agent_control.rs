@@ -248,7 +248,12 @@ impl AgentControl for AgentControlService {
                     &payload,
                 )
                 .await
-                .map_err(|_| Status::internal("usage receipt persistence failed"))?;
+                .map_err(|error| match error {
+                    cyberboard_database::DatabaseError::InvalidUsagePayload(message) => {
+                        Status::invalid_argument(message)
+                    }
+                    _ => Status::internal("usage receipt persistence failed"),
+                })?;
         }
         Ok(Response::new(Ack {
             request_id: Uuid::new_v4().to_string(),

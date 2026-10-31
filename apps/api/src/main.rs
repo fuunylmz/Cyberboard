@@ -15,12 +15,16 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use cyberboard_config::ApiConfig;
+use cyberboard_config_compiler::{SignedConfigEnvelope, hex_hash};
+use cyberboard_database::hash_session_token;
 use cyberboard_database::{
     ConfigRevisionRecord, ConfigTemplateInput, ConfigTemplateRecord, ConfigTemplateUpdate,
     Database, NodeInput, NodeRecord, NodeUpdate, PlanInput, PlanRecord, PlanUpdate,
     SubscriptionInput, SubscriptionRecord, SubscriptionUpdate, UserRecord,
 };
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -33,6 +37,7 @@ const DEMO_ACCESS_TOKEN: &str = "cyberboard-dev-token";
 const DEMO_PORTAL_ACCESS_TOKEN: &str = "cyberboard-portal-dev-token";
 const DEMO_TOKEN_TYPE: &str = "Bearer";
 const DEMO_TOKEN_EXPIRES_IN: u64 = 3600;
+const AGENT_REGISTRATION_TOKEN_TTL_SECS: i64 = 900;
 
 #[derive(Clone)]
 struct AppState {
@@ -668,6 +673,15 @@ struct NodeSummaryOwnedResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct AgentRegistrationTokenResponse {
+    node_id: String,
+    token: String,
+    expires_at: i64,
+    rotated: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SubscriptionOwnedResponse {
     id: String,
     user_email: String,
@@ -1002,6 +1016,74 @@ async fn admin_nodes(
         page_size: limit,
     })
     .into_response()
+}
+
+fn new_agent_registration_token(node_id: Uuid) -> (String, i64, i64) {
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let expires_at = created_at + AGENT_REGISTRATION_TOKEN_TTL_SECS;
+    let entropy = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    (format!("{node_id}:{entropy}"), created_at, expires_at)
+}
+
+async fn issue_agent_registration_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(node_id): Path<Uuid>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    let (token, created_at, expires_at) = new_agent_registration_token(node_id);
+    match database
+        .issue_agent_registration_token(
+            state.config.tenant_id,
+            node_id,
+            &hash_session_token(&token),
+            created_at,
+            expires_at,
+        )
+        .await
+    {
+        Ok(Some(rotated)) => (
+            StatusCode::CREATED,
+            Json(AgentRegistrationTokenResponse {
+                node_id: node_id.to_string(),
+                token,
+                expires_at,
+                rotated,
+            }),
+        )
+            .into_response(),
+        Ok(None) => not_found_response("节点不存在"),
+        Err(_) => internal_database_response(),
+    }
+}
+
+async fn revoke_agent_registration_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(node_id): Path<Uuid>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    match database
+        .revoke_agent_registration_token(state.config.tenant_id, node_id)
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => not_found_response("节点不存在或没有生效的注册凭证"),
+        Err(_) => internal_database_response(),
+    }
 }
 
 fn user_summary(record: UserRecord) -> UserSummaryResponse {
@@ -1986,6 +2068,60 @@ struct ConfigRevisionAction {
     expected_previous_hash: Option<String>,
 }
 
+fn config_signing_key() -> Result<(SigningKey, String), Response> {
+    let encoded = std::env::var("CYBERBOARD_CONFIG_SIGNING_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| service_unavailable_response())?;
+    let bytes = BASE64
+        .decode(encoded)
+        .map_err(|_| service_unavailable_response())?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| service_unavailable_response())?;
+    let key_id = std::env::var("CYBERBOARD_CONFIG_SIGNING_KEY_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "config-key-1".to_owned());
+    Ok((SigningKey::from_bytes(&bytes), key_id))
+}
+
+async fn signed_envelope_for_revision(
+    database: &Database,
+    tenant_id: Uuid,
+    revision_id: Uuid,
+) -> Result<String, Response> {
+    let Some(revision) = database
+        .config_revision_for_signing(tenant_id, revision_id)
+        .await
+        .map_err(|_| internal_database_response())?
+    else {
+        return Err(not_found_response("配置版本不存在"));
+    };
+    let payload =
+        serde_json::to_vec(&revision.payload).map_err(|_| internal_database_response())?;
+    if hex_hash(&payload) != revision.content_hash {
+        return Err(invalid_input_response(
+            "配置版本内容 hash 与 payload 不一致",
+        ));
+    }
+    let (signing_key, key_id) = config_signing_key()?;
+    let issued_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let envelope = SignedConfigEnvelope::sign(
+        &signing_key,
+        key_id,
+        revision.node_id,
+        revision.generation.max(0) as u64,
+        issued_at,
+        issued_at + 300,
+        payload,
+    );
+    serde_json::to_string(&envelope).map_err(|_| internal_database_response())
+}
+
 fn config_template_json(record: ConfigTemplateRecord) -> Value {
     json!({"id":record.id,"name":record.name,"description":record.description,"coreType":record.core_type,"coreVersionRange":record.core_version_range,"status":record.status,"updatedAt":record.updated_at,"updatedBy":record.updated_by})
 }
@@ -2121,6 +2257,10 @@ async fn publish_config_revision(
     let Some(generation) = action.expected_generation else {
         return invalid_input_response("expectedGeneration不能为空");
     };
+    let signed_envelope = match signed_envelope_for_revision(db, state.config.tenant_id, id).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     match db
         .set_config_publish_status(
             state.config.tenant_id,
@@ -2128,6 +2268,7 @@ async fn publish_config_revision(
             generation,
             "published",
             action.expected_previous_hash.as_deref(),
+            Some(&signed_envelope),
         )
         .await
     {
@@ -2159,6 +2300,7 @@ async fn rollback_config_revision(
             generation,
             "rolled_back",
             action.expected_previous_hash.as_deref(),
+            None,
         )
         .await
     {
@@ -2358,6 +2500,10 @@ async fn openapi() -> Json<Value> {
             "/api/v1/admin/nodes/{nodeId}": {
                 "patch": { "operationId": "updateAdminNode", "security": [{"bearerAuth": []}], "responses": { "200": { "description": "Updated node" }, "404": { "description": "Node not found" } } },
                 "delete": { "operationId": "deleteAdminNode", "security": [{"bearerAuth": []}], "responses": { "204": { "description": "Node deleted" }, "404": { "description": "Node not found" } } }
+            },
+            "/api/v1/admin/nodes/{nodeId}/registration-token": {
+                "post": { "operationId":"issueAgentRegistrationToken", "security":[{"bearerAuth":[]}], "parameters":[{"name":"nodeId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}], "responses":{"201":{"description":"One-time registration token","content":{"application/json":{"schema":{"$ref":"#/components/schemas/AgentRegistrationToken"}}}},"401":{"description":"Invalid token"},"404":{"description":"Node not found"},"503":{"description":"Database unavailable"}} },
+                "delete": { "operationId":"revokeAgentRegistrationToken", "security":[{"bearerAuth":[]}], "parameters":[{"name":"nodeId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}], "responses":{"204":{"description":"Registration token revoked"},"401":{"description":"Invalid token"},"404":{"description":"Node not found or token absent"},"503":{"description":"Database unavailable"}} }
             }
         },
         "securitySchemes": {
@@ -2439,6 +2585,10 @@ async fn openapi() -> Json<Value> {
                 "NodeList": {
                     "type":"object", "required":["items","total","page","pageSize"],
                     "properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/NodeSummary"}},"total":{"type":"integer"},"page":{"type":"integer"},"pageSize":{"type":"integer"}}
+                },
+                "AgentRegistrationToken": {
+                    "type":"object", "required":["nodeId","token","expiresAt","rotated"],
+                    "properties":{"nodeId":{"type":"string","format":"uuid"},"token":{"type":"string","description":"Shown once; never persisted in clear text"},"expiresAt":{"type":"integer","format":"int64"},"rotated":{"type":"boolean"}}
                 },
                 "PlanSummary": {
                     "type":"object",
@@ -2543,6 +2693,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/v1/admin/nodes/{node_id}",
             patch(update_admin_node).delete(delete_admin_node),
+        )
+        .route(
+            "/api/v1/admin/nodes/{node_id}/registration-token",
+            post(issue_agent_registration_token).delete(revoke_agent_registration_token),
         )
         .route(
             "/api/v1/admin/users",
@@ -2699,6 +2853,7 @@ mod tests {
     use cyberboard_config::ApiConfig;
     use serde_json::Value;
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn health_endpoint_is_available() {
@@ -2887,6 +3042,21 @@ mod tests {
         assert!(!super::role_allowed(&["admin".to_owned()], false));
     }
 
+    #[test]
+    fn agent_registration_tokens_are_unique_and_node_bound() {
+        let node_id = Uuid::from_u128(7);
+        let (first, created_at, expires_at) = super::new_agent_registration_token(node_id);
+        let (second, _, _) = super::new_agent_registration_token(node_id);
+        assert_ne!(first, second);
+        assert!(first.starts_with(&format!("{node_id}:")));
+        assert_eq!(first.split(':').nth(1).unwrap().len(), 64);
+        assert!(expires_at > created_at);
+        assert_eq!(
+            expires_at - created_at,
+            super::AGENT_REGISTRATION_TOKEN_TTL_SECS
+        );
+    }
+
     #[tokio::test]
     async fn protected_endpoints_require_and_accept_bearer_token() {
         let (status, headers, body) = get_json("/api/v1/session", None).await;
@@ -3044,6 +3214,7 @@ mod tests {
             "PortalUsage",
             "AdminOrderList",
             "SessionList",
+            "AgentRegistrationToken",
         ] {
             assert!(
                 document["components"]["schemas"][schema].is_object(),
@@ -3068,6 +3239,7 @@ mod tests {
             "/api/v1/admin/orders",
             "/api/v1/admin/plans/{planId}",
             "/api/v1/admin/nodes/{nodeId}",
+            "/api/v1/admin/nodes/{nodeId}/registration-token",
             "/api/v1/admin/subscriptions/{subscriptionId}",
         ] {
             assert!(
@@ -3079,5 +3251,13 @@ mod tests {
         assert!(document["paths"]["/api/v1/me/orders"]["post"]["responses"]["404"].is_object());
         assert!(document["paths"]["/api/v1/admin/orders/{orderId}/mark-paid"]["post"].is_object());
         assert!(document["paths"]["/api/v1/admin/orders/{orderId}/refund"]["post"].is_object());
+        assert!(
+            document["paths"]["/api/v1/admin/nodes/{nodeId}/registration-token"]["post"]
+                .is_object()
+        );
+        assert!(
+            document["paths"]["/api/v1/admin/nodes/{nodeId}/registration-token"]["delete"]
+                .is_object()
+        );
     }
 }

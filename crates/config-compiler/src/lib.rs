@@ -165,7 +165,7 @@ fn render_inbound(inbound: &Inbound) -> Value {
     value
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SignedConfigEnvelope {
     pub key_id: String,
     pub content_hash: String,
@@ -303,6 +303,10 @@ mod tests {
             payload,
         );
         assert!(envelope.verify(&signing_key.verifying_key(), 150).is_ok());
+        let wire = serde_json::to_vec(&envelope).unwrap();
+        let decoded: SignedConfigEnvelope = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(decoded, envelope);
+        assert!(decoded.verify(&signing_key.verifying_key(), 150).is_ok());
         assert!(envelope.verify(&signing_key.verifying_key(), 201).is_err());
 
         let future = SignedConfigEnvelope::sign(

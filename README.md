@@ -39,6 +39,7 @@ curl http://127.0.0.1:8080/openapi.json
 The API accepts `CYBERBOARD_BIND_ADDR`, `CYBERBOARD_API_PORT`,
 `CYBERBOARD_AGENT_GRPC_ADDR`, `CYBERBOARD_AGENT_GRPC_SERVER_CERT`,
 `CYBERBOARD_AGENT_GRPC_SERVER_KEY`, and `CYBERBOARD_AGENT_GRPC_CLIENT_CA`,
+`CYBERBOARD_CONFIG_SIGNING_KEY`, and `CYBERBOARD_CONFIG_SIGNING_KEY_ID`,
 `CYBERBOARD_DATABASE_URL`, `CYBERBOARD_REDIS_URL`,
 `CYBERBOARD_DEMO_ADMIN_EMAIL`, `CYBERBOARD_DEMO_ADMIN_PASSWORD`,
 `CYBERBOARD_DEMO_USER_EMAIL`, and `CYBERBOARD_DEMO_USER_PASSWORD`. The admin
@@ -105,7 +106,17 @@ stays in explicit local mode. The API exposes AgentControl gRPC on
 are mandatory when database mode is enabled outside `CYBERBOARD_DEV_MODE=1`;
 setting `CYBERBOARD_AGENT_GRPC_CLIENT_CA` additionally enables mutual TLS.
 Registration tokens use the `<node_uuid>:<secret>` form and are cleared after
-successful registration.
+successful registration. An administrator issues a 15-minute token with
+`POST /api/v1/admin/nodes/{nodeId}/registration-token` using the admin bearer
+token; the clear-text value is returned once, while PostgreSQL stores only its
+SHA-256 hash and lifecycle timestamps. `DELETE` on the same endpoint revokes
+the current token, and a later `POST` rotates it.
+
+Publishing a config revision requires `CYBERBOARD_CONFIG_SIGNING_KEY` to be a
+base64-encoded Ed25519 seed (32 bytes). The API stores the signed canonical
+envelope in the revision and the Agent receives that exact envelope through
+`GetDesiredState`; `CYBERBOARD_CONFIG_SIGNING_KEY_ID` defaults to
+`config-key-1`.
 
 ## Docker Compose
 

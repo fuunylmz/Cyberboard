@@ -7,9 +7,10 @@
 use std::time::Duration;
 
 use cyberboard_storage::{
-    EIGHTH_MIGRATION, FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, SECOND_MIGRATION,
-    SEVENTH_MIGRATION, SIXTH_MIGRATION, THIRD_MIGRATION,
+    EIGHTH_MIGRATION, FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, NINTH_MIGRATION,
+    SECOND_MIGRATION, SEVENTH_MIGRATION, SIXTH_MIGRATION, THIRD_MIGRATION,
 };
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use thiserror::Error;
@@ -37,6 +38,8 @@ pub enum DatabaseError {
     PlanUnavailable,
     #[error("idempotency key parameters conflict")]
     IdempotencyConflict,
+    #[error("usage payload is invalid: {0}")]
+    InvalidUsagePayload(String),
 }
 
 impl DatabaseError {
@@ -298,6 +301,21 @@ impl Database {
                 .await?;
             sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
                 .bind("0008_agent_control")
+                .execute(&mut *transaction)
+                .await?;
+        }
+
+        let ninth: Option<String> =
+            sqlx::query_scalar("SELECT version FROM cyberboard_schema_migrations WHERE version=$1")
+                .bind("0009_agent_registration_token_lifecycle")
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if ninth.is_none() {
+            sqlx::raw_sql(NINTH_MIGRATION)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
+                .bind("0009_agent_registration_token_lifecycle")
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -1138,9 +1156,10 @@ impl Database {
         let usage_result = sqlx::query(
             "UPDATE subscriptions AS s
              SET traffic_used_bytes=COALESCE((
-                 SELECT sum(b.download_bytes + b.upload_bytes)::bigint
-                 FROM usage_buckets AS b
-                 WHERE b.tenant_id=s.tenant_id AND b.user_id=s.user_id
+                 SELECT sum(e.download_bytes + e.upload_bytes)::bigint
+                 FROM usage_events AS e
+                 WHERE e.tenant_id=s.tenant_id
+                   AND e.subscription_id=s.id
              ), 0), updated_at=now()
              WHERE s.tenant_id=$1",
         )
@@ -1255,6 +1274,29 @@ impl Database {
         Ok(ConfigRevisionRecord::from_row(row))
     }
 
+    pub async fn config_revision_for_signing(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+    ) -> DatabaseResult<Option<ConfigRevisionSigningRecord>> {
+        let row = sqlx::query(
+            "SELECT node_id,generation,core_type,core_version,content_hash,payload
+             FROM config_revisions WHERE tenant_id=$1 AND id=$2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| ConfigRevisionSigningRecord {
+            node_id: row.get("node_id"),
+            generation: row.get("generation"),
+            core_type: row.get("core_type"),
+            core_version: row.get("core_version"),
+            content_hash: row.get("content_hash"),
+            payload: row.get("payload"),
+        }))
+    }
+
     pub async fn count_config_revisions(&self, tenant_id: Uuid) -> DatabaseResult<i64> {
         Ok(
             sqlx::query_scalar("SELECT count(*) FROM config_revisions WHERE tenant_id=$1")
@@ -1271,6 +1313,7 @@ impl Database {
         expected_generation: i64,
         status: &str,
         expected_previous_hash: Option<&str>,
+        signed_envelope: Option<&str>,
     ) -> DatabaseResult<Option<ConfigRevisionRecord>> {
         let mut tx = self.pool.begin().await?;
         let revision = sqlx::query("SELECT id,template_id,node_id,generation,core_version,content_hash,validation_status,publish_status,failure_reason,created_at::text AS created_at FROM config_revisions WHERE tenant_id=$1 AND id=$2 FOR UPDATE")
@@ -1325,7 +1368,7 @@ impl Database {
             tx.rollback().await?;
             return Ok(None);
         };
-        sqlx::query("UPDATE config_revisions SET publish_status=$3,failure_reason=NULL WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(id).bind(status).execute(&mut *tx).await?;
+        sqlx::query("UPDATE config_revisions SET publish_status=$3,failure_reason=NULL,signature=COALESCE($4,signature) WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(id).bind(status).bind(signed_envelope).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO config_deployments(tenant_id,config_revision_id,node_id,status,expected_generation,applied_generation) VALUES($1,$2,$3,$4,$5,$5)").bind(tenant_id).bind(target_revision).bind(node_id).bind(if status=="published" {"applied"} else {"rolled_back"}).bind(expected_generation).execute(&mut *tx).await?;
         sqlx::query("UPDATE nodes SET current_config_revision=$3,updated_at=now() WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(node_id).bind(Some(target_revision)).execute(&mut *tx).await?;
         let row = sqlx::query("SELECT r.id,COALESCE(r.template_id::text,'') AS template_id,r.node_id,n.name AS node_name,r.generation,r.core_version,r.content_hash,CASE WHEN r.signature='' THEN 'pending' ELSE 'valid' END AS signature_status,r.validation_status,r.publish_status,r.failure_reason,r.created_at::text AS created_at FROM config_revisions r JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id WHERE r.tenant_id=$1 AND r.id=$2").bind(tenant_id).bind(id).fetch_one(&mut *tx).await?;
@@ -1434,9 +1477,13 @@ impl Database {
         let row = sqlx::query(
             "UPDATE nodes
              SET agent_id=$4, agent_registration_token_hash=NULL,
+                 agent_registration_token_created_at=NULL,
+                 agent_registration_token_expires_at=NULL,
+                 agent_registration_token_revoked_at=NULL,
                  agent_public_key=$5, agent_platform=$6, agent_architecture=$7,
                  agent_version=$8, status='online', last_heartbeat_at=now(), updated_at=now()
              WHERE tenant_id=$1 AND id=$2 AND agent_registration_token_hash=$3
+               AND agent_registration_token_expires_at > now()
              RETURNING id,agent_id,agent_version,agent_platform,agent_architecture",
         )
         .bind(tenant_id)
@@ -1456,6 +1503,65 @@ impl Database {
             platform: row.get("agent_platform"),
             architecture: row.get("agent_architecture"),
         }))
+    }
+
+    pub async fn issue_agent_registration_token(
+        &self,
+        tenant_id: Uuid,
+        node_id: Uuid,
+        token_hash: &str,
+        created_at_unix: i64,
+        expires_at_unix: i64,
+    ) -> DatabaseResult<Option<bool>> {
+        let mut tx = self.pool.begin().await?;
+        let previous: Option<bool> = sqlx::query_scalar(
+            "SELECT agent_registration_token_hash IS NOT NULL
+             FROM nodes WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
+        )
+        .bind(tenant_id)
+        .bind(node_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(previous) = previous else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        sqlx::query(
+            "UPDATE nodes SET agent_registration_token_hash=$3,
+                    agent_registration_token_created_at=to_timestamp($4),
+                    agent_registration_token_expires_at=to_timestamp($5),
+                    agent_registration_token_revoked_at=NULL,
+                    updated_at=now()
+             WHERE tenant_id=$1 AND id=$2",
+        )
+        .bind(tenant_id)
+        .bind(node_id)
+        .bind(token_hash)
+        .bind(created_at_unix)
+        .bind(expires_at_unix)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(previous))
+    }
+
+    pub async fn revoke_agent_registration_token(
+        &self,
+        tenant_id: Uuid,
+        node_id: Uuid,
+    ) -> DatabaseResult<bool> {
+        let result = sqlx::query(
+            "UPDATE nodes SET agent_registration_token_hash=NULL,
+                    agent_registration_token_expires_at=NULL,
+                    agent_registration_token_revoked_at=now(),
+                    updated_at=now()
+             WHERE tenant_id=$1 AND id=$2 AND agent_registration_token_hash IS NOT NULL",
+        )
+        .bind(tenant_id)
+        .bind(node_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn update_agent_heartbeat(
@@ -1582,7 +1688,23 @@ impl Database {
         window_end: i64,
         payload: &serde_json::Value,
     ) -> DatabaseResult<bool> {
-        let result = sqlx::query(
+        if batch_id.trim().is_empty() || window_end <= window_start {
+            return Err(DatabaseError::InvalidUsagePayload(
+                "batch_id and usage window are required".to_owned(),
+            ));
+        }
+        let events = parse_usage_events(payload, window_start, window_end, agent_id, batch_id)?;
+        let mut event_keys = std::collections::HashSet::with_capacity(events.len());
+        for event in &events {
+            if !event_keys.insert(event.event_key.as_str()) {
+                return Err(DatabaseError::InvalidUsagePayload(
+                    "event_key is duplicated within the batch".to_owned(),
+                ));
+            }
+        }
+
+        let mut transaction = self.pool.begin().await?;
+        let receipt = sqlx::query(
             "INSERT INTO agent_usage_receipts
                 (tenant_id,node_id,agent_id,batch_id,sequence,window_start,window_end,usage_payload)
              SELECT $1,$2,$3,$4,$5,to_timestamp($6),to_timestamp($7),$8
@@ -1597,10 +1719,143 @@ impl Database {
         .bind(window_start)
         .bind(window_end)
         .bind(payload)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
-        Ok(result.rows_affected() == 1)
+        if receipt.rows_affected() == 0 {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+
+        for event in events {
+            let inserted = sqlx::query(
+                "INSERT INTO usage_events
+                    (tenant_id,event_key,user_id,subscription_id,node_id,
+                     window_start,window_end,download_bytes,upload_bytes,source_sequence)
+                 SELECT $1,$2,s.user_id,s.id,$3,to_timestamp($4),to_timestamp($5),$6,$7,$8
+                 FROM subscriptions s
+                 JOIN subscription_nodes sn
+                   ON sn.tenant_id=s.tenant_id AND sn.subscription_id=s.id
+                  AND sn.node_id=$3
+                 WHERE s.tenant_id=$1 AND s.id=$9 AND s.user_id=$10
+                   AND s.status <> 'revoked'
+                 ON CONFLICT (tenant_id,event_key) DO NOTHING",
+            )
+            .bind(tenant_id)
+            .bind(&event.event_key)
+            .bind(node_id)
+            .bind(event.window_start)
+            .bind(event.window_end)
+            .bind(event.download_bytes)
+            .bind(event.upload_bytes)
+            .bind(sequence)
+            .bind(event.subscription_id)
+            .bind(event.user_id)
+            .execute(&mut *transaction)
+            .await?;
+            if inserted.rows_affected() == 0 {
+                let already_recorded: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM usage_events
+                         WHERE tenant_id=$1 AND event_key=$2
+                     )",
+                )
+                .bind(tenant_id)
+                .bind(&event.event_key)
+                .fetch_one(&mut *transaction)
+                .await?;
+                if !already_recorded {
+                    return Err(DatabaseError::InvalidUsagePayload(
+                        "subscription is not assigned to this node or user".to_owned(),
+                    ));
+                }
+            }
+        }
+        transaction.commit().await?;
+        Ok(true)
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageEventPayload {
+    #[serde(alias = "event_key")]
+    event_key: Option<String>,
+    #[serde(alias = "user_id")]
+    user_id: Uuid,
+    #[serde(alias = "subscription_id")]
+    subscription_id: Uuid,
+    #[serde(default, alias = "window_start")]
+    window_start: Option<i64>,
+    #[serde(default, alias = "window_end")]
+    window_end: Option<i64>,
+    #[serde(alias = "download_bytes")]
+    download_bytes: i64,
+    #[serde(alias = "upload_bytes")]
+    upload_bytes: i64,
+}
+
+#[derive(Debug)]
+struct ParsedUsageEvent {
+    event_key: String,
+    user_id: Uuid,
+    subscription_id: Uuid,
+    window_start: i64,
+    window_end: i64,
+    download_bytes: i64,
+    upload_bytes: i64,
+}
+
+fn parse_usage_events(
+    payload: &serde_json::Value,
+    default_window_start: i64,
+    default_window_end: i64,
+    agent_id: &str,
+    batch_id: &str,
+) -> DatabaseResult<Vec<ParsedUsageEvent>> {
+    let raw_events: Vec<UsageEventPayload> = match payload.get("events") {
+        Some(events) => serde_json::from_value(events.clone())
+            .map_err(|error| DatabaseError::InvalidUsagePayload(format!("events: {error}")))?,
+        None => vec![
+            serde_json::from_value(payload.clone())
+                .map_err(|error| DatabaseError::InvalidUsagePayload(format!("event: {error}")))?,
+        ],
+    };
+    if raw_events.is_empty() {
+        return Err(DatabaseError::InvalidUsagePayload(
+            "at least one usage event is required".to_owned(),
+        ));
+    }
+    raw_events
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let window_start = event.window_start.unwrap_or(default_window_start);
+            let window_end = event.window_end.unwrap_or(default_window_end);
+            if window_end <= window_start {
+                return Err(DatabaseError::InvalidUsagePayload(
+                    "usage window must end after it starts".to_owned(),
+                ));
+            }
+            if event.download_bytes < 0 || event.upload_bytes < 0 {
+                return Err(DatabaseError::InvalidUsagePayload(
+                    "byte counters cannot be negative".to_owned(),
+                ));
+            }
+            let event_key = event
+                .event_key
+                .filter(|key| !key.trim().is_empty())
+                .unwrap_or_else(|| format!("{agent_id}:{batch_id}:{index}"));
+            Ok(ParsedUsageEvent {
+                event_key,
+                user_id: event.user_id,
+                subscription_id: event.subscription_id,
+                window_start,
+                window_end,
+                download_bytes: event.download_bytes,
+                upload_bytes: event.upload_bytes,
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -2011,6 +2266,16 @@ pub struct ConfigRevisionRecord {
     pub failure_reason: Option<String>,
     pub created_at: String,
 }
+
+#[derive(Clone, Debug)]
+pub struct ConfigRevisionSigningRecord {
+    pub node_id: Uuid,
+    pub generation: i64,
+    pub core_type: String,
+    pub core_version: String,
+    pub content_hash: String,
+    pub payload: serde_json::Value,
+}
 impl ConfigRevisionRecord {
     fn from_row(row: sqlx::postgres::PgRow) -> Self {
         Self {
@@ -2047,7 +2312,9 @@ impl SubscriptionRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::{CREATE_ORDER_IDEMPOTENT_SQL, CREATE_ORDER_SQL, DatabaseError};
+    use super::{CREATE_ORDER_IDEMPOTENT_SQL, CREATE_ORDER_SQL, DatabaseError, parse_usage_events};
+    use serde_json::json;
+    use uuid::Uuid;
 
     #[test]
     fn order_creation_queries_only_select_active_plans() {
@@ -2063,5 +2330,60 @@ mod tests {
     fn idempotency_parameter_conflicts_are_classified_as_conflicts() {
         assert!(DatabaseError::IdempotencyConflict.is_conflict());
         assert!(!DatabaseError::PlanUnavailable.is_conflict());
+    }
+
+    #[test]
+    fn usage_payload_supports_single_and_batched_events() {
+        let user_id = Uuid::from_u128(1);
+        let subscription_id = Uuid::from_u128(2);
+        let single = parse_usage_events(
+            &json!({
+                "userId": user_id,
+                "subscriptionId": subscription_id,
+                "downloadBytes": 12,
+                "uploadBytes": 3
+            }),
+            100,
+            200,
+            "agent-1",
+            "batch-1",
+        )
+        .unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].event_key, "agent-1:batch-1:0");
+        let batched = parse_usage_events(
+            &json!({"events": [{
+                "event_key": "event-1",
+                "user_id": user_id,
+                "subscription_id": subscription_id,
+                "download_bytes": 5,
+                "upload_bytes": 1
+            }]}),
+            100,
+            200,
+            "agent-1",
+            "batch-2",
+        )
+        .unwrap();
+        assert_eq!(batched[0].event_key, "event-1");
+        assert_eq!(batched[0].download_bytes, 5);
+    }
+
+    #[test]
+    fn usage_payload_rejects_negative_counters() {
+        let error = parse_usage_events(
+            &json!({
+                "userId": Uuid::from_u128(1),
+                "subscriptionId": Uuid::from_u128(2),
+                "downloadBytes": -1,
+                "uploadBytes": 0
+            }),
+            100,
+            200,
+            "agent-1",
+            "batch-1",
+        )
+        .unwrap_err();
+        assert!(matches!(error, DatabaseError::InvalidUsagePayload(_)));
     }
 }

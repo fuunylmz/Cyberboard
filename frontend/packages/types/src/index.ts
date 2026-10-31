@@ -24,6 +24,7 @@ export interface ConfigRevisionSummary { id: string; templateId: string; nodeId:
 export interface ConfigTemplateCreateInput { name: string; description?: string; coreType: string; coreVersionRange: string; status?: ConfigTemplateSummary['status'] }
 export type ConfigTemplateUpdateInput = Partial<ConfigTemplateCreateInput>
 export interface ConfigRevisionQuery extends PageQuery { templateId?: string; nodeId?: string }
+export interface ConfigRevisionCreateInput { templateId: string; nodeId: string; generation: number; coreVersion: string; payload: Record<string, unknown> }
 export interface ConfigPublishInput { targetNodeIds?: string[]; expectedGeneration?: number }
 export interface ConfigRollbackInput { expectedGeneration?: number; reason?: string }
 export interface OrderSummary { id: string; plan: string; status: 'pending' | 'paid' | 'cancelled' | 'refunded' | 'failed'; amountCents: number; currency: string; createdAt: string; paidAt?: string | null }

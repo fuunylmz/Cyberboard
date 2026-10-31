@@ -419,6 +419,25 @@ impl Database {
         )
     }
 
+    /// Returns only plans that can be purchased by a portal user.
+    ///
+    /// Keeping this query separate from the admin listing makes the public
+    /// lifecycle rule explicit and prevents callers from accidentally exposing
+    /// archived plans as purchasable options.
+    pub async fn list_public_plans(
+        &self,
+        tenant_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> DatabaseResult<Vec<PlanRecord>> {
+        self.list_plans(tenant_id, limit, offset, None, Some("active"))
+            .await
+    }
+
+    pub async fn count_public_plans(&self, tenant_id: Uuid) -> DatabaseResult<i64> {
+        self.count_plans(tenant_id, None, Some("active")).await
+    }
+
     pub async fn create_plan(
         &self,
         tenant_id: Uuid,
@@ -721,7 +740,7 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> DatabaseResult<Vec<OrderRecord>> {
-        let rows = sqlx::query("SELECT o.id,o.status,o.amount_cents,o.currency,o.created_at::text AS created_at,p.name AS plan FROM orders o JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id WHERE o.tenant_id=$1 AND o.user_id=$2 ORDER BY o.created_at DESC,o.id LIMIT $3 OFFSET $4").bind(tenant_id).bind(user_id).bind(limit).bind(offset).fetch_all(&self.pool).await?;
+        let rows = sqlx::query("SELECT o.id,o.status,o.amount_cents,o.currency,o.created_at::text AS created_at,o.paid_at::text AS paid_at,p.name AS plan FROM orders o JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id WHERE o.tenant_id=$1 AND o.user_id=$2 ORDER BY o.created_at DESC,o.id LIMIT $3 OFFSET $4").bind(tenant_id).bind(user_id).bind(limit).bind(offset).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(OrderRecord::from_row).collect())
     }
     pub async fn count_orders(&self, tenant_id: Uuid, user_id: Uuid) -> DatabaseResult<i64> {
@@ -741,11 +760,11 @@ impl Database {
         plan_id: Uuid,
         idempotency_key: &str,
     ) -> DatabaseResult<OrderRecord> {
-        if let Some(existing) = sqlx::query("SELECT o.id,o.status,o.amount_cents,o.currency,o.created_at::text AS created_at,p.name AS plan FROM orders o JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id WHERE o.tenant_id=$1 AND o.user_id=$2 AND o.idempotency_key=$3")
+        if let Some(existing) = sqlx::query("SELECT o.id,o.status,o.amount_cents,o.currency,o.created_at::text AS created_at,o.paid_at::text AS paid_at,p.name AS plan FROM orders o JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id WHERE o.tenant_id=$1 AND o.user_id=$2 AND o.idempotency_key=$3")
             .bind(tenant_id).bind(user_id).bind(idempotency_key).fetch_optional(&self.pool).await? {
             return Ok(OrderRecord::from_row(existing));
         }
-        let row = sqlx::query("INSERT INTO orders (tenant_id,user_id,plan_id,status,amount_cents,currency,idempotency_key) SELECT $1,$2,id,'pending',price_cents,currency,$4 FROM plans WHERE tenant_id=$1 AND id=$3 RETURNING id,status,amount_cents,currency,created_at::text AS created_at, (SELECT name FROM plans WHERE tenant_id=$1 AND id=$3) AS plan")
+        let row = sqlx::query("INSERT INTO orders (tenant_id,user_id,plan_id,status,amount_cents,currency,idempotency_key) SELECT $1,$2,id,'pending',price_cents,currency,$4 FROM plans WHERE tenant_id=$1 AND id=$3 RETURNING id,status,amount_cents,currency,created_at::text AS created_at,paid_at::text AS paid_at, (SELECT name FROM plans WHERE tenant_id=$1 AND id=$3) AS plan")
             .bind(tenant_id).bind(user_id).bind(plan_id).bind(idempotency_key).fetch_one(&self.pool).await?;
         Ok(OrderRecord::from_row(row))
     }
@@ -771,7 +790,7 @@ impl Database {
         let plan_id: Uuid = row.get("plan_id");
         sqlx::query("INSERT INTO subscriptions (tenant_id,user_id,plan_id,status,traffic_quota_bytes,starts_at,expires_at,subscription_token) SELECT $1,$2,id,'active',traffic_quota_bytes,now(),now()+make_interval(days=>duration_days),concat('cb_',replace(gen_random_uuid()::text,'-','')) FROM plans WHERE tenant_id=$1 AND id=$3")
             .bind(tenant_id).bind(user_id).bind(plan_id).execute(&mut *tx).await?;
-        let result = sqlx::query("SELECT o.id,o.status,o.amount_cents,o.currency,o.created_at::text AS created_at,p.name AS plan FROM orders o JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id WHERE o.tenant_id=$1 AND o.id=$2")
+        let result = sqlx::query("SELECT o.id,o.status,o.amount_cents,o.currency,o.created_at::text AS created_at,o.paid_at::text AS paid_at,p.name AS plan FROM orders o JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id WHERE o.tenant_id=$1 AND o.id=$2")
             .bind(tenant_id).bind(order_id).fetch_one(&mut *tx).await?;
         tx.commit().await?;
         Ok(OrderRecord::from_row(result))
@@ -1212,6 +1231,7 @@ pub struct OrderRecord {
     pub amount_cents: i64,
     pub currency: String,
     pub created_at: String,
+    pub paid_at: Option<String>,
     pub plan: String,
 }
 
@@ -1251,6 +1271,7 @@ impl OrderRecord {
             amount_cents: row.get("amount_cents"),
             currency: row.get("currency"),
             created_at: row.get("created_at"),
+            paid_at: row.try_get("paid_at").ok(),
             plan: row.get("plan"),
         }
     }

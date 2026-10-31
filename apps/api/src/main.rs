@@ -1437,6 +1437,7 @@ fn order_json(order: &cyberboard_database::OrderRecord) -> Value {
         "amountCents": order.amount_cents,
         "currency": order.currency,
         "createdAt": order.created_at,
+        "paidAt": order.paid_at,
         "plan": order.plan
     })
 }
@@ -1540,7 +1541,31 @@ async fn me_orders(
         return Json(json!({"items": [], "total": 0, "page": 1, "pageSize": 50})).into_response();
     };
     match (database.list_orders(state.config.tenant_id, identity.user_id, 50, 0).await, database.count_orders(state.config.tenant_id, identity.user_id).await) {
-        (Ok(items), Ok(total)) => Json(json!({"items": items.iter().map(|item| json!({"id":item.id,"status":item.status,"amountCents":item.amount_cents,"currency":item.currency,"createdAt":item.created_at,"plan":item.plan})).collect::<Vec<_>>(),"total":total,"page":1,"pageSize":50})).into_response(),
+        (Ok(items), Ok(total)) => Json(json!({"items": items.iter().map(|item| json!({"id":item.id,"status":item.status,"amountCents":item.amount_cents,"currency":item.currency,"createdAt":item.created_at,"paidAt":item.paid_at,"plan":item.plan})).collect::<Vec<_>>(),"total":total,"page":1,"pageSize":50})).into_response(),
+        _ => internal_database_response(),
+    }
+}
+
+async fn me_plans(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_portal_auth(&state, &headers) {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    match (
+        database
+            .list_public_plans(state.config.tenant_id, 100, 0)
+            .await,
+        database.count_public_plans(state.config.tenant_id).await,
+    ) {
+        (Ok(items), Ok(total)) => Json(json!({
+            "items": items.into_iter().map(plan_summary).collect::<Vec<_>>(),
+            "total": total,
+            "page": 1,
+            "pageSize": 100,
+        }))
+        .into_response(),
         _ => internal_database_response(),
     }
 }
@@ -1627,17 +1652,6 @@ fn conflict_response(message: &'static str) -> Response {
         Json(ApiErrorResponse {
             code: "conflict",
             message,
-        }),
-    )
-        .into_response()
-}
-
-fn feature_pending_response() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(ApiErrorResponse {
-            code: "feature_pending",
-            message: "配置持久化接口正在接入",
         }),
     )
         .into_response()
@@ -1842,17 +1856,6 @@ async fn rollback_config_revision(
     }
 }
 
-async fn config_boundary(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(response) = require_auth(&state, &headers) {
-        return response;
-    }
-    if state.database.is_none() {
-        service_unavailable_response()
-    } else {
-        feature_pending_response()
-    }
-}
-
 async fn admin_subscriptions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1982,20 +1985,28 @@ async fn openapi() -> Json<Value> {
             "/api/v1/portal/usage": {
                 "get": { "operationId": "getPortalUsage", "security": [{"portalBearerAuth": []}], "responses": { "200": { "description": "Current portal usage", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PortalUsage" } } } }, "401": { "description": "Invalid portal token" }, "404": { "description": "No usage available" }, "503": { "description": "Database unavailable" } } }
             },
-            "/api/v1/me/orders": { "get": { "operationId":"listMyOrders", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped order page"},"401":{"description":"Invalid portal token"},"501":{"description":"Database repository pending"}} } },
-            "/api/v1/me/devices": { "get": { "operationId":"listMyDevices", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped device page"},"401":{"description":"Invalid portal token"},"501":{"description":"Database repository pending"}} } },
-            "/api/v1/me/usage": { "get": { "operationId":"getMyUsage", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped usage"},"401":{"description":"Invalid portal token"},"501":{"description":"Database repository pending"}} } },
+            "/api/v1/me/plans": {
+                "get": { "operationId": "listPurchasablePlans", "security": [{"portalBearerAuth": []}], "responses": { "200": { "description": "Active plans available for purchase", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PlanList" } } } }, "401": { "description": "Invalid portal token" }, "500": { "description": "Database error" }, "503": { "description": "Database unavailable" } } }
+            },
+            "/api/v1/me/orders": {
+                "get": { "operationId":"listMyOrders", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped order page"},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} },
+                "post": { "operationId":"createMyOrder", "security":[{"portalBearerAuth":[]}], "parameters":[{"name":"Idempotency-Key","in":"header","required":true,"schema":{"type":"string","minLength":1}}], "requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/CreateOrderRequest"}}}}, "responses":{"201":{"description":"Created or replayed order","content":{"application/json":{"schema":{"$ref":"#/components/schemas/OrderSummary"}}}},"400":{"description":"Missing idempotency key or invalid request"},"401":{"description":"Invalid portal token"},"409":{"description":"Idempotency key conflict"},"503":{"description":"Database unavailable"}} }
+            },
+            "/api/v1/me/devices": { "get": { "operationId":"listMyDevices", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped device page"},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} } },
+            "/api/v1/me/usage": { "get": { "operationId":"getMyUsage", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped usage"},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} } },
             "/subscribe/{token}": {
                 "get": { "operationId": "getSubscriptionConfig", "parameters": [{"name":"token","in":"path","required":true,"schema":{"type":"string"}}], "responses": { "200": { "description": "Sing-box compatible JSON configuration" }, "404": { "description": "Subscription missing or expired" }, "503": { "description": "Database unavailable" } } }
             },
             "/api/v1/admin/dashboard": {
                 "get": { "operationId": "getAdminDashboard", "security": [{"bearerAuth": []}], "responses": { "200": { "description": "Demo dashboard summary", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DashboardSummary" } } } }, "401": { "description": "Missing or invalid bearer token", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } } } }
             },
-            "/api/v1/admin/config-templates": { "get": {"operationId":"listConfigTemplates","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Config templates"},"401":{"description":"Invalid token"},"503":{"description":"Database unavailable"},"501":{"description":"Repository pending"}}}, "post": {"operationId":"createConfigTemplate","security":[{"bearerAuth":[]}],"responses":{"201":{"description":"Created template"},"401":{"description":"Invalid token"},"503":{"description":"Database unavailable"},"501":{"description":"Repository pending"}}} },
-            "/api/v1/admin/config-templates/{templateId}": { "patch":{"operationId":"updateConfigTemplate","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Updated template"},"501":{"description":"Repository pending"}}}, "delete":{"operationId":"deleteConfigTemplate","security":[{"bearerAuth":[]}],"responses":{"204":{"description":"Template deleted"},"501":{"description":"Repository pending"}}} },
-            "/api/v1/admin/config-revisions": { "get":{"operationId":"listConfigRevisions","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Config revisions"},"501":{"description":"Repository pending"}}} },
-            "/api/v1/admin/config-revisions/{revisionId}/publish": { "post":{"operationId":"publishConfigRevision","security":[{"bearerAuth":[]}],"responses":{"202":{"description":"Deployment queued"},"409":{"description":"Generation conflict"},"501":{"description":"Repository pending"}}} },
-            "/api/v1/admin/config-revisions/{revisionId}/rollback": { "post":{"operationId":"rollbackConfigRevision","security":[{"bearerAuth":[]}],"responses":{"202":{"description":"Rollback queued"},"409":{"description":"Generation conflict"},"501":{"description":"Repository pending"}}} },
+            "/api/v1/admin/config-templates": { "get": {"operationId":"listConfigTemplates","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Config templates"},"401":{"description":"Invalid token"},"503":{"description":"Database unavailable"},"500":{"description":"Database error"}}}, "post": {"operationId":"createConfigTemplate","security":[{"bearerAuth":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ConfigTemplateRequest"}}}},"responses":{"201":{"description":"Created template"},"400":{"description":"Invalid template"},"401":{"description":"Invalid token"},"503":{"description":"Database unavailable"},"500":{"description":"Database error"}}} },
+            "/api/v1/admin/config-templates/{templateId}": { "patch":{"operationId":"updateConfigTemplate","security":[{"bearerAuth":[]}],"parameters":[{"name":"templateId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ConfigTemplateRequest"}}}},"responses":{"200":{"description":"Updated template"},"401":{"description":"Invalid token"},"404":{"description":"Template not found"},"503":{"description":"Database unavailable"},"500":{"description":"Database error"}}}, "delete":{"operationId":"deleteConfigTemplate","security":[{"bearerAuth":[]}],"parameters":[{"name":"templateId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"responses":{"204":{"description":"Template deleted"},"401":{"description":"Invalid token"},"404":{"description":"Template not found"},"503":{"description":"Database unavailable"},"500":{"description":"Database error"}}} },
+            "/api/v1/admin/config-revisions": { "get":{"operationId":"listConfigRevisions","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Config revisions"},"401":{"description":"Invalid token"},"503":{"description":"Database unavailable"},"500":{"description":"Database error"}}} },
+            "/api/v1/admin/config-revisions/{revisionId}/publish": { "post":{"operationId":"publishConfigRevision","security":[{"bearerAuth":[]}],"parameters":[{"name":"revisionId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ConfigRevisionAction"}}}},"responses":{"200":{"description":"Published revision"},"400":{"description":"Missing expected generation"},"401":{"description":"Invalid token"},"409":{"description":"Generation conflict"},"503":{"description":"Database unavailable"},"500":{"description":"Database error"}}} },
+            "/api/v1/admin/config-revisions/{revisionId}/rollback": { "post":{"operationId":"rollbackConfigRevision","security":[{"bearerAuth":[]}],"parameters":[{"name":"revisionId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ConfigRevisionAction"}}}},"responses":{"200":{"description":"Rolled back revision"},"400":{"description":"Missing expected generation"},"401":{"description":"Invalid token"},"409":{"description":"Generation conflict"},"503":{"description":"Database unavailable"},"500":{"description":"Database error"}}} },
+            "/api/v1/admin/orders/{orderId}/mark-paid": { "post":{"operationId":"markAdminOrderPaid","security":[{"bearerAuth":[]}],"parameters":[{"name":"orderId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}},{"name":"Idempotency-Key","in":"header","required":false,"schema":{"type":"string"}}],"responses":{"200":{"description":"Order marked paid"},"401":{"description":"Invalid token"},"404":{"description":"Order not found"},"409":{"description":"Invalid order state"},"503":{"description":"Database unavailable"}}} },
+            "/api/v1/admin/orders/{orderId}/refund": { "post":{"operationId":"refundAdminOrder","security":[{"bearerAuth":[]}],"parameters":[{"name":"orderId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}},{"name":"Idempotency-Key","in":"header","required":false,"schema":{"type":"string"}}],"responses":{"200":{"description":"Order refunded"},"401":{"description":"Invalid token"},"404":{"description":"Order not found"},"409":{"description":"Invalid order state"},"503":{"description":"Database unavailable"}}} },
             "/api/v1/admin/nodes": {
                 "get": { "operationId": "listAdminNodes", "security": [{"bearerAuth": []}], "parameters": [{"name":"page","in":"query","schema":{"type":"integer"}},{"name":"pageSize","in":"query","schema":{"type":"integer"}}], "responses": { "200": { "description": "Tenant-scoped node page", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NodeList" } } } }, "401": { "description": "Missing or invalid bearer token" }, "503": { "description": "Database unavailable" } } },
                 "post": { "operationId": "createAdminNode", "security": [{"bearerAuth": []}], "responses": { "201": { "description": "Created node" }, "401": { "description": "Missing or invalid bearer token" }, "503": { "description": "Database unavailable" } } }
@@ -2152,7 +2163,11 @@ async fn openapi() -> Json<Value> {
                     }
                 },
                 "SubscriptionList": { "type":"object", "required":["items","total","page","pageSize"], "properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/SubscriptionSummary"}},"total":{"type":"integer"},"page":{"type":"integer"},"pageSize":{"type":"integer"}} },
-                "PortalUsage": { "type":"object", "required":["usedBytes","quotaBytes","todayBytes","projectedBytes","periodStart","periodEnd","daily"], "properties":{"usedBytes":{"type":"integer"},"quotaBytes":{"type":"integer"},"todayBytes":{"type":"integer"},"projectedBytes":{"type":"integer"},"periodStart":{"type":"string"},"periodEnd":{"type":"string"},"daily":{"type":"array","items":{"type":"object"}}} }
+                "PortalUsage": { "type":"object", "required":["usedBytes","quotaBytes","todayBytes","projectedBytes","periodStart","periodEnd","daily"], "properties":{"usedBytes":{"type":"integer"},"quotaBytes":{"type":"integer"},"todayBytes":{"type":"integer"},"projectedBytes":{"type":"integer"},"periodStart":{"type":"string"},"periodEnd":{"type":"string"},"daily":{"type":"array","items":{"type":"object"}}} },
+                "OrderSummary": { "type":"object", "required":["id","status","amountCents","currency","createdAt","plan"], "properties":{"id":{"type":"string","format":"uuid"},"status":{"type":"string","enum":["pending","paid","cancelled","refunded","failed"]},"amountCents":{"type":"integer","format":"int64"},"currency":{"type":"string"},"createdAt":{"type":"string","format":"date-time"},"paidAt":{"type":"string","format":"date-time","nullable":true},"plan":{"type":"string"}} },
+                "CreateOrderRequest": { "type":"object", "required":["planId"], "properties":{"planId":{"type":"string","format":"uuid"}} },
+                "ConfigTemplateRequest": { "type":"object", "properties":{"name":{"type":"string"},"description":{"type":"string"},"coreType":{"type":"string","default":"sing-box"},"coreVersionRange":{"type":"string","default":"*"},"status":{"type":"string","enum":["draft","active","archived"]}} },
+                "ConfigRevisionAction": { "type":"object", "required":["expectedGeneration"], "properties":{"expectedGeneration":{"type":"integer","format":"int64"},"expectedPreviousHash":{"type":"string"}} }
             }
         }
     }))
@@ -2174,6 +2189,7 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/session", get(session))
         .route("/api/v1/portal/subscription", get(portal_subscription))
         .route("/api/v1/portal/usage", get(portal_usage))
+        .route("/api/v1/me/plans", get(me_plans))
         .route("/api/v1/me/orders", get(me_orders).post(create_my_order))
         .route("/api/v1/me/devices", get(me_devices))
         .route("/api/v1/me/usage", get(me_usage))
@@ -2526,7 +2542,11 @@ mod tests {
         assert_eq!(body["id"], "demo-user");
         assert_eq!(body["roles"], serde_json::json!(["user"]));
 
-        for path in ["/api/v1/portal/subscription", "/api/v1/portal/usage"] {
+        for path in [
+            "/api/v1/portal/subscription",
+            "/api/v1/portal/usage",
+            "/api/v1/me/plans",
+        ] {
             let (status, _, body) =
                 get_json(path, Some("Bearer cyberboard-portal-dev-token")).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -2587,6 +2607,17 @@ mod tests {
         assert!(document["components"]["schemas"]["PortalLoginRequest"].is_object());
         assert!(document["components"]["schemas"]["PortalLoginResponse"].is_object());
         for schema in [
+            "CreateOrderRequest",
+            "OrderSummary",
+            "ConfigTemplateRequest",
+            "ConfigRevisionAction",
+        ] {
+            assert!(
+                document["components"]["schemas"][schema].is_object(),
+                "missing schema {schema}"
+            );
+        }
+        for schema in [
             "NodeList",
             "UserList",
             "PlanList",
@@ -2602,6 +2633,10 @@ mod tests {
             "/api/v1/session",
             "/api/v1/portal/subscription",
             "/api/v1/portal/usage",
+            "/api/v1/me/plans",
+            "/api/v1/me/orders",
+            "/api/v1/me/devices",
+            "/api/v1/me/usage",
             "/api/v1/admin/dashboard",
             "/api/v1/admin/nodes",
             "/api/v1/admin/users",
@@ -2616,5 +2651,8 @@ mod tests {
                 "missing OpenAPI path {path}"
             );
         }
+        assert!(document["paths"]["/api/v1/me/orders"]["post"].is_object());
+        assert!(document["paths"]["/api/v1/admin/orders/{orderId}/mark-paid"]["post"].is_object());
+        assert!(document["paths"]["/api/v1/admin/orders/{orderId}/refund"]["post"].is_object());
     }
 }

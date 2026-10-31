@@ -1268,10 +1268,10 @@ impl Database {
         core_version: &str,
         payload: &serde_json::Value,
         content_hash: &str,
-    ) -> DatabaseResult<ConfigRevisionRecord> {
-        let row = sqlx::query("INSERT INTO config_revisions (tenant_id,template_id,node_id,generation,core_type,core_version,content_hash,signature,validation_status,publish_status,payload) SELECT $1,$2,$3,$4,t.core_type,$5,$6,'','validated','draft',$7 FROM config_templates t WHERE t.tenant_id=$1 AND t.id=$2 RETURNING id,COALESCE(template_id::text,'') AS template_id,node_id,generation,core_version,content_hash,'pending' AS signature_status,validation_status,publish_status,failure_reason,created_at::text AS created_at")
-            .bind(tenant_id).bind(template_id).bind(node_id).bind(generation).bind(core_version).bind(content_hash).bind(payload).fetch_one(&self.pool).await?;
-        Ok(ConfigRevisionRecord::from_row(row))
+    ) -> DatabaseResult<Option<ConfigRevisionRecord>> {
+        let row = sqlx::query("INSERT INTO config_revisions (tenant_id,template_id,node_id,generation,core_type,core_version,content_hash,signature,validation_status,publish_status,payload) SELECT $1,$2,$3,$4,t.core_type,$5,$6,'','validated','draft',$7 FROM config_templates t JOIN nodes n ON n.tenant_id=$1 AND n.id=$3 WHERE t.tenant_id=$1 AND t.id=$2 AND t.status <> 'archived' RETURNING id,COALESCE(template_id::text,'') AS template_id,node_id,generation,core_version,content_hash,'pending' AS signature_status,validation_status,publish_status,failure_reason,created_at::text AS created_at")
+            .bind(tenant_id).bind(template_id).bind(node_id).bind(generation).bind(core_version).bind(content_hash).bind(payload).fetch_optional(&self.pool).await?;
+        Ok(row.map(ConfigRevisionRecord::from_row))
     }
 
     pub async fn config_revision_for_signing(

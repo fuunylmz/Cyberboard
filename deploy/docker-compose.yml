@@ -33,11 +33,16 @@ services:
     environment:
       CYBERBOARD_BIND_ADDR: 0.0.0.0
       CYBERBOARD_API_PORT: 8080
+      CYBERBOARD_AGENT_GRPC_ADDR: 0.0.0.0:9090
       CYBERBOARD_DEV_MODE: "1"
+      # Leave empty for local boot; config publishing requires a real key.
+      CYBERBOARD_CONFIG_SIGNING_KEY: ${CYBERBOARD_CONFIG_SIGNING_KEY:-}
+      CYBERBOARD_CONFIG_SIGNING_KEY_ID: ${CYBERBOARD_CONFIG_SIGNING_KEY_ID:-config-key-dev}
       CYBERBOARD_DATABASE_URL: postgres://cyberboard:change-me-in-development@postgres:5432/cyberboard
       CYBERBOARD_REDIS_URL: redis://redis:6379
     ports:
       - "8080:8080"
+      - "9090:9090"
     depends_on:
       postgres:
         condition: service_healthy

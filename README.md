@@ -139,6 +139,21 @@ docker compose -f deploy/docker-compose.yml up --build
 The database password in the compose file is development-only and must be
 replaced before any shared or production deployment.
 
+Compose publishes HTTP on `localhost:8080` and AgentControl gRPC on
+`localhost:9090`. Development mode permits plaintext gRPC for local testing;
+an Agent can connect with `CYBERBOARD_AGENT_INSECURE=1` and
+`CYBERBOARD_CONTROL_PLANE_URL=http://127.0.0.1:9090`. Set
+`CYBERBOARD_CONFIG_SIGNING_KEY` before publishing revisions, for example:
+
+```sh
+export CYBERBOARD_CONFIG_SIGNING_KEY="$(openssl rand -base64 32)"
+docker compose -f deploy/docker-compose.yml up --build
+```
+
+Production deployments must disable `CYBERBOARD_DEV_MODE` and provide the
+Agent gRPC server certificate, key, client CA, and a real signing key through
+the deployment secret manager.
+
 ## Compatibility boundary
 
 The Agent protocol is outbound-only by design. The control plane signs desired

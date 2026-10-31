@@ -28,7 +28,10 @@ export interface ConfigPublishInput { targetNodeIds?: string[]; expectedGenerati
 export interface ConfigRollbackInput { expectedGeneration?: number; reason?: string }
 export interface OrderSummary { id: string; plan: string; status: 'pending' | 'paid' | 'cancelled' | 'refunded' | 'failed'; amountCents: number; currency: string; createdAt: string; paidAt?: string | null }
 export interface OrderCreateInput { planId: string }
+export interface AdminOrderSummary extends OrderSummary { userId: string; userEmail: string; provider?: string; providerPaymentId?: string | null }
 export interface DeviceSummary { id: string; name: string; lastSeenAt: string | null; createdAt: string; revokedAt: string | null; platform?: string; status?: 'active' | 'revoked' | 'unknown'; ipAddress?: string }
+export interface SessionSummary { id: string; role: string; issuedAt: string; expiresAt: string; revokedAt: string | null; active: boolean }
+export interface PasswordChangeInput { currentPassword: string; newPassword: string }
 export interface NodeSummary { id: string; name: string; region: string; address: string; status: NodeStatus; core: string; coreVersion: string; agentVersion: string; currentConfigRevision: string | null; latencyMs: number | null; lastHeartbeatAt: string | null }
 export interface SubscriptionSummary { id: string; userEmail: string; plan: string; status: SubscriptionStatus; trafficUsedBytes: number; trafficQuotaBytes: number; expiresAt: string; tokenHint: string; subscriptionUrl?: string }
 export interface DashboardSummary { users: number; activeSubscriptions: number; onlineNodes: number; trafficBytes24h: number; failedTasks: number; generatedAt: string }

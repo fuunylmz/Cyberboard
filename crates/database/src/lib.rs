@@ -15,6 +15,9 @@ use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use thiserror::Error;
 use uuid::Uuid;
 
+const CREATE_ORDER_SQL: &str = "INSERT INTO orders (tenant_id,user_id,plan_id,status,amount_cents,currency,idempotency_key) SELECT $1,$2,id,'pending',price_cents,currency,$4 FROM plans WHERE tenant_id=$1 AND id=$3 AND status='active' RETURNING id,status,amount_cents,currency,created_at::text AS created_at,paid_at::text AS paid_at, (SELECT name FROM plans WHERE tenant_id=$1 AND id=$3) AS plan";
+const CREATE_ORDER_IDEMPOTENT_SQL: &str = "INSERT INTO orders (tenant_id,user_id,plan_id,status,amount_cents,currency,provider,idempotency_key) SELECT $1,$2,id,'pending',price_cents,currency,'manual',$3 FROM plans WHERE tenant_id=$1 AND id=$4 AND status='active' RETURNING id,user_id,plan_id,status,amount_cents,currency,provider,provider_payment_id,paid_at::text AS paid_at";
+
 pub type DatabaseResult<T> = Result<T, DatabaseError>;
 
 pub fn hash_session_token(token: &str) -> String {
@@ -764,7 +767,7 @@ impl Database {
             .bind(tenant_id).bind(user_id).bind(idempotency_key).fetch_optional(&self.pool).await? {
             return Ok(OrderRecord::from_row(existing));
         }
-        let row = sqlx::query("INSERT INTO orders (tenant_id,user_id,plan_id,status,amount_cents,currency,idempotency_key) SELECT $1,$2,id,'pending',price_cents,currency,$4 FROM plans WHERE tenant_id=$1 AND id=$3 RETURNING id,status,amount_cents,currency,created_at::text AS created_at,paid_at::text AS paid_at, (SELECT name FROM plans WHERE tenant_id=$1 AND id=$3) AS plan")
+        let row = sqlx::query(CREATE_ORDER_SQL)
             .bind(tenant_id).bind(user_id).bind(plan_id).bind(idempotency_key).fetch_one(&self.pool).await?;
         Ok(OrderRecord::from_row(row))
     }
@@ -992,7 +995,7 @@ impl Database {
     ) -> DatabaseResult<PaymentOrderRecord> {
         if let Some(row) = sqlx::query("SELECT id,user_id,plan_id,status,amount_cents,currency,provider,provider_payment_id,paid_at::text AS paid_at FROM orders WHERE tenant_id=$1 AND user_id=$2 AND idempotency_key=$3")
             .bind(tenant_id).bind(user_id).bind(idempotency_key).fetch_optional(&self.pool).await? { return Ok(PaymentOrderRecord::from_row(row)); }
-        let row = sqlx::query("INSERT INTO orders (tenant_id,user_id,plan_id,status,amount_cents,currency,provider,idempotency_key) SELECT $1,$2,id,'pending',price_cents,currency,'manual',$3 FROM plans WHERE tenant_id=$1 AND id=$4 RETURNING id,user_id,plan_id,status,amount_cents,currency,provider,provider_payment_id,paid_at::text AS paid_at")
+        let row = sqlx::query(CREATE_ORDER_IDEMPOTENT_SQL)
             .bind(tenant_id).bind(user_id).bind(idempotency_key).bind(plan_id).fetch_one(&self.pool).await?;
         Ok(PaymentOrderRecord::from_row(row))
     }
@@ -1388,6 +1391,21 @@ impl SubscriptionRecord {
             traffic_quota_bytes: row.get("traffic_quota_bytes"),
             expires_at: row.get("expires_at"),
             subscription_token: row.try_get("subscription_token").ok(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CREATE_ORDER_IDEMPOTENT_SQL, CREATE_ORDER_SQL};
+
+    #[test]
+    fn order_creation_queries_only_select_active_plans() {
+        for query in [CREATE_ORDER_SQL, CREATE_ORDER_IDEMPOTENT_SQL] {
+            assert!(
+                query.contains("AND status='active'"),
+                "order creation must reject archived plans"
+            );
         }
     }
 }

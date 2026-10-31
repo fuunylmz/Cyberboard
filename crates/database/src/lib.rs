@@ -7,13 +7,22 @@
 use std::time::Duration;
 
 use cyberboard_storage::{
-    FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, SECOND_MIGRATION, THIRD_MIGRATION,
+    FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, SECOND_MIGRATION, SIXTH_MIGRATION,
+    THIRD_MIGRATION,
 };
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use thiserror::Error;
 use uuid::Uuid;
 
 pub type DatabaseResult<T> = Result<T, DatabaseError>;
+
+pub fn hash_session_token(token: &str) -> String {
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
 
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -33,6 +42,36 @@ pub struct Database {
 }
 
 impl Database {
+    pub async fn create_session(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        token: &str,
+        role: &str,
+        ttl_seconds: i64,
+    ) -> DatabaseResult<()> {
+        sqlx::query("INSERT INTO sessions(tenant_id,user_id,token_hash,role,expires_at) VALUES($1,$2,$3,$4,now()+make_interval(secs=>$5))")
+            .bind(tenant_id).bind(user_id).bind(hash_session_token(token)).bind(role).bind(ttl_seconds as f64).execute(&self.pool).await?;
+        Ok(())
+    }
+    pub async fn find_session(
+        &self,
+        tenant_id: Uuid,
+        token: &str,
+    ) -> DatabaseResult<Option<SessionRecord>> {
+        let row = sqlx::query("SELECT id,user_id,role,expires_at>now() AS active FROM sessions WHERE tenant_id=$1 AND token_hash=$2 AND revoked_at IS NULL")
+            .bind(tenant_id).bind(hash_session_token(token)).fetch_optional(&self.pool).await?;
+        Ok(row.map(|r| SessionRecord {
+            id: r.get("id"),
+            user_id: r.get("user_id"),
+            role: r.get("role"),
+            active: r.get("active"),
+        }))
+    }
+    pub async fn revoke_session(&self, tenant_id: Uuid, token: &str) -> DatabaseResult<bool> {
+        let result=sqlx::query("UPDATE sessions SET revoked_at=now() WHERE tenant_id=$1 AND token_hash=$2 AND revoked_at IS NULL").bind(tenant_id).bind(hash_session_token(token)).execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
     pub async fn connect(database_url: &str) -> DatabaseResult<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(10)
@@ -138,6 +177,20 @@ impl Database {
                 .await?;
             sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
                 .bind("0005_subscription_nodes")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        let sixth: Option<String> =
+            sqlx::query_scalar("SELECT version FROM cyberboard_schema_migrations WHERE version=$1")
+                .bind("0006_sessions")
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if sixth.is_none() {
+            sqlx::raw_sql(SIXTH_MIGRATION)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
+                .bind("0006_sessions")
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -795,6 +848,14 @@ pub struct UserCredentials {
     pub password_hash: String,
     pub status: String,
     pub roles: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionRecord {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub role: String,
+    pub active: bool,
 }
 
 #[derive(Clone, Debug)]

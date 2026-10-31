@@ -9,14 +9,13 @@ use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
+    http::Request,
     http::{HeaderMap, StatusCode, header},
+    middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, patch, post},
 };
 use cyberboard_config::ApiConfig;
-use cyberboard_config_compiler::{
-    ConfigProfile, Credential, Inbound, Outbound, Route, TlsConfig, Transport,
-};
 use cyberboard_database::{
     ConfigRevisionRecord, ConfigTemplateInput, ConfigTemplateRecord, ConfigTemplateUpdate,
     Database, NodeInput, NodeRecord, NodeUpdate, PlanInput, PlanRecord, PlanUpdate,
@@ -45,6 +44,94 @@ struct AppState {
 struct PortalIdentity {
     user_id: String,
     email: String,
+}
+
+#[derive(Clone, Debug)]
+struct AuthIdentity {
+    user_id: uuid::Uuid,
+    tenant_id: uuid::Uuid,
+    role: String,
+}
+
+async fn auth_middleware(
+    State(state): State<AppState>,
+    mut request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let Some(token) = state.bearer_token(request.headers()) else {
+        return unauthorized_response();
+    };
+    if let Some(database) = state.database.as_ref() {
+        match database.find_session(state.config.tenant_id, &token).await {
+            Ok(Some(session)) if session.active => {
+                request.extensions_mut().insert(AuthIdentity {
+                    user_id: session.user_id,
+                    tenant_id: state.config.tenant_id,
+                    role: session.role,
+                });
+                return next.run(request).await;
+            }
+            _ => return unauthorized_response(),
+        }
+    }
+    if state.is_authorized(request.headers()) || state.is_portal_authorized(request.headers()) {
+        next.run(request).await
+    } else {
+        unauthorized_response()
+    }
+}
+
+async fn admin_auth_middleware(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    auth_middleware_role(state, request, next, "admin").await
+}
+
+async fn portal_auth_middleware(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    auth_middleware_role(state, request, next, "user").await
+}
+
+async fn auth_middleware_role(
+    state: AppState,
+    mut request: Request<axum::body::Body>,
+    next: Next,
+    required_role: &str,
+) -> Response {
+    let Some(token) = state.bearer_token(request.headers()) else {
+        return unauthorized_response();
+    };
+    if let Some(database) = state.database.as_ref() {
+        match database.find_session(state.config.tenant_id, &token).await {
+            Ok(Some(session))
+                if session.active
+                    && (session.role == required_role
+                        || (required_role == "user" && session.role == "admin")) =>
+            {
+                request.extensions_mut().insert(AuthIdentity {
+                    user_id: session.user_id,
+                    tenant_id: state.config.tenant_id,
+                    role: session.role,
+                });
+                return next.run(request).await;
+            }
+            _ => return unauthorized_response(),
+        }
+    }
+    if (required_role == "admin" && state.is_authorized(request.headers()))
+        || (required_role == "user"
+            && (state.is_portal_authorized(request.headers())
+                || state.is_authorized(request.headers())))
+    {
+        next.run(request).await
+    } else {
+        unauthorized_response()
+    }
 }
 
 impl AppState {
@@ -371,6 +458,26 @@ async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>)
     {
         return invalid_credentials_response();
     }
+    if let Some(database) = state.database.as_ref() {
+        if let Ok(Some(user)) = database
+            .find_user_credentials(state.config.tenant_id, &request.email)
+            .await
+        {
+            if database
+                .create_session(
+                    state.config.tenant_id,
+                    user.id,
+                    state.demo_access_token.as_ref(),
+                    "admin",
+                    3600,
+                )
+                .await
+                .is_err()
+            {
+                return internal_database_response();
+            }
+        }
+    }
 
     Json(LoginResponse {
         access_token: state.demo_access_token.to_string(),
@@ -416,6 +523,13 @@ async fn portal_login(
                 },
             );
         }
+        if database
+            .create_session(state.config.tenant_id, credentials.id, &token, "user", 3600)
+            .await
+            .is_err()
+        {
+            return internal_database_response();
+        }
         (
             token,
             SessionUserResponse {
@@ -440,6 +554,21 @@ async fn portal_login(
         user: portal_user,
     })
     .into_response()
+}
+
+async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(token) = state.bearer_token(&headers) else {
+        return unauthorized_response();
+    };
+    if let Some(database) = state.database.as_ref() {
+        let _ = database
+            .revoke_session(state.config.tenant_id, &token)
+            .await;
+    }
+    if let Ok(mut sessions) = state.portal_sessions.write() {
+        sessions.remove(&token);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(Serialize)]
@@ -1350,40 +1479,12 @@ async fn public_subscription(State(state): State<AppState>, Path(token): Path<St
         .await
     {
         Ok(nodes) if !nodes.is_empty() => {
-            let inbounds = nodes
-                .iter()
-                .map(|node| Inbound {
-                    tag: format!("node-{}", node.id.simple()),
-                    listen: node.address.clone(),
-                    listen_port: node.port as u16,
-                    inbound_type: "mixed".into(),
-                    transport: Transport::Tcp,
-                    tls: None::<TlsConfig>,
-                    credential: Credential::None,
-                })
-                .collect();
-            let profile = ConfigProfile {
-                schema_version: 1,
-                node_id: nodes[0].id,
-                generation: 1,
-                inbounds,
-                outbounds: vec![Outbound {
-                    outbound_type: "direct".into(),
-                    tag: "direct".into(),
-                }],
-                route: Route {
-                    final_tag: Some("direct".into()),
-                },
-            };
-            let config = match profile.render_sing_box() {
-                Ok(value) => value,
-                Err(_) => return internal_database_response(),
-            };
+            let outbounds: Vec<Value> = nodes.iter().map(|node| json!({"type":"socks","tag":format!("node-{}",node.id.simple()),"server":node.address,"server_port":node.port})).collect();
             let mut response = Json(json!({
                 "version": 1,
                 "experimental": false,
-                "outbounds": config["inbounds"],
-                "route": config["route"]
+                "outbounds": outbounds,
+                "route": {"final": "direct"}
             }))
             .into_response();
             response.headers_mut().insert(
@@ -1937,19 +2038,27 @@ async fn openapi() -> Json<Value> {
 }
 
 fn router(state: AppState) -> Router {
-    Router::new()
+    use axum::middleware::from_fn_with_state;
+
+    let public = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/openapi.json", get(openapi))
         .route("/api/v1/auth/login", post(login))
+        .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/portal-login", post(portal_login))
+        .route("/subscribe/{token}", get(public_subscription));
+
+    let portal = Router::new()
         .route("/api/v1/session", get(session))
         .route("/api/v1/portal/subscription", get(portal_subscription))
         .route("/api/v1/portal/usage", get(portal_usage))
         .route("/api/v1/me/orders", get(me_orders))
         .route("/api/v1/me/devices", get(me_devices))
         .route("/api/v1/me/usage", get(me_usage))
-        .route("/subscribe/{token}", get(public_subscription))
+        .route_layer(from_fn_with_state(state.clone(), portal_auth_middleware));
+
+    let admin = Router::new()
         .route("/api/v1/admin/dashboard", get(admin_dashboard))
         .route(
             "/api/v1/admin/nodes",
@@ -2000,7 +2109,9 @@ fn router(state: AppState) -> Router {
             "/api/v1/admin/config-revisions/{revision_id}/rollback",
             post(rollback_config_revision),
         )
-        .with_state(state)
+        .route_layer(from_fn_with_state(state.clone(), admin_auth_middleware));
+
+    public.merge(portal).merge(admin).with_state(state)
 }
 
 async fn shutdown_signal() {

@@ -20,7 +20,7 @@ export interface NodeCreateInput { name: string; region: string; address: string
 export type NodeUpdateInput = Partial<NodeCreateInput> & { status?: NodeStatus }
 export interface UsageSummary { usedBytes: number; quotaBytes: number; todayBytes: number; projectedBytes: number; periodStart: string; periodEnd: string; daily: Array<{ date: string; bytes: number }> }
 export interface ConfigTemplateSummary { id: string; name: string; description: string; coreType: string; coreVersionRange: string; status: 'draft' | 'active' | 'archived'; updatedAt: string; updatedBy: string }
-export interface ConfigRevisionSummary { id: string; templateId: string; nodeId: string; nodeName: string; generation: number; coreVersion: string; contentHash: string; signatureStatus: 'pending' | 'valid' | 'invalid'; validationStatus: 'pending' | 'passed' | 'failed'; publishStatus: 'draft' | 'publishing' | 'published' | 'failed' | 'rolled_back'; failureReason?: string; createdAt: string }
+export interface ConfigRevisionSummary { id: string; templateId: string; nodeId: string; nodeName: string; generation: number; coreVersion: string; contentHash: string; signatureStatus: 'pending' | 'valid' | 'invalid'; validationStatus: 'pending' | 'validated' | 'passed' | 'failed'; publishStatus: 'draft' | 'publishing' | 'published' | 'failed' | 'rolled_back'; failureReason?: string; createdAt: string }
 export interface ConfigTemplateCreateInput { name: string; description?: string; coreType: string; coreVersionRange: string; status?: ConfigTemplateSummary['status'] }
 export type ConfigTemplateUpdateInput = Partial<ConfigTemplateCreateInput>
 export interface ConfigRevisionQuery extends PageQuery { templateId?: string; nodeId?: string }

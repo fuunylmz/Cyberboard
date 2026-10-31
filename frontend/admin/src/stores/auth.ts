@@ -15,13 +15,14 @@ export const useAuthStore = defineStore('admin-auth', () => {
   const session = ref<SessionUser | null>(readSession())
   const accessToken = ref<string | null>(storageGet(adminAccessTokenKey))
   const expiresAt = ref<number | null>(readExpiresAt())
+  const sessionExpired = ref(false)
   const isAuthenticated = computed(() => Boolean(session.value && accessToken.value && (!expiresAt.value || expiresAt.value > Date.now())))
   let expiryTimer: number | undefined
   function persist() { if (session.value) storageSet(sessionStorageKey, JSON.stringify(session.value)); else storageRemove(sessionStorageKey); if (accessToken.value) storageSet(adminAccessTokenKey, accessToken.value); else storageRemove(adminAccessTokenKey); if (expiresAt.value) storageSet(expiresAtStorageKey, String(expiresAt.value)); else storageRemove(expiresAtStorageKey) }
-  function logout() { if (expiryTimer !== undefined && typeof window !== 'undefined') window.clearTimeout(expiryTimer); expiryTimer = undefined; session.value = null; accessToken.value = null; expiresAt.value = null; persist() }
+  function logout(expired = false) { if (expiryTimer !== undefined && typeof window !== 'undefined') window.clearTimeout(expiryTimer); expiryTimer = undefined; sessionExpired.value = expired; session.value = null; accessToken.value = null; expiresAt.value = null; persist() }
   function scheduleExpiry() { if (typeof window === 'undefined' || !expiresAt.value) return; const delay = expiresAt.value - Date.now(); if (delay <= 0) { logout(); return } expiryTimer = window.setTimeout(() => window.dispatchEvent(new CustomEvent('cyberboard:unauthorized')), delay) }
-  async function login(email: string, password: string) { const result = await adminApi.login({ email, password }); session.value = result.user; accessToken.value = result.accessToken; expiresAt.value = Date.now() + result.expiresIn * 1000; persist(); scheduleExpiry() }
-  if (expiresAt.value && expiresAt.value <= Date.now()) logout()
+  async function login(email: string, password: string) { const result = await adminApi.login({ email, password }); sessionExpired.value = false; session.value = result.user; accessToken.value = result.accessToken; expiresAt.value = Date.now() + result.expiresIn * 1000; persist(); scheduleExpiry() }
+  if (expiresAt.value && expiresAt.value <= Date.now()) logout(true)
   else scheduleExpiry()
-  return { session, accessToken, expiresAt, isAuthenticated, login, logout }
+  return { session, accessToken, expiresAt, sessionExpired, isAuthenticated, login, logout }
 })

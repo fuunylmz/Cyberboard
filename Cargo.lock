@@ -421,6 +421,7 @@ dependencies = [
  "cyberboard-storage",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "uuid",

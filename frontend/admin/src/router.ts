@@ -14,6 +14,6 @@ const router = createRouter({ history:createWebHistory(), routes:[
     { path:'', redirect:'/admin/dashboard' }, { path:'dashboard', name:'总览', component:DashboardPage }, { path:'nodes', name:'节点', component:NodesPage }, { path:'users', name:'用户', component:UsersPage }, { path:'plans', name:'套餐', component:PlansPage }, { path:'subscriptions', name:'订阅', component:SubscriptionsPage }, { path:'config', name:'配置发布', component:ConfigPage },
   ] }, { path:'/:pathMatch(.*)*', redirect:'/admin' },
 ] })
-router.beforeEach((to) => { const auth = useAuthStore(); if (to.meta.requiresAuth && !auth.isAuthenticated) return '/login'; if (to.path === '/login' && auth.isAuthenticated) return '/admin' })
-if (typeof window !== 'undefined') window.addEventListener('cyberboard:unauthorized', () => { const auth = useAuthStore(); auth.logout(); if (router.currentRoute.value.path !== '/login') router.replace('/login') })
+router.beforeEach((to) => { const auth = useAuthStore(); if (to.meta.requiresAuth && !auth.isAuthenticated) return auth.sessionExpired ? { path: '/login', query: { reason: 'session-expired' } } : '/login'; if (to.path === '/login' && auth.isAuthenticated) return '/admin' })
+if (typeof window !== 'undefined') window.addEventListener('cyberboard:unauthorized', () => { const auth = useAuthStore(); auth.logout(); if (router.currentRoute.value.path !== '/login') router.replace({ path: '/login', query: { reason: 'session-expired' } }) })
 export default router

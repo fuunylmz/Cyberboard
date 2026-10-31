@@ -31,6 +31,7 @@ export interface OrderSummary { id: string; plan: string; status: 'pending' | 'p
 export interface OrderCreateInput { planId: string }
 export interface AdminOrderSummary extends OrderSummary { userId: string; userEmail: string; provider?: string; providerPaymentId?: string | null }
 export interface DeviceSummary { id: string; name: string; lastSeenAt: string | null; createdAt: string; revokedAt: string | null; platform?: string; status?: 'active' | 'revoked' | 'unknown'; ipAddress?: string }
+export interface DeviceCreateInput { name: string; fingerprint: string }
 export interface SessionSummary { id: string; role: string; issuedAt: string; expiresAt: string; revokedAt: string | null; active: boolean; current: boolean }
 export interface PasswordChangeInput { currentPassword: string; newPassword: string }
 export interface NodeSummary { id: string; name: string; region: string; address: string; status: NodeStatus; core: string; coreVersion: string; agentVersion: string; currentConfigRevision: string | null; latencyMs: number | null; lastHeartbeatAt: string | null }

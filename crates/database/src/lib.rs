@@ -41,6 +41,8 @@ pub enum DatabaseError {
     IdempotencyConflict,
     #[error("usage payload is invalid: {0}")]
     InvalidUsagePayload(String),
+    #[error("device limit exceeded")]
+    DeviceLimitExceeded,
 }
 
 impl DatabaseError {
@@ -1300,6 +1302,39 @@ impl Database {
     ) -> DatabaseResult<Vec<DeviceRecord>> {
         let rows = sqlx::query("SELECT id,name,last_seen_at::text AS last_seen_at,created_at::text AS created_at,revoked_at::text AS revoked_at FROM devices WHERE tenant_id=$1 AND user_id=$2 ORDER BY created_at DESC,id LIMIT $3 OFFSET $4").bind(tenant_id).bind(user_id).bind(limit).bind(offset).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(DeviceRecord::from_row).collect())
+    }
+
+    pub async fn register_device(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        name: &str,
+        fingerprint_hash: &str,
+    ) -> DatabaseResult<DeviceRecord> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(row) = sqlx::query("UPDATE devices SET name=$4,last_seen_at=now(),revoked_at=NULL WHERE tenant_id=$1 AND user_id=$2 AND fingerprint_hash=$3 RETURNING id,name,last_seen_at::text AS last_seen_at,created_at::text AS created_at,revoked_at::text AS revoked_at")
+            .bind(tenant_id).bind(user_id).bind(fingerprint_hash).bind(name)
+            .fetch_optional(&mut *tx).await? {
+            tx.commit().await?;
+            return Ok(DeviceRecord::from_row(row));
+        }
+        let limit: i64 = sqlx::query_scalar("SELECT COALESCE((SELECT p.device_limit FROM subscriptions s JOIN plans p ON p.tenant_id=s.tenant_id AND p.id=s.plan_id WHERE s.tenant_id=$1 AND s.user_id=$2 AND s.status='active' AND s.expires_at>now() ORDER BY s.created_at DESC LIMIT 1),0)")
+            .bind(tenant_id).bind(user_id).fetch_one(&mut *tx).await?;
+        let active: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM devices WHERE tenant_id=$1 AND user_id=$2 AND revoked_at IS NULL",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if limit <= 0 || active >= limit {
+            tx.rollback().await?;
+            return Err(DatabaseError::DeviceLimitExceeded);
+        }
+        let row = sqlx::query("INSERT INTO devices(tenant_id,user_id,name,fingerprint_hash,last_seen_at) VALUES($1,$2,$3,$4,now()) RETURNING id,name,last_seen_at::text AS last_seen_at,created_at::text AS created_at,revoked_at::text AS revoked_at")
+            .bind(tenant_id).bind(user_id).bind(name).bind(fingerprint_hash).fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(DeviceRecord::from_row(row))
     }
     pub async fn count_devices(&self, tenant_id: Uuid, user_id: Uuid) -> DatabaseResult<i64> {
         Ok(

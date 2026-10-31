@@ -281,6 +281,13 @@ struct ChangePasswordRequest {
     new_password: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceCreateRequest {
+    name: String,
+    fingerprint: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LoginResponse {
@@ -2191,6 +2198,29 @@ async fn me_devices(
     }
 }
 
+async fn create_me_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(request): Json<DeviceCreateRequest>,
+) -> Response {
+    if let Err(response) = require_portal_auth(&state, &headers) {
+        return response;
+    }
+    if request.name.trim().is_empty() || request.fingerprint.trim().is_empty() {
+        return invalid_input_response("设备名称和指纹不能为空");
+    }
+    let Some(database) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    let fingerprint_hash = hash_session_token(request.fingerprint.trim());
+    match database.register_device(state.config.tenant_id, identity.user_id, request.name.trim(), &fingerprint_hash).await {
+        Ok(device) => (StatusCode::CREATED, Json(json!({"id":device.id,"name":device.name,"lastSeenAt":device.last_seen_at,"createdAt":device.created_at,"revokedAt":device.revoked_at}))).into_response(),
+        Err(cyberboard_database::DatabaseError::DeviceLimitExceeded) => conflict_response("设备数量已达到套餐上限"),
+        Err(_) => internal_database_response(),
+    }
+}
+
 async fn revoke_me_device(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2753,7 +2783,7 @@ async fn openapi() -> Json<Value> {
             "/api/v1/admin/audit-logs": {
                 "get": { "operationId":"listAdminAuditLogs", "security":[{"bearerAuth":[]}], "parameters":[{"name":"page","in":"query","schema":{"type":"integer"}},{"name":"pageSize","in":"query","schema":{"type":"integer"}},{"name":"search","in":"query","schema":{"type":"string"}},{"name":"status","in":"query","schema":{"type":"string","description":"Exact audit action filter"}}], "responses":{"200":{"description":"Tenant-scoped audit log page"},"401":{"description":"Invalid token"},"500":{"description":"Database error"},"503":{"description":"Database unavailable"}} }
             },
-            "/api/v1/me/devices": { "get": { "operationId":"listMyDevices", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped device page"},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} } },
+            "/api/v1/me/devices": { "get": { "operationId":"listMyDevices", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped device page"},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} }, "post":{"operationId":"registerMyDevice","security":[{"portalBearerAuth":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/DeviceCreateRequest"}}}},"responses":{"201":{"description":"Device registered"},"400":{"description":"Invalid device"},"401":{"description":"Invalid portal token"},"409":{"description":"Device limit exceeded"},"503":{"description":"Database unavailable"}} } },
             "/api/v1/me/devices/{deviceId}": { "delete": { "operationId":"revokeMyDevice", "security":[{"portalBearerAuth":[]}], "parameters":[{"name":"deviceId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}], "responses":{"204":{"description":"Device revoked"},"401":{"description":"Invalid portal token"},"404":{"description":"Device not found or already revoked"},"503":{"description":"Database unavailable"}} } },
             "/api/v1/me/devices/{deviceId}/revoke": { "post": { "operationId":"revokeMyDeviceExplicit", "security":[{"portalBearerAuth":[]}], "parameters":[{"name":"deviceId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}], "responses":{"204":{"description":"Device revoked"},"401":{"description":"Invalid portal token"},"404":{"description":"Device not found or already revoked"},"503":{"description":"Database unavailable"}} } },
             "/api/v1/me/sessions": { "get": { "operationId":"listMySessions", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"User session metadata","content":{"application/json":{"schema":{"$ref":"#/components/schemas/SessionList"}}}},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} } },
@@ -2891,6 +2921,8 @@ async fn openapi() -> Json<Value> {
                     "type":"object", "required":["items","total","page","pageSize"],
                     "properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/NodeSummary"}},"total":{"type":"integer"},"page":{"type":"integer"},"pageSize":{"type":"integer"}}
                 },
+                "DeviceCreateRequest": { "type":"object", "required":["name","fingerprint"], "properties":{"name":{"type":"string","minLength":1},"fingerprint":{"type":"string","minLength":1}} },
+                "DeviceSummary": { "type":"object", "required":["id","name","lastSeenAt","createdAt","revokedAt"], "properties":{"id":{"type":"string","format":"uuid"},"name":{"type":"string"},"lastSeenAt":{"type":["string","null"]},"createdAt":{"type":"string","format":"date-time"},"revokedAt":{"type":["string","null"]}} },
                 "AgentRegistrationToken": {
                     "type":"object", "required":["nodeId","token","expiresAt","rotated"],
                     "properties":{"nodeId":{"type":"string","format":"uuid"},"token":{"type":"string","description":"Shown once; never persisted in clear text"},"expiresAt":{"type":"integer","format":"int64"},"rotated":{"type":"boolean"}}
@@ -2986,7 +3018,7 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/portal/usage", get(portal_usage))
         .route("/api/v1/me/plans", get(me_plans))
         .route("/api/v1/me/orders", get(me_orders).post(create_my_order))
-        .route("/api/v1/me/devices", get(me_devices))
+        .route("/api/v1/me/devices", get(me_devices).post(create_me_device))
         .route("/api/v1/me/devices/{device_id}", delete(revoke_me_device))
         .route(
             "/api/v1/me/devices/{device_id}/revoke",

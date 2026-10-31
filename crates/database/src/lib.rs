@@ -878,9 +878,28 @@ impl Database {
             tx.rollback().await?;
             return Ok(None);
         }
+        let target_revision = if status == "rolled_back" {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM config_revisions
+                 WHERE tenant_id=$1 AND node_id=$2 AND generation < $3
+                   AND publish_status='published'
+                 ORDER BY generation DESC LIMIT 1",
+            )
+            .bind(tenant_id)
+            .bind(node_id)
+            .bind(expected_generation)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            Some(id)
+        };
+        let Some(target_revision) = target_revision else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
         sqlx::query("UPDATE config_revisions SET publish_status=$3,failure_reason=NULL WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(id).bind(status).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO config_deployments(tenant_id,config_revision_id,node_id,status,expected_generation,applied_generation) VALUES($1,$2,$3,$4,$5,$5)").bind(tenant_id).bind(id).bind(node_id).bind(if status=="published" {"applied"} else {"rolled_back"}).bind(expected_generation).execute(&mut *tx).await?;
-        sqlx::query("UPDATE nodes SET current_config_revision=$3,updated_at=now() WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(node_id).bind(Some(id)).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO config_deployments(tenant_id,config_revision_id,node_id,status,expected_generation,applied_generation) VALUES($1,$2,$3,$4,$5,$5)").bind(tenant_id).bind(target_revision).bind(node_id).bind(if status=="published" {"applied"} else {"rolled_back"}).bind(expected_generation).execute(&mut *tx).await?;
+        sqlx::query("UPDATE nodes SET current_config_revision=$3,updated_at=now() WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(node_id).bind(Some(target_revision)).execute(&mut *tx).await?;
         let row = sqlx::query("SELECT r.id,COALESCE(r.template_id::text,'') AS template_id,r.node_id,n.name AS node_name,r.generation,r.core_version,r.content_hash,CASE WHEN r.signature='' THEN 'pending' ELSE 'valid' END AS signature_status,r.validation_status,r.publish_status,r.failure_reason,r.created_at::text AS created_at FROM config_revisions r JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id WHERE r.tenant_id=$1 AND r.id=$2").bind(tenant_id).bind(id).fetch_one(&mut *tx).await?;
         tx.commit().await?;
         Ok(Some(ConfigRevisionRecord::from_row(row)))

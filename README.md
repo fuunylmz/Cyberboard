@@ -33,8 +33,25 @@ curl http://127.0.0.1:8080/openapi.json
 ```
 
 The API accepts `CYBERBOARD_BIND_ADDR`, `CYBERBOARD_API_PORT`,
-`CYBERBOARD_DATABASE_URL`, and `CYBERBOARD_REDIS_URL`. Database and Redis are
-reported as configuration state only until the persistence slice is added.
+`CYBERBOARD_DATABASE_URL`, `CYBERBOARD_REDIS_URL`,
+`CYBERBOARD_DEMO_ADMIN_EMAIL`, and `CYBERBOARD_DEMO_ADMIN_PASSWORD`. The last
+two credentials default to `admin@example.com` and `password` for local
+development only. `POST /api/v1/auth/login` returns the fixed development
+Bearer token `cyberboard-dev-token` with `expiresIn: 3600` as a client hint;
+the static placeholder token is not expired server-side. This must be replaced
+with persistent users, hashed passwords, expiring sessions, and token rotation
+before any shared or production deployment. Database and Redis are reported as
+configuration state only until the persistence slice is added.
+
+The read-only session and admin endpoints require
+`Authorization: Bearer cyberboard-dev-token` after a successful development
+login:
+
+```sh
+curl -s http://127.0.0.1:8080/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"admin@example.com","password":"password"}'
+```
 
 Run the worker or agent in separate terminals:
 

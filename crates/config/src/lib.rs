@@ -59,6 +59,8 @@ pub struct ApiConfig {
     pub port: u16,
     pub database_url: Option<String>,
     pub redis_url: Option<String>,
+    pub demo_admin_email: String,
+    pub demo_admin_password: String,
 }
 
 impl ApiConfig {
@@ -68,6 +70,10 @@ impl ApiConfig {
             port: env_u16("CYBERBOARD_API_PORT", 8080)?,
             database_url: optional_env("CYBERBOARD_DATABASE_URL"),
             redis_url: optional_env("CYBERBOARD_REDIS_URL"),
+            demo_admin_email: optional_env("CYBERBOARD_DEMO_ADMIN_EMAIL")
+                .unwrap_or_else(|| "admin@example.com".to_owned()),
+            demo_admin_password: optional_env("CYBERBOARD_DEMO_ADMIN_PASSWORD")
+                .unwrap_or_else(|| "password".to_owned()),
         })
     }
 

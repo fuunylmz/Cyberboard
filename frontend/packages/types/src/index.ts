@@ -3,6 +3,8 @@ export type NodeStatus = 'online' | 'offline' | 'maintenance' | 'error'
 export type SubscriptionStatus = 'active' | 'pending' | 'expired' | 'revoked'
 
 export interface SessionUser { id: string; email: string; displayName: string; roles: string[]; permissions: string[] }
+export interface LoginCredentials { email: string; password: string }
+export interface LoginResponse { user: SessionUser; accessToken: string; tokenType: 'Bearer'; expiresIn: number }
 export interface UserSummary { id: string; email: string; displayName: string; status: UserStatus; plan: string; usedBytes: number; quotaBytes: number; expiresAt: string; lastSeenAt: string | null }
 export interface NodeSummary { id: string; name: string; region: string; address: string; status: NodeStatus; core: string; coreVersion: string; agentVersion: string; currentConfigRevision: string; latencyMs: number | null; lastHeartbeatAt: string | null }
 export interface SubscriptionSummary { id: string; userEmail: string; plan: string; status: SubscriptionStatus; trafficUsedBytes: number; trafficQuotaBytes: number; expiresAt: string; tokenHint: string }

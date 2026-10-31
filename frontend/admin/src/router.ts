@@ -13,4 +13,5 @@ const router = createRouter({ history:createWebHistory(), routes:[
   ] }, { path:'/:pathMatch(.*)*', redirect:'/admin' },
 ] })
 router.beforeEach((to) => { const auth = useAuthStore(); if (to.meta.requiresAuth && !auth.isAuthenticated) return '/login'; if (to.path === '/login' && auth.isAuthenticated) return '/admin' })
+if (typeof window !== 'undefined') window.addEventListener('cyberboard:unauthorized', () => { const auth = useAuthStore(); auth.logout(); if (router.currentRoute.value.path !== '/login') router.replace('/login') })
 export default router

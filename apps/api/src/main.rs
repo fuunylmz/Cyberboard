@@ -607,7 +607,7 @@ struct DashboardResponse {
     online_nodes: u64,
     traffic_bytes_24h: u64,
     failed_tasks: u64,
-    generated_at: &'static str,
+    generated_at: String,
 }
 
 #[derive(Serialize)]
@@ -929,13 +929,28 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> R
         return response;
     }
 
+    if let Some(database) = state.database.as_ref() {
+        return match database.dashboard_stats(state.config.tenant_id).await {
+            Ok(stats) => Json(DashboardResponse {
+                users: stats.users.max(0) as u64,
+                active_subscriptions: stats.active_subscriptions.max(0) as u64,
+                online_nodes: stats.online_nodes.max(0) as u64,
+                traffic_bytes_24h: stats.traffic_bytes_24h.max(0) as u64,
+                failed_tasks: stats.failed_tasks.max(0) as u64,
+                generated_at: stats.generated_at,
+            })
+            .into_response(),
+            Err(_) => internal_database_response(),
+        };
+    }
+
     Json(DashboardResponse {
         users: 0,
         active_subscriptions: 0,
         online_nodes: 0,
         traffic_bytes_24h: 0,
         failed_tasks: 0,
-        generated_at: DEMO_GENERATED_AT,
+        generated_at: DEMO_GENERATED_AT.to_owned(),
     })
     .into_response()
 }

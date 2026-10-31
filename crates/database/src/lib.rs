@@ -432,6 +432,29 @@ impl Database {
         Ok(count)
     }
 
+    pub async fn dashboard_stats(&self, tenant_id: Uuid) -> DatabaseResult<DashboardStats> {
+        let row = sqlx::query(
+            "SELECT
+                (SELECT count(*) FROM users WHERE tenant_id=$1 AND status <> 'deleted') AS users,
+                (SELECT count(*) FROM subscriptions WHERE tenant_id=$1 AND status='active' AND expires_at > now()) AS active_subscriptions,
+                (SELECT count(*) FROM nodes WHERE tenant_id=$1 AND status='online') AS online_nodes,
+                (SELECT COALESCE(sum(download_bytes + upload_bytes), 0) FROM usage_events WHERE tenant_id=$1 AND received_at >= now() - interval '24 hours') AS traffic_bytes_24h,
+                (SELECT count(*) FROM config_deployments WHERE tenant_id=$1 AND status='failed' AND updated_at >= now() - interval '24 hours') AS failed_tasks,
+                now()::text AS generated_at",
+        )
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(DashboardStats {
+            users: row.get("users"),
+            active_subscriptions: row.get("active_subscriptions"),
+            online_nodes: row.get("online_nodes"),
+            traffic_bytes_24h: row.get("traffic_bytes_24h"),
+            failed_tasks: row.get("failed_tasks"),
+            generated_at: row.get("generated_at"),
+        })
+    }
+
     pub async fn create_user(
         &self,
         tenant_id: Uuid,
@@ -1338,6 +1361,16 @@ pub struct UserRecord {
     pub email: String,
     pub display_name: String,
     pub status: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct DashboardStats {
+    pub users: i64,
+    pub active_subscriptions: i64,
+    pub online_nodes: i64,
+    pub traffic_bytes_24h: i64,
+    pub failed_tasks: i64,
+    pub generated_at: String,
 }
 
 #[derive(Clone, Debug)]

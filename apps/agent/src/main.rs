@@ -116,8 +116,17 @@ fn apply_desired(
     let envelope: SignedConfigEnvelope = serde_json::from_slice(&response.signed_config)
         .map_err(|_| "invalid_envelope".to_owned())?;
     let target = uuid::Uuid::parse_str(node_id).map_err(|_| "invalid_node_id".to_owned())?;
-    if envelope.target_node != target || envelope.generation.to_string() != response.generation {
+    if envelope.target_node != target
+        || envelope.generation.to_string() != response.generation
+        || (response.generation_number != 0 && response.generation_number != envelope.generation)
+    {
         return Err("target_or_generation_mismatch".into());
+    }
+    let payload_hash = hex_hash(&envelope.payload);
+    if (!response.content_hash.is_empty() && response.content_hash != payload_hash)
+        || envelope.content_hash != payload_hash
+    {
+        return Err("content_hash_mismatch".into());
     }
     let key_bytes = BASE64
         .decode(
@@ -138,10 +147,35 @@ fn apply_desired(
         .unwrap_or_else(|_| "/var/lib/cyberboard/sing-box.json".into());
     let binary = std::env::var("CYBERBOARD_SING_BOX_BINARY").unwrap_or_else(|_| "sing-box".into());
     let runtime = runtime::CoreRuntime::new(binary, path);
+    let current = runtime
+        .current_state()
+        .map_err(|_| "runtime_state_unavailable".to_owned())?;
+    if envelope.generation < current.generation {
+        return Err("stale_generation".into());
+    }
+    if envelope.generation == current.generation {
+        if current.content_hash == payload_hash {
+            return Ok(payload_hash);
+        }
+        return Err("generation_hash_conflict".into());
+    }
+    if !response.expected_previous_hash.is_empty()
+        && response.expected_previous_hash != current.content_hash
+    {
+        return Err("compare_and_swap_conflict".into());
+    }
+    runtime::ensure_parent(runtime.config_path())
+        .map_err(|_| "runtime_parent_unavailable".to_owned())?;
     runtime
-        .apply(&envelope.payload, envelope.generation, envelope.generation)
+        .apply(&envelope.payload, envelope.generation, current.generation)
         .map_err(|_| String::from("runtime_apply_failed"))?;
-    Ok(hex_hash(&envelope.payload))
+    runtime
+        .record_state(&runtime::AppliedState {
+            generation: envelope.generation,
+            content_hash: payload_hash.clone(),
+        })
+        .map_err(|_| "runtime_state_write_failed".to_owned())?;
+    Ok(payload_hash)
 }
 
 fn chrono_now() -> i64 {

@@ -11,6 +11,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -21,6 +22,14 @@ pub enum RuntimeError {
     Io(#[from] std::io::Error),
     #[error("core config check failed with status {0}")]
     CheckFailed(i32),
+    #[error("runtime state is invalid: {0}")]
+    InvalidState(#[from] serde_json::Error),
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AppliedState {
+    pub generation: u64,
+    pub content_hash: String,
 }
 
 pub struct CoreRuntime {
@@ -34,6 +43,10 @@ impl CoreRuntime {
             binary_path: binary_path.into(),
             config_path: config_path.into(),
         }
+    }
+
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
     }
 
     pub fn apply(
@@ -67,6 +80,31 @@ impl CoreRuntime {
         Ok(())
     }
 
+    pub fn current_state(&self) -> Result<AppliedState, RuntimeError> {
+        let path = self.state_path();
+        if !path.exists() {
+            return Ok(AppliedState::default());
+        }
+        Ok(serde_json::from_slice(&fs::read(path)?)?)
+    }
+
+    pub fn record_state(&self, state: &AppliedState) -> Result<(), RuntimeError> {
+        ensure_parent(&self.state_path())?;
+        let temporary_path = self.state_path().with_extension(format!(
+            "state-tmp-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::write(&temporary_path, serde_json::to_vec(state)?)?;
+        if let Err(error) = fs::rename(&temporary_path, self.state_path()) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     pub fn rollback(&self) -> Result<(), RuntimeError> {
         let backup_path = self.config_path.with_extension("previous");
         if backup_path.exists() {
@@ -82,6 +120,10 @@ impl CoreRuntime {
             .as_nanos();
         self.config_path.with_extension(format!("tmp-{nonce}"))
     }
+
+    fn state_path(&self) -> PathBuf {
+        self.config_path.with_extension("state")
+    }
 }
 
 pub fn ensure_parent(path: &Path) -> Result<(), RuntimeError> {
@@ -93,7 +135,7 @@ pub fn ensure_parent(path: &Path) -> Result<(), RuntimeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CoreRuntime, RuntimeError, ensure_parent};
+    use super::{AppliedState, CoreRuntime, RuntimeError, ensure_parent};
     use std::{env, fs};
 
     #[test]
@@ -114,5 +156,38 @@ mod tests {
         runtime.apply(b"{}", 1, 1).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"{}");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_applied_generation_and_hash_atomically() {
+        let path = env::temp_dir().join(format!(
+            "cyberboard-runtime-state-{}.json",
+            std::process::id()
+        ));
+        let runtime = CoreRuntime::new("/usr/bin/true", &path);
+        runtime
+            .record_state(&AppliedState {
+                generation: 7,
+                content_hash: "abc".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(
+            runtime.current_state().unwrap(),
+            AppliedState {
+                generation: 7,
+                content_hash: "abc".to_owned(),
+            }
+        );
+        let _ = fs::remove_file(path.with_extension("state"));
+    }
+
+    #[test]
+    fn missing_state_starts_at_generation_zero() {
+        let path = env::temp_dir().join(format!(
+            "cyberboard-runtime-missing-state-{}.json",
+            std::process::id()
+        ));
+        let runtime = CoreRuntime::new("/usr/bin/true", &path);
+        assert_eq!(runtime.current_state().unwrap(), AppliedState::default());
     }
 }

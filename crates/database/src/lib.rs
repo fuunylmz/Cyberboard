@@ -33,11 +33,21 @@ pub enum DatabaseError {
     Sqlx(#[from] sqlx::Error),
     #[error("invalid payment order state")]
     InvalidState,
+    #[error("purchasable plan not found")]
+    PlanUnavailable,
+    #[error("idempotency key parameters conflict")]
+    IdempotencyConflict,
 }
 
 impl DatabaseError {
     pub fn is_conflict(&self) -> bool {
-        matches!(self, Self::Sqlx(error) if error.as_database_error().is_some_and(|db| db.code().as_deref() == Some("23505")))
+        match self {
+            Self::IdempotencyConflict => true,
+            Self::Sqlx(error) => error
+                .as_database_error()
+                .is_some_and(|db| db.code().as_deref() == Some("23505")),
+            _ => false,
+        }
     }
 }
 
@@ -763,12 +773,21 @@ impl Database {
         plan_id: Uuid,
         idempotency_key: &str,
     ) -> DatabaseResult<OrderRecord> {
-        if let Some(existing) = sqlx::query("SELECT o.id,o.status,o.amount_cents,o.currency,o.created_at::text AS created_at,o.paid_at::text AS paid_at,p.name AS plan FROM orders o JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id WHERE o.tenant_id=$1 AND o.user_id=$2 AND o.idempotency_key=$3")
+        if let Some(existing) = sqlx::query("SELECT o.id,o.plan_id,o.status,o.amount_cents,o.currency,o.created_at::text AS created_at,o.paid_at::text AS paid_at,p.name AS plan FROM orders o JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id WHERE o.tenant_id=$1 AND o.user_id=$2 AND o.idempotency_key=$3")
             .bind(tenant_id).bind(user_id).bind(idempotency_key).fetch_optional(&self.pool).await? {
+            if existing.get::<Uuid, _>("plan_id") != plan_id {
+                return Err(DatabaseError::IdempotencyConflict);
+            }
             return Ok(OrderRecord::from_row(existing));
         }
         let row = sqlx::query(CREATE_ORDER_SQL)
-            .bind(tenant_id).bind(user_id).bind(plan_id).bind(idempotency_key).fetch_one(&self.pool).await?;
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(plan_id)
+            .bind(idempotency_key)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(DatabaseError::PlanUnavailable)?;
         Ok(OrderRecord::from_row(row))
     }
 
@@ -994,9 +1013,20 @@ impl Database {
         idempotency_key: &str,
     ) -> DatabaseResult<PaymentOrderRecord> {
         if let Some(row) = sqlx::query("SELECT id,user_id,plan_id,status,amount_cents,currency,provider,provider_payment_id,paid_at::text AS paid_at FROM orders WHERE tenant_id=$1 AND user_id=$2 AND idempotency_key=$3")
-            .bind(tenant_id).bind(user_id).bind(idempotency_key).fetch_optional(&self.pool).await? { return Ok(PaymentOrderRecord::from_row(row)); }
+            .bind(tenant_id).bind(user_id).bind(idempotency_key).fetch_optional(&self.pool).await? {
+            if row.get::<Uuid, _>("plan_id") != plan_id {
+                return Err(DatabaseError::IdempotencyConflict);
+            }
+            return Ok(PaymentOrderRecord::from_row(row));
+        }
         let row = sqlx::query(CREATE_ORDER_IDEMPOTENT_SQL)
-            .bind(tenant_id).bind(user_id).bind(idempotency_key).bind(plan_id).fetch_one(&self.pool).await?;
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(idempotency_key)
+            .bind(plan_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(DatabaseError::PlanUnavailable)?;
         Ok(PaymentOrderRecord::from_row(row))
     }
 
@@ -1397,7 +1427,7 @@ impl SubscriptionRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::{CREATE_ORDER_IDEMPOTENT_SQL, CREATE_ORDER_SQL};
+    use super::{CREATE_ORDER_IDEMPOTENT_SQL, CREATE_ORDER_SQL, DatabaseError};
 
     #[test]
     fn order_creation_queries_only_select_active_plans() {
@@ -1407,5 +1437,11 @@ mod tests {
                 "order creation must reject archived plans"
             );
         }
+    }
+
+    #[test]
+    fn idempotency_parameter_conflicts_are_classified_as_conflicts() {
+        assert!(DatabaseError::IdempotencyConflict.is_conflict());
+        assert!(!DatabaseError::PlanUnavailable.is_conflict());
     }
 }

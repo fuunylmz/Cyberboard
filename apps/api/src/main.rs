@@ -1200,6 +1200,17 @@ fn not_found_response(message: &'static str) -> Response {
         .into_response()
 }
 
+fn plan_unavailable_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ApiErrorResponse {
+            code: "plan_unavailable",
+            message: "套餐不存在或已下架",
+        }),
+    )
+        .into_response()
+}
+
 async fn create_admin_node(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1442,6 +1453,14 @@ fn order_json(order: &cyberboard_database::OrderRecord) -> Value {
     })
 }
 
+fn create_order_error_response(error: cyberboard_database::DatabaseError) -> Response {
+    match error {
+        error if error.is_conflict() => conflict_response("Idempotency-Key 已被其他订单使用"),
+        cyberboard_database::DatabaseError::PlanUnavailable => plan_unavailable_response(),
+        _ => internal_database_response(),
+    }
+}
+
 async fn create_my_order(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1468,8 +1487,7 @@ async fn create_my_order(
         .await
     {
         Ok(order) => (StatusCode::CREATED, Json(order_json(&order))).into_response(),
-        Err(error) if error.is_conflict() => conflict_response("Idempotency-Key 已被其他订单使用"),
-        Err(_) => internal_database_response(),
+        Err(error) => create_order_error_response(error),
     }
 }
 
@@ -1990,7 +2008,7 @@ async fn openapi() -> Json<Value> {
             },
             "/api/v1/me/orders": {
                 "get": { "operationId":"listMyOrders", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped order page"},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} },
-                "post": { "operationId":"createMyOrder", "security":[{"portalBearerAuth":[]}], "parameters":[{"name":"Idempotency-Key","in":"header","required":true,"schema":{"type":"string","minLength":1}}], "requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/CreateOrderRequest"}}}}, "responses":{"201":{"description":"Created or replayed order","content":{"application/json":{"schema":{"$ref":"#/components/schemas/OrderSummary"}}}},"400":{"description":"Missing idempotency key or invalid request"},"401":{"description":"Invalid portal token"},"409":{"description":"Idempotency key conflict"},"503":{"description":"Database unavailable"}} }
+                "post": { "operationId":"createMyOrder", "security":[{"portalBearerAuth":[]}], "parameters":[{"name":"Idempotency-Key","in":"header","required":true,"schema":{"type":"string","minLength":1}}], "requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/CreateOrderRequest"}}}}, "responses":{"201":{"description":"Created or replayed order","content":{"application/json":{"schema":{"$ref":"#/components/schemas/OrderSummary"}}}},"400":{"description":"Missing idempotency key or invalid request"},"401":{"description":"Invalid portal token"},"404":{"description":"Plan does not exist or is archived"},"409":{"description":"Idempotency key conflict"},"503":{"description":"Database unavailable"}} }
             },
             "/api/v1/me/devices": { "get": { "operationId":"listMyDevices", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped device page"},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} } },
             "/api/v1/me/usage": { "get": { "operationId":"getMyUsage", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped usage"},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} } },
@@ -2293,7 +2311,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEMO_ACCESS_TOKEN, DEMO_GENERATED_AT, DEMO_PORTAL_ACCESS_TOKEN, router};
+    use super::{
+        DEMO_ACCESS_TOKEN, DEMO_GENERATED_AT, DEMO_PORTAL_ACCESS_TOKEN,
+        create_order_error_response, router,
+    };
     use axum::{
         body::{Body, to_bytes},
         http::{HeaderMap, Request, StatusCode, header},
@@ -2316,6 +2337,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unavailable_order_plan_is_mapped_to_not_found() {
+        let response =
+            create_order_error_response(cyberboard_database::DatabaseError::PlanUnavailable);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "plan_unavailable");
+        assert_eq!(body["message"], "套餐不存在或已下架");
     }
 
     fn test_state() -> super::AppState {
@@ -2652,6 +2684,7 @@ mod tests {
             );
         }
         assert!(document["paths"]["/api/v1/me/orders"]["post"].is_object());
+        assert!(document["paths"]["/api/v1/me/orders"]["post"]["responses"]["404"].is_object());
         assert!(document["paths"]["/api/v1/admin/orders/{orderId}/mark-paid"]["post"].is_object());
         assert!(document["paths"]["/api/v1/admin/orders/{orderId}/refund"]["post"].is_object());
     }

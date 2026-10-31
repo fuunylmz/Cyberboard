@@ -11,6 +11,10 @@ export const adminApi = createAdminApi(new ApiClient({
   onUnauthorized: () => window.dispatchEvent(new CustomEvent('cyberboard:unauthorized')),
 }))
 
+export async function refreshAdminSession(refreshToken: string) {
+  return new ApiClient({ baseUrl }).post('/v1/auth/refresh', { refreshToken }, { skipAuth: true }) as Promise<import('@cyberboard/types').LoginResponse>
+}
+
 const auditClient = new ApiClient({
   baseUrl,
   getAccessToken: () => typeof window === 'undefined' ? null : localStorage.getItem(adminAccessTokenKey),

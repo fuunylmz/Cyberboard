@@ -13,7 +13,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
 };
 use cyberboard_config::ApiConfig;
 use cyberboard_database::{
@@ -76,6 +76,16 @@ async fn auth_middleware(
         }
     }
     if state.is_authorized(request.headers()) || state.is_portal_authorized(request.headers()) {
+        let role = if state.is_authorized(request.headers()) {
+            "admin"
+        } else {
+            "user"
+        };
+        request.extensions_mut().insert(AuthIdentity {
+            user_id: Uuid::nil(),
+            tenant_id: state.config.tenant_id,
+            role: role.to_owned(),
+        });
         next.run(request).await
     } else {
         unauthorized_response()
@@ -109,11 +119,7 @@ async fn auth_middleware_role(
     };
     if let Some(database) = state.database.as_ref() {
         match database.find_session(state.config.tenant_id, &token).await {
-            Ok(Some(session))
-                if session.active
-                    && (session.role == required_role
-                        || (required_role == "user" && session.role == "admin")) =>
-            {
+            Ok(Some(session)) if session.active && session.role == required_role => {
                 request.extensions_mut().insert(AuthIdentity {
                     user_id: session.user_id,
                     tenant_id: state.config.tenant_id,
@@ -125,19 +131,12 @@ async fn auth_middleware_role(
         }
     }
     if (required_role == "admin" && state.is_authorized(request.headers()))
-        || (required_role == "user"
-            && (state.is_portal_authorized(request.headers())
-                || state.is_authorized(request.headers())))
+        || (required_role == "user" && state.is_portal_authorized(request.headers()))
     {
-        let role = if state.is_authorized(request.headers()) {
-            "admin"
-        } else {
-            required_role
-        };
         request.extensions_mut().insert(AuthIdentity {
             user_id: uuid::Uuid::nil(),
             tenant_id: state.config.tenant_id,
-            role: role.to_owned(),
+            role: required_role.to_owned(),
         });
         next.run(request).await
     } else {
@@ -258,6 +257,13 @@ struct LoginRequest {
 struct PortalLoginRequest {
     email: String,
     password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
 }
 
 #[derive(Serialize)]
@@ -686,6 +692,32 @@ struct PortalUsageResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct AdminOrderSummaryResponse {
+    id: String,
+    user_id: String,
+    user_email: String,
+    plan: String,
+    status: String,
+    amount_cents: i64,
+    currency: String,
+    created_at: String,
+    paid_at: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionSummaryResponse {
+    id: String,
+    role: String,
+    issued_at: String,
+    expires_at: String,
+    revoked_at: Option<String>,
+    active: bool,
+    current: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ResourceListResponse<T> {
     items: Vec<T>,
     total: i64,
@@ -737,10 +769,159 @@ async fn session(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
 ) -> Response {
+    if let Some(database) = state.database.as_ref() {
+        return match database
+            .find_user_credentials_by_id(state.config.tenant_id, identity.user_id)
+            .await
+        {
+            Ok(Some(user)) => {
+                let is_admin = identity.role == "admin";
+                let permissions = if is_admin {
+                    vec!["*".to_owned()]
+                } else {
+                    vec!["subscription:read".to_owned()]
+                };
+                Json(SessionUserResponse {
+                    id: user.id.to_string(),
+                    email: user.email,
+                    display_name: user.display_name,
+                    roles: if user.roles.is_empty() {
+                        vec![identity.role]
+                    } else {
+                        user.roles
+                    },
+                    permissions,
+                })
+                .into_response()
+            }
+            Ok(None) => unauthorized_response(),
+            Err(_) => internal_database_response(),
+        };
+    }
     if identity.role == "admin" {
         return Json(demo_user(&state.config)).into_response();
     }
     Json(demo_portal_user(&state.config)).into_response()
+}
+
+async fn me_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
+    if let Err(response) = require_portal_auth(&state, &headers) {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return Json(json!({"items": [], "total": 0, "page": 1, "pageSize": 0})).into_response();
+    };
+    let Some(current_token) = state.bearer_token(&headers) else {
+        return unauthorized_response();
+    };
+    match database
+        .list_user_sessions(state.config.tenant_id, identity.user_id, &current_token)
+        .await
+    {
+        Ok(items) => {
+            let total = items.len();
+            let items = items
+                .into_iter()
+                .map(|session| SessionSummaryResponse {
+                    id: session.id.to_string(),
+                    role: session.role,
+                    issued_at: session.issued_at,
+                    expires_at: session.expires_at,
+                    revoked_at: session.revoked_at,
+                    active: session.active,
+                    current: session.current,
+                })
+                .collect::<Vec<_>>();
+            Json(json!({"items": items, "total": total, "page": 1, "pageSize": total}))
+                .into_response()
+        }
+        Err(_) => internal_database_response(),
+    }
+}
+
+async fn revoke_me_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(session_id): Path<Uuid>,
+) -> Response {
+    if let Err(response) = require_portal_auth(&state, &headers) {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    match database
+        .revoke_session_by_id(state.config.tenant_id, identity.user_id, session_id)
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => not_found_response("会话不存在或已经撤销"),
+        Err(_) => internal_database_response(),
+    }
+}
+
+async fn me_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(request): Json<ChangePasswordRequest>,
+) -> Response {
+    if let Err(response) = require_portal_auth(&state, &headers) {
+        return response;
+    }
+    if request.new_password.len() < 8 {
+        return invalid_input_response("新密码至少需要 8 个字符");
+    }
+    let Some(database) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    let Some(current_token) = state.bearer_token(&headers) else {
+        return unauthorized_response();
+    };
+    let credentials = match database
+        .find_user_credentials_by_id(state.config.tenant_id, identity.user_id)
+        .await
+    {
+        Ok(Some(credentials)) => credentials,
+        Ok(None) => return unauthorized_response(),
+        Err(_) => return internal_database_response(),
+    };
+    let valid_current = PasswordHash::new(&credentials.password_hash)
+        .ok()
+        .is_some_and(|hash| {
+            Argon2::default()
+                .verify_password(request.current_password.as_bytes(), &hash)
+                .is_ok()
+        });
+    if !valid_current {
+        return invalid_credentials_response();
+    }
+    let password_hash = match hash_password(&request.new_password) {
+        Ok(hash) => hash,
+        Err(response) => return response,
+    };
+    match database
+        .update_user_password(state.config.tenant_id, identity.user_id, &password_hash)
+        .await
+    {
+        Ok(true) => {
+            if database
+                .revoke_other_sessions(state.config.tenant_id, identity.user_id, &current_token)
+                .await
+                .is_err()
+            {
+                return internal_database_response();
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => unauthorized_response(),
+        Err(_) => internal_database_response(),
+    }
 }
 
 async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1514,7 +1695,14 @@ async fn mark_admin_order_paid(
         )
         .await
     {
-        Ok(order) => Json(order_json(&order)).into_response(),
+        Ok(_) => match database
+            .get_admin_order(state.config.tenant_id, order_id)
+            .await
+        {
+            Ok(Some(order)) => Json(admin_order_summary(order)).into_response(),
+            Ok(None) => not_found_response("订单不存在"),
+            Err(_) => internal_database_response(),
+        },
         Err(cyberboard_database::DatabaseError::InvalidState) => {
             conflict_response("订单状态不允许支付")
         }
@@ -1539,7 +1727,14 @@ async fn refund_admin_order(
         .refund_order(state.config.tenant_id, order_id, event_id)
         .await
     {
-        Ok(order) => Json(json!({"id": order.id, "status": order.status})).into_response(),
+        Ok(_) => match database
+            .get_admin_order(state.config.tenant_id, order_id)
+            .await
+        {
+            Ok(Some(order)) => Json(admin_order_summary(order)).into_response(),
+            Ok(None) => not_found_response("订单不存在"),
+            Err(_) => internal_database_response(),
+        },
         Err(cyberboard_database::DatabaseError::InvalidState) => {
             conflict_response("订单状态不允许退款")
         }
@@ -1562,6 +1757,66 @@ async fn me_orders(
         (Ok(items), Ok(total)) => Json(json!({"items": items.iter().map(|item| json!({"id":item.id,"status":item.status,"amountCents":item.amount_cents,"currency":item.currency,"createdAt":item.created_at,"paidAt":item.paid_at,"plan":item.plan})).collect::<Vec<_>>(),"total":total,"page":1,"pageSize":50})).into_response(),
         _ => internal_database_response(),
     }
+}
+
+fn admin_order_summary(order: cyberboard_database::AdminOrderRecord) -> AdminOrderSummaryResponse {
+    AdminOrderSummaryResponse {
+        id: order.id.to_string(),
+        user_id: order.user_id.to_string(),
+        user_email: order.user_email,
+        plan: order.plan,
+        status: order.status,
+        amount_cents: order.amount_cents,
+        currency: order.currency,
+        created_at: order.created_at,
+        paid_at: order.paid_at,
+    }
+}
+
+async fn admin_orders(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(pagination): Query<PaginationQuery>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    let limit = pagination.bounded_limit();
+    let offset = pagination.bounded_offset();
+    let items = match database
+        .list_admin_orders(
+            state.config.tenant_id,
+            limit,
+            offset,
+            pagination.search.as_deref(),
+            pagination.status.as_deref(),
+        )
+        .await
+    {
+        Ok(items) => items.into_iter().map(admin_order_summary).collect(),
+        Err(_) => return internal_database_response(),
+    };
+    let total = match database
+        .count_admin_orders(
+            state.config.tenant_id,
+            pagination.search.as_deref(),
+            pagination.status.as_deref(),
+        )
+        .await
+    {
+        Ok(total) => total,
+        Err(_) => return internal_database_response(),
+    };
+    Json(ResourceListResponse {
+        items,
+        total,
+        page: offset / limit + 1,
+        page_size: limit,
+    })
+    .into_response()
 }
 
 async fn me_plans(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1603,6 +1858,28 @@ async fn me_devices(
     match (database.list_devices(state.config.tenant_id, user_id, 50, 0).await, database.count_devices(state.config.tenant_id, user_id).await) {
         (Ok(items), Ok(total)) => Json(json!({"items": items.iter().map(|item| json!({"id":item.id,"name":item.name,"lastSeenAt":item.last_seen_at,"createdAt":item.created_at,"revokedAt":item.revoked_at})).collect::<Vec<_>>(),"total":total,"page":1,"pageSize":50})).into_response(),
         _ => internal_database_response(),
+    }
+}
+
+async fn revoke_me_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(device_id): Path<Uuid>,
+) -> Response {
+    if let Err(response) = require_portal_auth(&state, &headers) {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    match database
+        .revoke_device(state.config.tenant_id, identity.user_id, device_id)
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => not_found_response("设备不存在或已经撤销"),
+        Err(_) => internal_database_response(),
     }
 }
 
@@ -2010,7 +2287,15 @@ async fn openapi() -> Json<Value> {
                 "get": { "operationId":"listMyOrders", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped order page"},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} },
                 "post": { "operationId":"createMyOrder", "security":[{"portalBearerAuth":[]}], "parameters":[{"name":"Idempotency-Key","in":"header","required":true,"schema":{"type":"string","minLength":1}}], "requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/CreateOrderRequest"}}}}, "responses":{"201":{"description":"Created or replayed order","content":{"application/json":{"schema":{"$ref":"#/components/schemas/OrderSummary"}}}},"400":{"description":"Missing idempotency key or invalid request"},"401":{"description":"Invalid portal token"},"404":{"description":"Plan does not exist or is archived"},"409":{"description":"Idempotency key conflict"},"503":{"description":"Database unavailable"}} }
             },
+            "/api/v1/admin/orders": {
+                "get": { "operationId":"listAdminOrders", "security":[{"bearerAuth":[]}], "parameters":[{"name":"page","in":"query","schema":{"type":"integer"}},{"name":"pageSize","in":"query","schema":{"type":"integer"}},{"name":"search","in":"query","schema":{"type":"string"}},{"name":"status","in":"query","schema":{"type":"string","enum":["pending","paid","cancelled","refunded"]}}], "responses":{"200":{"description":"Tenant-scoped order page","content":{"application/json":{"schema":{"$ref":"#/components/schemas/AdminOrderList"}}}},"401":{"description":"Invalid token"},"500":{"description":"Database error"},"503":{"description":"Database unavailable"}} }
+            },
             "/api/v1/me/devices": { "get": { "operationId":"listMyDevices", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped device page"},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} } },
+            "/api/v1/me/devices/{deviceId}": { "delete": { "operationId":"revokeMyDevice", "security":[{"portalBearerAuth":[]}], "parameters":[{"name":"deviceId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}], "responses":{"204":{"description":"Device revoked"},"401":{"description":"Invalid portal token"},"404":{"description":"Device not found or already revoked"},"503":{"description":"Database unavailable"}} } },
+            "/api/v1/me/devices/{deviceId}/revoke": { "post": { "operationId":"revokeMyDeviceExplicit", "security":[{"portalBearerAuth":[]}], "parameters":[{"name":"deviceId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}], "responses":{"204":{"description":"Device revoked"},"401":{"description":"Invalid portal token"},"404":{"description":"Device not found or already revoked"},"503":{"description":"Database unavailable"}} } },
+            "/api/v1/me/sessions": { "get": { "operationId":"listMySessions", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"User session metadata","content":{"application/json":{"schema":{"$ref":"#/components/schemas/SessionList"}}}},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} } },
+            "/api/v1/me/sessions/{sessionId}": { "delete": { "operationId":"revokeMySession", "security":[{"portalBearerAuth":[]}], "parameters":[{"name":"sessionId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}], "responses":{"204":{"description":"Session revoked"},"401":{"description":"Invalid portal token"},"404":{"description":"Session not found or already revoked"},"503":{"description":"Database unavailable"}} } },
+            "/api/v1/me/password": { "patch": { "operationId":"changeMyPassword", "security":[{"portalBearerAuth":[]}], "requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ChangePasswordRequest"}}}}, "responses":{"204":{"description":"Password changed"},"400":{"description":"Invalid password"},"401":{"description":"Current password is invalid"},"503":{"description":"Database unavailable"}} } },
             "/api/v1/me/usage": { "get": { "operationId":"getMyUsage", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped usage"},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} } },
             "/subscribe/{token}": {
                 "get": { "operationId": "getSubscriptionConfig", "parameters": [{"name":"token","in":"path","required":true,"schema":{"type":"string"}}], "responses": { "200": { "description": "Sing-box compatible JSON configuration" }, "404": { "description": "Subscription missing or expired" }, "503": { "description": "Database unavailable" } } }
@@ -2183,7 +2468,12 @@ async fn openapi() -> Json<Value> {
                 "SubscriptionList": { "type":"object", "required":["items","total","page","pageSize"], "properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/SubscriptionSummary"}},"total":{"type":"integer"},"page":{"type":"integer"},"pageSize":{"type":"integer"}} },
                 "PortalUsage": { "type":"object", "required":["usedBytes","quotaBytes","todayBytes","projectedBytes","periodStart","periodEnd","daily"], "properties":{"usedBytes":{"type":"integer"},"quotaBytes":{"type":"integer"},"todayBytes":{"type":"integer"},"projectedBytes":{"type":"integer"},"periodStart":{"type":"string"},"periodEnd":{"type":"string"},"daily":{"type":"array","items":{"type":"object"}}} },
                 "OrderSummary": { "type":"object", "required":["id","status","amountCents","currency","createdAt","plan"], "properties":{"id":{"type":"string","format":"uuid"},"status":{"type":"string","enum":["pending","paid","cancelled","refunded","failed"]},"amountCents":{"type":"integer","format":"int64"},"currency":{"type":"string"},"createdAt":{"type":"string","format":"date-time"},"paidAt":{"type":"string","format":"date-time","nullable":true},"plan":{"type":"string"}} },
+                "AdminOrderSummary": { "type":"object", "required":["id","userId","userEmail","plan","status","amountCents","currency","createdAt","paidAt"], "properties":{"id":{"type":"string","format":"uuid"},"userId":{"type":"string","format":"uuid"},"userEmail":{"type":"string","format":"email"},"plan":{"type":"string"},"status":{"type":"string","enum":["pending","paid","cancelled","refunded"]},"amountCents":{"type":"integer","format":"int64"},"currency":{"type":"string"},"createdAt":{"type":"string","format":"date-time"},"paidAt":{"type":["string","null"],"format":"date-time"}} },
+                "AdminOrderList": { "type":"object", "required":["items","total","page","pageSize"], "properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/AdminOrderSummary"}},"total":{"type":"integer","format":"int64"},"page":{"type":"integer"},"pageSize":{"type":"integer"}} },
                 "CreateOrderRequest": { "type":"object", "required":["planId"], "properties":{"planId":{"type":"string","format":"uuid"}} },
+                "ChangePasswordRequest": { "type":"object", "required":["currentPassword","newPassword"], "properties":{"currentPassword":{"type":"string","format":"password","minLength":1},"newPassword":{"type":"string","format":"password","minLength":8}} },
+                "SessionSummary": { "type":"object", "required":["id","role","issuedAt","expiresAt","revokedAt","active","current"], "properties":{"id":{"type":"string","format":"uuid"},"role":{"type":"string"},"issuedAt":{"type":"string","format":"date-time"},"expiresAt":{"type":"string","format":"date-time"},"revokedAt":{"type":["string","null"],"format":"date-time"},"active":{"type":"boolean"},"current":{"type":"boolean"}} },
+                "SessionList": { "type":"object", "required":["items","total","page","pageSize"], "properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/SessionSummary"}},"total":{"type":"integer"},"page":{"type":"integer"},"pageSize":{"type":"integer"}} },
                 "ConfigTemplateRequest": { "type":"object", "properties":{"name":{"type":"string"},"description":{"type":"string"},"coreType":{"type":"string","default":"sing-box"},"coreVersionRange":{"type":"string","default":"*"},"status":{"type":"string","enum":["draft","active","archived"]}} },
                 "ConfigRevisionAction": { "type":"object", "required":["expectedGeneration"], "properties":{"expectedGeneration":{"type":"integer","format":"int64"},"expectedPreviousHash":{"type":"string"}} }
             }
@@ -2203,13 +2493,27 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/auth/portal-login", post(portal_login))
         .route("/subscribe/{token}", get(public_subscription));
 
-    let portal = Router::new()
+    let session_route = Router::new()
         .route("/api/v1/session", get(session))
+        .route_layer(from_fn_with_state(state.clone(), auth_middleware));
+
+    let portal = Router::new()
         .route("/api/v1/portal/subscription", get(portal_subscription))
         .route("/api/v1/portal/usage", get(portal_usage))
         .route("/api/v1/me/plans", get(me_plans))
         .route("/api/v1/me/orders", get(me_orders).post(create_my_order))
         .route("/api/v1/me/devices", get(me_devices))
+        .route("/api/v1/me/devices/{device_id}", delete(revoke_me_device))
+        .route(
+            "/api/v1/me/devices/{device_id}/revoke",
+            post(revoke_me_device),
+        )
+        .route("/api/v1/me/sessions", get(me_sessions))
+        .route(
+            "/api/v1/me/sessions/{session_id}",
+            delete(revoke_me_session),
+        )
+        .route("/api/v1/me/password", patch(me_password))
         .route("/api/v1/me/usage", get(me_usage))
         .route_layer(from_fn_with_state(state.clone(), portal_auth_middleware));
 
@@ -2247,6 +2551,7 @@ fn router(state: AppState) -> Router {
             "/api/v1/admin/subscriptions/{subscription_id}",
             patch(update_admin_subscription).delete(delete_admin_subscription),
         )
+        .route("/api/v1/admin/orders", get(admin_orders))
         .route(
             "/api/v1/admin/orders/{order_id}/mark-paid",
             post(mark_admin_order_paid),
@@ -2274,7 +2579,11 @@ fn router(state: AppState) -> Router {
         )
         .route_layer(from_fn_with_state(state.clone(), admin_auth_middleware));
 
-    public.merge(portal).merge(admin).with_state(state)
+    public
+        .merge(session_route)
+        .merge(portal)
+        .merge(admin)
+        .with_state(state)
 }
 
 async fn shutdown_signal() {
@@ -2520,6 +2829,11 @@ mod tests {
         assert_eq!(body["id"], "demo-admin");
         assert_eq!(body["email"], "admin@example.com");
 
+        let (status, _, body) =
+            get_json("/api/v1/me/devices", Some("Bearer cyberboard-dev-token")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["code"], "invalid_token");
+
         let (status, _, dashboard) = get_json(
             "/api/v1/admin/dashboard",
             Some("Bearer cyberboard-dev-token"),
@@ -2640,6 +2954,7 @@ mod tests {
         assert!(document["components"]["schemas"]["PortalLoginResponse"].is_object());
         for schema in [
             "CreateOrderRequest",
+            "ChangePasswordRequest",
             "OrderSummary",
             "ConfigTemplateRequest",
             "ConfigRevisionAction",
@@ -2655,6 +2970,8 @@ mod tests {
             "PlanList",
             "SubscriptionList",
             "PortalUsage",
+            "AdminOrderList",
+            "SessionList",
         ] {
             assert!(
                 document["components"]["schemas"][schema].is_object(),
@@ -2668,12 +2985,15 @@ mod tests {
             "/api/v1/me/plans",
             "/api/v1/me/orders",
             "/api/v1/me/devices",
+            "/api/v1/me/sessions",
+            "/api/v1/me/password",
             "/api/v1/me/usage",
             "/api/v1/admin/dashboard",
             "/api/v1/admin/nodes",
             "/api/v1/admin/users",
             "/api/v1/admin/plans",
             "/api/v1/admin/subscriptions",
+            "/api/v1/admin/orders",
             "/api/v1/admin/plans/{planId}",
             "/api/v1/admin/nodes/{nodeId}",
             "/api/v1/admin/subscriptions/{subscriptionId}",

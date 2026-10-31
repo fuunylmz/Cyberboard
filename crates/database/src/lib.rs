@@ -87,6 +87,69 @@ impl Database {
         let result=sqlx::query("UPDATE sessions SET revoked_at=now() WHERE tenant_id=$1 AND token_hash=$2 AND revoked_at IS NULL").bind(tenant_id).bind(hash_session_token(token)).execute(&self.pool).await?;
         Ok(result.rows_affected() == 1)
     }
+
+    pub async fn list_user_sessions(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        current_token: &str,
+    ) -> DatabaseResult<Vec<SessionSummaryRecord>> {
+        let rows = sqlx::query(
+            "SELECT id,role,issued_at::text AS issued_at,expires_at::text AS expires_at,
+                    revoked_at::text AS revoked_at,
+                    (revoked_at IS NULL AND expires_at > now()) AS active,
+                    (token_hash=$3) AS current
+             FROM sessions
+             WHERE tenant_id=$1 AND user_id=$2
+             ORDER BY issued_at DESC,id",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(hash_session_token(current_token))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(SessionSummaryRecord::from_row)
+            .collect())
+    }
+
+    pub async fn revoke_session_by_id(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        session_id: Uuid,
+    ) -> DatabaseResult<bool> {
+        let result = sqlx::query(
+            "UPDATE sessions SET revoked_at=now()
+             WHERE tenant_id=$1 AND user_id=$2 AND id=$3 AND revoked_at IS NULL",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn revoke_other_sessions(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        current_token: &str,
+    ) -> DatabaseResult<u64> {
+        let result = sqlx::query(
+            "UPDATE sessions SET revoked_at=now()
+             WHERE tenant_id=$1 AND user_id=$2 AND revoked_at IS NULL
+               AND token_hash <> $3",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(hash_session_token(current_token))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
     pub async fn connect(database_url: &str) -> DatabaseResult<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(10)
@@ -270,6 +333,53 @@ impl Database {
             status: row.get("status"),
             roles: row.get("roles"),
         }))
+    }
+
+    pub async fn find_user_credentials_by_id(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> DatabaseResult<Option<UserCredentials>> {
+        let row = sqlx::query(
+            "SELECT u.id, u.email, u.display_name, u.password_hash, u.status,
+                    COALESCE(array_agg(r.name) FILTER (WHERE r.name IS NOT NULL), ARRAY[]::text[]) AS roles
+             FROM users u
+             LEFT JOIN user_roles ur ON ur.tenant_id=u.tenant_id AND ur.user_id=u.id
+             LEFT JOIN roles r ON r.tenant_id=ur.tenant_id AND r.id=ur.role_id
+             WHERE u.tenant_id=$1 AND u.id=$2
+             GROUP BY u.id, u.email, u.display_name, u.password_hash, u.status
+             LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| UserCredentials {
+            id: row.get("id"),
+            email: row.get("email"),
+            display_name: row.get("display_name"),
+            password_hash: row.get("password_hash"),
+            status: row.get("status"),
+            roles: row.get("roles"),
+        }))
+    }
+
+    pub async fn update_user_password(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        password_hash: &str,
+    ) -> DatabaseResult<bool> {
+        let result = sqlx::query(
+            "UPDATE users SET password_hash=$3,updated_at=now()
+             WHERE tenant_id=$1 AND id=$2 AND status='active'",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(password_hash)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn list_users(
@@ -766,6 +876,80 @@ impl Database {
         )
     }
 
+    pub async fn list_admin_orders(
+        &self,
+        tenant_id: Uuid,
+        limit: i64,
+        offset: i64,
+        search: Option<&str>,
+        status: Option<&str>,
+    ) -> DatabaseResult<Vec<AdminOrderRecord>> {
+        let rows = sqlx::query(
+            "SELECT o.id,o.status,o.amount_cents,o.currency,
+                    o.created_at::text AS created_at,o.paid_at::text AS paid_at,
+                    u.id AS user_id,u.email AS user_email,p.name AS plan
+             FROM orders o
+             JOIN users u ON u.tenant_id=o.tenant_id AND u.id=o.user_id
+             JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id
+             WHERE o.tenant_id=$1
+               AND ($2::text IS NULL OR u.email ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%' OR o.id::text ILIKE '%' || $2 || '%')
+               AND ($3::text IS NULL OR o.status=$3)
+             ORDER BY o.created_at DESC,o.id
+             LIMIT $4 OFFSET $5",
+        )
+        .bind(tenant_id)
+        .bind(search)
+        .bind(status)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(AdminOrderRecord::from_row).collect())
+    }
+
+    pub async fn count_admin_orders(
+        &self,
+        tenant_id: Uuid,
+        search: Option<&str>,
+        status: Option<&str>,
+    ) -> DatabaseResult<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT count(*)
+             FROM orders o
+             JOIN users u ON u.tenant_id=o.tenant_id AND u.id=o.user_id
+             JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id
+             WHERE o.tenant_id=$1
+               AND ($2::text IS NULL OR u.email ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%' OR o.id::text ILIKE '%' || $2 || '%')
+               AND ($3::text IS NULL OR o.status=$3)",
+        )
+        .bind(tenant_id)
+        .bind(search)
+        .bind(status)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    pub async fn get_admin_order(
+        &self,
+        tenant_id: Uuid,
+        order_id: Uuid,
+    ) -> DatabaseResult<Option<AdminOrderRecord>> {
+        let row = sqlx::query(
+            "SELECT o.id,o.status,o.amount_cents,o.currency,
+                    o.created_at::text AS created_at,o.paid_at::text AS paid_at,
+                    u.id AS user_id,u.email AS user_email,p.name AS plan
+             FROM orders o
+             JOIN users u ON u.tenant_id=o.tenant_id AND u.id=o.user_id
+             JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id
+             WHERE o.tenant_id=$1 AND o.id=$2",
+        )
+        .bind(tenant_id)
+        .bind(order_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(AdminOrderRecord::from_row))
+    }
+
     pub async fn create_order(
         &self,
         tenant_id: Uuid,
@@ -835,6 +1019,24 @@ impl Database {
                 .fetch_one(&self.pool)
                 .await?,
         )
+    }
+
+    pub async fn revoke_device(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        device_id: Uuid,
+    ) -> DatabaseResult<bool> {
+        let result = sqlx::query(
+            "UPDATE devices SET revoked_at=now()
+             WHERE tenant_id=$1 AND user_id=$2 AND id=$3 AND revoked_at IS NULL",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(device_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
     pub async fn usage_summary(
         &self,
@@ -1106,6 +1308,31 @@ pub struct SessionRecord {
 }
 
 #[derive(Clone, Debug)]
+pub struct SessionSummaryRecord {
+    pub id: Uuid,
+    pub role: String,
+    pub issued_at: String,
+    pub expires_at: String,
+    pub revoked_at: Option<String>,
+    pub active: bool,
+    pub current: bool,
+}
+
+impl SessionSummaryRecord {
+    fn from_row(row: sqlx::postgres::PgRow) -> Self {
+        Self {
+            id: row.get("id"),
+            role: row.get("role"),
+            issued_at: row.get("issued_at"),
+            expires_at: row.get("expires_at"),
+            revoked_at: row.try_get("revoked_at").ok(),
+            active: row.get("active"),
+            current: row.get("current"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct UserRecord {
     pub id: Uuid,
     pub email: String,
@@ -1266,6 +1493,35 @@ pub struct OrderRecord {
     pub created_at: String,
     pub paid_at: Option<String>,
     pub plan: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AdminOrderRecord {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub user_email: String,
+    pub plan: String,
+    pub status: String,
+    pub amount_cents: i64,
+    pub currency: String,
+    pub created_at: String,
+    pub paid_at: Option<String>,
+}
+
+impl AdminOrderRecord {
+    fn from_row(row: sqlx::postgres::PgRow) -> Self {
+        Self {
+            id: row.get("id"),
+            user_id: row.get("user_id"),
+            user_email: row.get("user_email"),
+            plan: row.get("plan"),
+            status: row.get("status"),
+            amount_cents: row.get("amount_cents"),
+            currency: row.get("currency"),
+            created_at: row.get("created_at"),
+            paid_at: row.try_get("paid_at").ok(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

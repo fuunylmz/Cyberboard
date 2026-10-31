@@ -36,6 +36,9 @@ impl TonicAgentTransport {
     pub async fn connect(
         config: &AgentConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        if config.control_plane_url.starts_with("http://") && !config.insecure {
+            return Err("cleartext AgentControl requires CYBERBOARD_AGENT_INSECURE=1".into());
+        }
         let mut endpoint = Endpoint::from_shared(config.control_plane_url.clone())?
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10));

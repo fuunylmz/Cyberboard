@@ -47,6 +47,7 @@ message HeartbeatRequest {
   double cpu_percent = 11;
   int64 unix_time = 12;
   string nonce = 13;
+  string agent_public_key = 14;
 }
 
 message HeartbeatResponse {
@@ -61,6 +62,7 @@ message GetDesiredStateRequest {
   string current_generation = 3;
   string current_content_hash = 4;
   uint64 last_applied_generation = 5;
+  string agent_public_key = 6;
 }
 
 message DesiredStateResponse {
@@ -89,6 +91,7 @@ message ReportApplyResultRequest {
   int64 unix_time = 10;
   string expected_previous_hash = 11;
   bool compare_and_swap_ok = 12;
+  string agent_public_key = 13;
 }
 
 message ReportUsageRequest {
@@ -99,12 +102,14 @@ message ReportUsageRequest {
   int64 window_start = 5;
   int64 window_end = 6;
   bytes usage_payload = 7;
+  string agent_public_key = 8;
 }
 
 message GetReleaseManifestRequest {
   string agent_id = 1;
   string node_id = 2;
   string current_agent_version = 3;
+  string agent_public_key = 4;
 }
 
 message ReleaseManifestResponse {
@@ -123,6 +128,7 @@ message ReportUpgradeResultRequest {
   bool success = 4;
   string error_code = 5;
   string error_message = 6;
+  string agent_public_key = 7;
 }
 
 message Ack {

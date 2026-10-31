@@ -47,16 +47,47 @@ impl AgentControlService {
         Ok(())
     }
 
-    fn authenticated(&self, agent_id: &str, node_id: Uuid) -> Result<(), Status> {
-        let sessions = self
-            .sessions
-            .read()
-            .map_err(|_| Status::internal("agent registry unavailable"))?;
-        if sessions
-            .get(agent_id)
-            .is_some_and(|known| *known == node_id)
-        {
+    async fn authenticated(
+        &self,
+        agent_id: &str,
+        node_id: Uuid,
+        public_key: &str,
+    ) -> Result<(), Status> {
+        let in_memory = {
+            let sessions = self
+                .sessions
+                .read()
+                .map_err(|_| Status::internal("agent registry unavailable"))?;
+            sessions.get(agent_id).copied() == Some(node_id)
+        };
+        if in_memory {
             Ok(())
+        } else if let Some(database) = &self.database {
+            if public_key.trim().is_empty() {
+                return Err(Status::unauthenticated(
+                    "agent public key is required for reconnect",
+                ));
+            }
+            let known: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM nodes
+                    WHERE tenant_id=$1 AND id=$2 AND agent_id=$3
+                      AND agent_public_key=$4
+                )",
+            )
+            .bind(self.tenant_id)
+            .bind(node_id)
+            .bind(agent_id)
+            .bind(public_key)
+            .fetch_one(database.pool())
+            .await
+            .map_err(|_| Status::internal("agent identity lookup failed"))?;
+            if known {
+                self.remember(agent_id.to_owned(), node_id)?;
+                Ok(())
+            } else {
+                Err(Status::unauthenticated("agent identity is not registered"))
+            }
         } else {
             Err(Status::unauthenticated("agent identity is not registered"))
         }
@@ -129,7 +160,8 @@ impl AgentControl for AgentControlService {
         let request = request.into_inner();
         let node_id = Uuid::parse_str(&request.node_id)
             .map_err(|_| Status::invalid_argument("node_id is invalid"))?;
-        self.authenticated(&request.agent_id, node_id)?;
+        self.authenticated(&request.agent_id, node_id, &request.agent_public_key)
+            .await?;
         if let Some(database) = &self.database {
             let accepted = database
                 .update_agent_heartbeat(
@@ -168,7 +200,8 @@ impl AgentControl for AgentControlService {
         let request = request.into_inner();
         let node_id = Uuid::parse_str(&request.node_id)
             .map_err(|_| Status::invalid_argument("node_id is invalid"))?;
-        self.authenticated(&request.agent_id, node_id)?;
+        self.authenticated(&request.agent_id, node_id, &request.agent_public_key)
+            .await?;
         let Some(database) = &self.database else {
             return Ok(Response::new(DesiredStateResponse::default()));
         };
@@ -193,7 +226,8 @@ impl AgentControl for AgentControlService {
             .generation
             .parse::<i64>()
             .map_err(|_| Status::invalid_argument("generation is invalid"))?;
-        self.authenticated(&request.agent_id, node_id)?;
+        self.authenticated(&request.agent_id, node_id, &request.agent_public_key)
+            .await?;
         let accepted = if let Some(database) = &self.database {
             database
                 .record_agent_apply_result(
@@ -223,7 +257,8 @@ impl AgentControl for AgentControlService {
         let request = request.into_inner();
         let node_id = Uuid::parse_str(&request.node_id)
             .map_err(|_| Status::invalid_argument("node_id is invalid"))?;
-        self.authenticated(&request.agent_id, node_id)?;
+        self.authenticated(&request.agent_id, node_id, &request.agent_public_key)
+            .await?;
         if request.batch_id.trim().is_empty() || request.window_end <= request.window_start {
             return Err(Status::invalid_argument(
                 "usage batch and window are required",
@@ -268,7 +303,8 @@ impl AgentControl for AgentControlService {
         let request = request.into_inner();
         let node_id = Uuid::parse_str(&request.node_id)
             .map_err(|_| Status::invalid_argument("node_id is invalid"))?;
-        self.authenticated(&request.agent_id, node_id)?;
+        self.authenticated(&request.agent_id, node_id, &request.agent_public_key)
+            .await?;
         Ok(Response::new(ReleaseManifestResponse::default()))
     }
 
@@ -279,7 +315,8 @@ impl AgentControl for AgentControlService {
         let request = request.into_inner();
         let node_id = Uuid::parse_str(&request.node_id)
             .map_err(|_| Status::invalid_argument("node_id is invalid"))?;
-        self.authenticated(&request.agent_id, node_id)?;
+        self.authenticated(&request.agent_id, node_id, &request.agent_public_key)
+            .await?;
         Ok(Response::new(Ack {
             request_id: Uuid::new_v4().to_string(),
             accepted: true,
@@ -340,10 +377,16 @@ mod tests {
     #[tokio::test]
     async fn registration_remembers_agent_identity() {
         let (service, node_id, agent_id) = registered().await;
-        assert!(service.authenticated(&agent_id, node_id).is_ok());
         assert!(
             service
-                .authenticated(&agent_id, Uuid::from_u128(3))
+                .authenticated(&agent_id, node_id, "test-public-key")
+                .await
+                .is_ok()
+        );
+        assert!(
+            service
+                .authenticated(&agent_id, Uuid::from_u128(3), "test-public-key")
+                .await
                 .is_err()
         );
     }

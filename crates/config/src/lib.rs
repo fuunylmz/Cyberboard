@@ -157,6 +157,8 @@ pub struct AgentConfig {
     pub client_cert_path: Option<String>,
     pub client_key_path: Option<String>,
     pub tls_server_name: Option<String>,
+    pub identity_path: String,
+    pub insecure: bool,
 }
 
 impl AgentConfig {
@@ -167,13 +169,16 @@ impl AgentConfig {
 
         Ok(Self {
             control_plane_url: optional_env("CYBERBOARD_CONTROL_PLANE_URL")
-                .unwrap_or_else(|| "https://127.0.0.1:8080".to_owned()),
+                .unwrap_or_else(|| "https://127.0.0.1:9090".to_owned()),
             node_id,
             interval_secs: env_u64("CYBERBOARD_AGENT_INTERVAL_SECS", 30)?.max(1),
             ca_cert_path: optional_env("CYBERBOARD_AGENT_CA_CERT"),
             client_cert_path: optional_env("CYBERBOARD_AGENT_CLIENT_CERT"),
             client_key_path: optional_env("CYBERBOARD_AGENT_CLIENT_KEY"),
             tls_server_name: optional_env("CYBERBOARD_AGENT_TLS_SERVER_NAME"),
+            identity_path: optional_env("CYBERBOARD_AGENT_IDENTITY_PATH")
+                .unwrap_or_else(|| "/var/lib/cyberboard/agent-identity.json".to_owned()),
+            insecure: env_bool("CYBERBOARD_AGENT_INSECURE", false)?,
         })
     }
 }

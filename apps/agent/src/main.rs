@@ -13,17 +13,44 @@ use tokio::time::{MissedTickBehavior, interval};
 use tracing::{info, warn};
 
 mod control_plane;
+mod identity;
 mod runtime;
 mod tonic_transport;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     cyberboard_observability::init("cyberboard_agent");
-    let config = AgentConfig::from_env()?;
-    let node_id = config
+    let mut config = AgentConfig::from_env()?;
+    let stored_identity = identity::AgentIdentity::load(&config.identity_path)?;
+    if let Some(identity) = stored_identity.as_ref() {
+        if config.ca_cert_path.is_none() {
+            config.ca_cert_path = identity.ca_cert_path.clone();
+        }
+        if config.client_cert_path.is_none() {
+            config.client_cert_path = identity.client_cert_path.clone();
+        }
+        if config.client_key_path.is_none() {
+            config.client_key_path = identity.client_key_path.clone();
+        }
+    }
+    if let (Some(configured), Some(stored)) = (config.node_id, stored_identity.as_ref()) {
+        if configured != stored.node_id {
+            return Err("CYBERBOARD_NODE_ID does not match persisted agent identity".into());
+        }
+    }
+    let node_uuid = config
         .node_id
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| "unregistered".to_owned());
+        .or_else(|| stored_identity.as_ref().map(|identity| identity.node_id))
+        .ok_or("CYBERBOARD_NODE_ID or persisted agent identity is required")?;
+    let node_id = node_uuid.to_string();
+    let public_key = stored_identity
+        .as_ref()
+        .map(|identity| identity.public_key.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(agent_public_key);
+    let mut persisted_agent_id = stored_identity
+        .as_ref()
+        .map(|identity| identity.agent_id.clone());
     let mut ticker = interval(Duration::from_secs(config.interval_secs));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -37,31 +64,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls_configured = config.ca_cert_path.is_some()
         && config.client_cert_path.is_some()
         && config.client_key_path.is_some();
-    let mut transport = if tls_configured {
+    let insecure_configured = config.insecure && config.control_plane_url.starts_with("http://");
+    let mut transport = if tls_configured || insecure_configured {
         match tonic_transport::TonicAgentTransport::connect_with_backoff(&config, 5).await {
             Ok(mut value) => {
-                let registration = RegisterAgentRequest {
-                    one_time_registration_token: std::env::var(
-                        "CYBERBOARD_AGENT_REGISTRATION_TOKEN",
-                    )
-                    .unwrap_or_default(),
-                    agent_public_key: agent_public_key(),
-                    agent_version: env!("CARGO_PKG_VERSION").into(),
-                    platform: std::env::consts::OS.into(),
-                    architecture: std::env::consts::ARCH.into(),
-                    unix_time: 0,
-                    nonce: String::new(),
+                let agent_id = if let Some(identity) = stored_identity.as_ref() {
+                    info!(agent_id = %identity.agent_id, "reusing persisted agent identity");
+                    Some(identity.agent_id.clone())
+                } else {
+                    let registration = RegisterAgentRequest {
+                        one_time_registration_token: std::env::var(
+                            "CYBERBOARD_AGENT_REGISTRATION_TOKEN",
+                        )
+                        .unwrap_or_default(),
+                        agent_public_key: public_key.clone(),
+                        agent_version: env!("CARGO_PKG_VERSION").into(),
+                        platform: std::env::consts::OS.into(),
+                        architecture: std::env::consts::ARCH.into(),
+                        unix_time: unix_now(),
+                        nonce: uuid::Uuid::new_v4().to_string(),
+                    };
+                    match value.register(registration).await {
+                        Ok(agent_id) => {
+                            persisted_agent_id = Some(agent_id.clone());
+                            let saved = identity::AgentIdentity {
+                                agent_id: agent_id.clone(),
+                                node_id: node_uuid,
+                                public_key: public_key.clone(),
+                                ca_cert_path: config.ca_cert_path.clone(),
+                                client_cert_path: config.client_cert_path.clone(),
+                                client_key_path: config.client_key_path.clone(),
+                            };
+                            saved.persist(&config.identity_path)?;
+                            info!(%agent_id, "agent registered and identity persisted");
+                            Some(agent_id)
+                        }
+                        Err(error) => {
+                            warn!(%error, "agent registration failed");
+                            None
+                        }
+                    }
                 };
-                match value.register(registration).await {
-                    Ok(agent_id) => {
-                        info!(%agent_id, "agent registered");
-                        Some((value, agent_id))
-                    }
-                    Err(error) => {
-                        warn!(%error, "agent registration failed");
-                        None
-                    }
-                }
+                agent_id.map(|agent_id| (value, agent_id, public_key.clone()))
             }
             Err(error) => {
                 warn!(%error, "control-plane connection failed; agent remains offline");
@@ -76,18 +120,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                if let Some((client, agent_id)) = transport.as_mut() {
-                    let now = unix_now();
-                    let heartbeat = HeartbeatRequest { agent_id: agent_id.clone(), node_id: node_id.clone(), agent_version: env!("CARGO_PKG_VERSION").into(), core_versions: vec!["sing-box".into()], platform: std::env::consts::OS.into(), architecture: std::env::consts::ARCH.into(), current_config_revision: String::new(), core_state: "unknown".into(), memory_bytes: 0, disk_free_bytes: 0, cpu_percent: 0.0, unix_time: now, nonce: uuid::Uuid::new_v4().to_string() };
-                    if let Err(error) = client.heartbeat(heartbeat).await { warn!(%error, "control-plane heartbeat failed"); }
-                    let desired = client.desired_state(GetDesiredStateRequest { agent_id: agent_id.clone(), node_id: node_id.clone(), current_generation: String::new(), current_content_hash: String::new(), last_applied_generation: 0 }).await;
-                    if let Ok(response) = desired {
-                        if !response.signed_config.is_empty() {
-                            let result = apply_desired(&node_id, &response);
-                            let (phase, code, hash, cas) = match result { Ok(hash) => ("applied", String::new(), hash, true), Err(error) => ("rejected", error, String::new(), false) };
-                            let _ = client.report_apply(ReportApplyResultRequest { agent_id: agent_id.clone(), node_id: node_id.clone(), generation: response.generation, previous_hash: response.expected_previous_hash.clone(), applied_hash: hash, phase: phase.into(), error_code: code, error_message: String::new(), retry_count: 0, unix_time: now, expected_previous_hash: response.expected_previous_hash, compare_and_swap_ok: cas }).await;
+                if transport.is_none() {
+                    if let Some(agent_id) = persisted_agent_id.clone() {
+                        match tonic_transport::TonicAgentTransport::connect_with_backoff(&config, 1).await {
+                            Ok(client) => {
+                                info!(%agent_id, "agent transport reconnected");
+                                transport = Some((client, agent_id, public_key.clone()));
+                            }
+                            Err(error) => warn!(%error, "agent reconnect failed"),
                         }
                     }
+                }
+                let mut heartbeat_failed = false;
+                if let Some((client, agent_id, public_key)) = transport.as_mut() {
+                    let now = unix_now();
+                    let heartbeat = HeartbeatRequest { agent_id: agent_id.clone(), node_id: node_id.clone(), agent_version: env!("CARGO_PKG_VERSION").into(), core_versions: vec!["sing-box".into()], platform: std::env::consts::OS.into(), architecture: std::env::consts::ARCH.into(), current_config_revision: String::new(), core_state: "unknown".into(), memory_bytes: 0, disk_free_bytes: 0, cpu_percent: 0.0, unix_time: now, nonce: uuid::Uuid::new_v4().to_string(), agent_public_key: public_key.clone() };
+                    heartbeat_failed = match client.heartbeat(heartbeat).await {
+                        Ok(()) => false,
+                        Err(error) => { warn!(%error, "control-plane heartbeat failed"); true }
+                    };
+                    if !heartbeat_failed {
+                        let desired = client.desired_state(GetDesiredStateRequest { agent_id: agent_id.clone(), node_id: node_id.clone(), current_generation: String::new(), current_content_hash: String::new(), last_applied_generation: 0, agent_public_key: public_key.clone() }).await;
+                        if let Ok(response) = desired {
+                            if !response.signed_config.is_empty() {
+                                let result = apply_desired(&node_id, &response);
+                                let (phase, code, hash, cas) = match result { Ok(hash) => ("applied", String::new(), hash, true), Err(error) => ("rejected", error, String::new(), false) };
+                                let _ = client.report_apply(ReportApplyResultRequest { agent_id: agent_id.clone(), node_id: node_id.clone(), generation: response.generation, previous_hash: response.expected_previous_hash.clone(), applied_hash: hash, phase: phase.into(), error_code: code, error_message: String::new(), retry_count: 0, unix_time: now, expected_previous_hash: response.expected_previous_hash, compare_and_swap_ok: cas, agent_public_key: public_key.clone() }).await;
+                            }
+                        }
+                    }
+                }
+                if heartbeat_failed {
+                    transport = None;
                 }
             }
             signal = tokio::signal::ctrl_c() => {

@@ -94,6 +94,7 @@ cargo run -p cyberboard-agent
 ```
 
 The agent accepts `CYBERBOARD_CONTROL_PLANE_URL`, `CYBERBOARD_NODE_ID`,
+`CYBERBOARD_AGENT_IDENTITY_PATH`, `CYBERBOARD_AGENT_INSECURE`,
 `CYBERBOARD_AGENT_INTERVAL_SECS`, `CYBERBOARD_AGENT_CA_CERT`,
 `CYBERBOARD_AGENT_CLIENT_CERT`, `CYBERBOARD_AGENT_CLIENT_KEY`,
 `CYBERBOARD_AGENT_TLS_SERVER_NAME`, `CYBERBOARD_AGENT_TRUSTED_KEY`,
@@ -117,6 +118,15 @@ base64-encoded Ed25519 seed (32 bytes). The API stores the signed canonical
 envelope in the revision and the Agent receives that exact envelope through
 `GetDesiredState`; `CYBERBOARD_CONFIG_SIGNING_KEY_ID` defaults to
 `config-key-1`.
+
+The Agent stores its registration identity and public-key reference in the
+identity file (default `/var/lib/cyberboard/agent-identity.json`) using an
+atomic write with a private file mode. On restart it reuses the stored
+`agent_id`, node ID, public key, and certificate paths; the control plane
+revalidates that tuple against the node record before accepting heartbeats.
+For an explicit no-database development server, set
+`CYBERBOARD_AGENT_INSECURE=1` and use an `http://` control-plane URL; this
+enables h2c and is rejected by the production mTLS setup.
 
 ## Docker Compose
 

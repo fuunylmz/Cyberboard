@@ -80,16 +80,26 @@ impl CoreSupervisor {
             {
                 self.state = persisted.current.clone();
                 restored = true;
-            } else if let (Some(previous), Some(previous_state)) = (
-                persisted.previous_successful_config.as_ref(),
-                persisted.previous_successful.as_ref(),
-            ) && previous.exists()
-                && file_hash(previous).is_ok_and(|hash| hash == previous_state.content_hash)
-            {
-                copy_private_sync(previous, &self.config)?;
-                self.state = previous_state.clone();
-                self.durable.set_current(self.state.clone(), None, None);
-                restored = true;
+            } else if let Some(previous) = persisted.previous_successful_config.as_ref() {
+                let recovered = file_hash(previous).ok().and_then(|hash| {
+                    if hash == persisted.current.content_hash {
+                        Some(persisted.current.clone())
+                    } else if persisted
+                        .previous_successful
+                        .as_ref()
+                        .is_some_and(|state| state.content_hash == hash)
+                    {
+                        persisted.previous_successful.clone()
+                    } else {
+                        None
+                    }
+                });
+                if let Some(recovered_state) = recovered {
+                    copy_private_sync(previous, &self.config)?;
+                    self.state = recovered_state;
+                    self.durable.set_current(self.state.clone(), None, None);
+                    restored = true;
+                }
             }
         }
         if restored {
@@ -105,9 +115,12 @@ impl CoreSupervisor {
                 let unverified = self.unverified_path();
                 if let Err(error) = fs::rename(&self.config, &unverified) {
                     warn!(%error, path = %unverified.display(), "could not move unverified config");
+                } else if let Err(error) = set_private(&unverified) {
+                    warn!(%error, path = %unverified.display(), "could not restrict unverified config permissions");
                 }
             }
             self.state = AppliedState::default();
+            self.durable.set_current(self.state.clone(), None, None);
         }
         Ok(())
     }
@@ -580,14 +593,39 @@ mod tests {
         supervisor.shutdown().await;
     }
 
+    fn find_sing_box_binary() -> Result<PathBuf, String> {
+        if let Some(configured) = std::env::var_os("CYBERBOARD_SING_BOX_BINARY") {
+            let binary = PathBuf::from(configured);
+            return binary.is_file().then_some(binary.clone()).ok_or_else(|| {
+                format!(
+                    "CYBERBOARD_SING_BOX_BINARY path does not exist: {}",
+                    binary.display()
+                )
+            });
+        }
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join("sing-box"))
+            .find(|candidate| candidate.is_file())
+            .ok_or_else(|| "sing-box was not found on PATH".to_owned())
+    }
+
     #[tokio::test]
     async fn real_sing_box_restarts_with_persisted_config() {
-        let binary = PathBuf::from("/opt/homebrew/bin/sing-box");
-        if !binary.is_file() {
-            return;
-        }
-        let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", 18149)) else {
-            return;
+        let binary = match find_sing_box_binary() {
+            Ok(binary) => binary,
+            Err(reason) => {
+                eprintln!("skipping real sing-box restart test: {reason}");
+                return;
+            }
+        };
+        let listener = match std::net::TcpListener::bind(("127.0.0.1", 18149)) {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!(
+                    "skipping real sing-box restart test: 127.0.0.1:18149 unavailable: {error}"
+                );
+                return;
+            }
         };
         drop(listener);
 
@@ -608,6 +646,42 @@ mod tests {
         assert_eq!(restarted.state().generation, 1);
         assert_eq!(restarted.core_state(), "running");
         restarted.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn startup_recovers_previous_file_matching_persisted_current_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("sing-box.json");
+        let previous = PathBuf::from(format!("{}.previous", config.display()));
+        let binary = fake_core(dir.path());
+        let known_good = b"persisted generation seven";
+        fs::write(&config, b"uncommitted generation eight").unwrap();
+        fs::write(&previous, known_good).unwrap();
+        let durable = crate::state::StateStore::load(config.with_extension("state"));
+        durable.set_current(
+            AppliedState {
+                generation: 7,
+                content_hash: hash(known_good),
+            },
+            Some(previous),
+            Some(AppliedState {
+                generation: 6,
+                content_hash: "older-hash".into(),
+            }),
+        );
+
+        let mut supervisor = CoreSupervisor::new_with_state_store(
+            &binary,
+            &config,
+            Duration::from_millis(20),
+            durable,
+        )
+        .await;
+        supervisor.initialize().await.unwrap();
+        assert_eq!(fs::read(&config).unwrap(), known_good);
+        assert_eq!(supervisor.state().generation, 7);
+        assert_eq!(supervisor.core_state(), "running");
+        supervisor.shutdown().await;
     }
 
     #[tokio::test]
@@ -688,21 +762,63 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("sing-box.json");
         fs::write(&config, b"unverified old config").unwrap();
-        fs::write(config.with_extension("state"), b"not-json").unwrap();
-        fs::write(
-            PathBuf::from(format!("{}.previous", config.display())),
-            b"stale backup",
+        let previous = PathBuf::from(format!("{}.previous", config.display()));
+        fs::write(&previous, b"stale backup").unwrap();
+        let durable = crate::state::StateStore::load(config.with_extension("state"));
+        durable.set_current(
+            AppliedState {
+                generation: 8,
+                content_hash: "different-current".into(),
+            },
+            Some(previous),
+            Some(AppliedState {
+                generation: 7,
+                content_hash: "different-previous".into(),
+            }),
+        );
+        durable.record_failure(9, "failed-hash", "core_check_failed");
+        durable.record_result_for(
+            &cyberboard_agent_protocol::generated::ReportApplyResultRequest {
+                generation: "9".into(),
+                applied_hash: "old-hash".into(),
+                phase: "failed".into(),
+                error_code: "core_check_failed".into(),
+                ..Default::default()
+            },
+            "failed-hash",
+            false,
+        );
+        let mut supervisor = CoreSupervisor::new_with_state_store(
+            fake_core(dir.path()),
+            &config,
+            Duration::from_millis(350),
+            durable,
         )
-        .unwrap();
-        let mut supervisor =
-            CoreSupervisor::new(fake_core(dir.path()), &config, Duration::from_millis(350)).await;
+        .await;
         supervisor.initialize().await.unwrap();
         assert!(!config.exists());
         assert_eq!(
             fs::read(supervisor.unverified_path()).unwrap(),
             b"unverified old config"
         );
+        assert_eq!(
+            fs::metadata(supervisor.unverified_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         assert_eq!(supervisor.state(), &AppliedState::default());
+        let cleared = serde_json::from_slice::<crate::state::AgentState>(
+            &fs::read(supervisor.state_path()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cleared.current, AppliedState::default());
+        assert!(cleared.previous_successful_config.is_none());
+        assert!(cleared.previous_successful.is_none());
+        assert_eq!(cleared.failures.len(), 1);
+        assert_eq!(cleared.results.len(), 1);
         let bad = b"crash_on_start";
         let result = supervisor.apply(bad, 1, &hash(bad)).await;
         assert_eq!(result.phase, "failed");
@@ -748,6 +864,7 @@ mod tests {
         let mut supervisor =
             CoreSupervisor::new(fake_core(dir.path()), &config, Duration::from_millis(20)).await;
         supervisor.initialize().await.unwrap();
+        fs::remove_file(supervisor.state_path()).unwrap();
         fs::create_dir(supervisor.state_path()).unwrap();
         let bytes = b"valid config";
         let result = supervisor.apply(bytes, 1, &hash(bytes)).await;

@@ -235,11 +235,7 @@ impl StateStore {
     }
 
     fn persist(&self) {
-        let state = self
-            .state
-            .lock()
-            .expect("agent state mutex poisoned")
-            .clone();
+        let state = self.state.lock().expect("agent state mutex poisoned");
         if let Err(error) = atomic_write(&self.path, &state) {
             warn!(%error, path = %self.path.display(), "could not persist agent state");
         }
@@ -350,6 +346,13 @@ mod tests {
             error_code: "core_check_failed".into(),
             ..Default::default()
         };
+        let confirmed = ReportApplyResultRequest {
+            generation: "3".into(),
+            applied_hash: "older-hash".into(),
+            phase: "applied".into(),
+            ..Default::default()
+        };
+        store.record_result_for(&confirmed, "confirmed-hash", true);
         store.record_result_for(&pending, "bad-hash", false);
 
         let reloaded = StateStore::load(&path);
@@ -357,7 +360,10 @@ mod tests {
             reloaded.failure_code(4, "bad-hash").as_deref(),
             Some("core_check_failed")
         );
-        assert_eq!(reloaded.pending_results().len(), 1);
+        let pending_after_restart = reloaded.pending_results();
+        assert_eq!(pending_after_restart.len(), 1);
+        assert_eq!(pending_after_restart[0].0.generation, 4);
+        assert_eq!(pending_after_restart[0].1.error_code, "core_check_failed");
         reloaded.confirm_result(4, "bad-hash", "core_check_failed");
         assert!(StateStore::load(&path).pending_results().is_empty());
     }

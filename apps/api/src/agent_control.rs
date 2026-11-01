@@ -4,6 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use cyberboard_agent_protocol::{
     PROTOCOL_VERSION,
     generated::{
@@ -14,7 +15,10 @@ use cyberboard_agent_protocol::{
         agent_control_server::{AgentControl, AgentControlServer},
     },
 };
-use cyberboard_database::{AgentHeartbeatInput, Database, DesiredConfigRecord};
+use cyberboard_database::{
+    AgentApplyResultInput, AgentHeartbeatInput, AgentUpgradeResultInput, AgentUsageInput, Database,
+    DesiredConfigRecord,
+};
 use serde_json::Value;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -23,14 +27,20 @@ use uuid::Uuid;
 pub struct AgentControlService {
     tenant_id: Uuid,
     database: Option<Arc<Database>>,
-    sessions: Arc<RwLock<HashMap<String, Uuid>>>,
+    signer: Option<Arc<crate::signing::ConfigSigner>>,
+    sessions: Arc<RwLock<HashMap<String, (Uuid, String)>>>,
 }
 
 impl AgentControlService {
-    pub fn new(tenant_id: Uuid, database: Option<Arc<Database>>) -> Self {
+    pub fn new(
+        tenant_id: Uuid,
+        database: Option<Arc<Database>>,
+        signer: Option<Arc<crate::signing::ConfigSigner>>,
+    ) -> Self {
         Self {
             tenant_id,
             database,
+            signer,
             sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -39,11 +49,11 @@ impl AgentControlService {
         AgentControlServer::new(self)
     }
 
-    fn remember(&self, agent_id: String, node_id: Uuid) -> Result<(), Status> {
+    fn remember(&self, agent_id: String, node_id: Uuid, public_key: String) -> Result<(), Status> {
         self.sessions
             .write()
             .map_err(|_| Status::internal("agent registry unavailable"))?
-            .insert(agent_id, node_id);
+            .insert(agent_id, (node_id, public_key));
         Ok(())
     }
 
@@ -58,7 +68,11 @@ impl AgentControlService {
                 .sessions
                 .read()
                 .map_err(|_| Status::internal("agent registry unavailable"))?;
-            sessions.get(agent_id).copied() == Some(node_id)
+            sessions
+                .get(agent_id)
+                .is_some_and(|(cached_node, cached_key)| {
+                    *cached_node == node_id && cached_key == public_key
+                })
         };
         if in_memory {
             Ok(())
@@ -83,7 +97,7 @@ impl AgentControlService {
             .await
             .map_err(|_| Status::internal("agent identity lookup failed"))?;
             if known {
-                self.remember(agent_id.to_owned(), node_id)?;
+                self.remember(agent_id.to_owned(), node_id, public_key.to_owned())?;
                 Ok(())
             } else {
                 Err(Status::unauthenticated("agent identity is not registered"))
@@ -142,7 +156,11 @@ impl AgentControl for AgentControlService {
                 architecture: request.architecture.clone(),
             }
         };
-        self.remember(registration.agent_id.clone(), registration.node_id)?;
+        self.remember(
+            registration.agent_id.clone(),
+            registration.node_id,
+            request.agent_public_key,
+        )?;
         Ok(Response::new(RegisterAgentResponse {
             agent_id: registration.agent_id,
             node_id: registration.node_id.to_string(),
@@ -186,8 +204,18 @@ impl AgentControl for AgentControlService {
                 ));
             }
         }
+        let desired_generation = if let Some(database) = &self.database {
+            database
+                .desired_generation_for_agent(self.tenant_id, &request.agent_id, node_id)
+                .await
+                .map_err(|_| Status::internal("desired generation lookup failed"))?
+                .map(|generation| generation.to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         Ok(Response::new(HeartbeatResponse {
-            desired_state_revision: request.current_config_revision,
+            desired_state_revision: desired_generation,
             should_upgrade: false,
             protocol_version: PROTOCOL_VERSION.to_owned(),
         }))
@@ -202,6 +230,11 @@ impl AgentControl for AgentControlService {
             .map_err(|_| Status::invalid_argument("node_id is invalid"))?;
         self.authenticated(&request.agent_id, node_id, &request.agent_public_key)
             .await?;
+        let Some(signer) = &self.signer else {
+            return Err(Status::failed_precondition(
+                "config signing key is unavailable",
+            ));
+        };
         let Some(database) = &self.database else {
             return Ok(Response::new(DesiredStateResponse::default()));
         };
@@ -212,7 +245,7 @@ impl AgentControl for AgentControlService {
         else {
             return Ok(Response::new(DesiredStateResponse::default()));
         };
-        Ok(Response::new(desired_state(config)))
+        Ok(Response::new(desired_state(config, signer)?))
     }
 
     async fn report_apply_result(
@@ -230,15 +263,18 @@ impl AgentControl for AgentControlService {
             .await?;
         let accepted = if let Some(database) = &self.database {
             database
-                .record_agent_apply_result(
-                    self.tenant_id,
-                    &request.agent_id,
+                .record_agent_apply_result(AgentApplyResultInput {
+                    tenant_id: self.tenant_id,
+                    agent_id: &request.agent_id,
                     node_id,
                     generation,
-                    &request.phase,
-                    &request.error_code,
-                    &request.error_message,
-                )
+                    phase: &request.phase,
+                    error_code: &request.error_code,
+                    error_message: &request.error_message,
+                    previous_hash: &request.previous_hash,
+                    applied_hash: &request.applied_hash,
+                    retry_count: request.retry_count as i32,
+                })
                 .await
                 .map_err(|_| Status::internal("apply result persistence failed"))?
         } else {
@@ -272,16 +308,16 @@ impl AgentControl for AgentControlService {
         };
         if let Some(database) = &self.database {
             let _accepted = database
-                .ingest_agent_usage(
-                    self.tenant_id,
-                    &request.agent_id,
+                .ingest_agent_usage(AgentUsageInput {
+                    tenant_id: self.tenant_id,
+                    agent_id: &request.agent_id,
                     node_id,
-                    &request.batch_id,
-                    request.sequence as i64,
-                    request.window_start,
-                    request.window_end,
-                    &payload,
-                )
+                    batch_id: &request.batch_id,
+                    sequence: request.sequence as i64,
+                    window_start: request.window_start,
+                    window_end: request.window_end,
+                    payload: &payload,
+                })
                 .await
                 .map_err(|error| match error {
                     cyberboard_database::DatabaseError::InvalidUsagePayload(message) => {
@@ -336,15 +372,17 @@ impl AgentControl for AgentControlService {
             .await?;
         if let Some(database) = &self.database {
             database
-                .record_agent_upgrade_result(
-                    self.tenant_id,
+                .record_agent_upgrade_result(AgentUpgradeResultInput {
+                    tenant_id: self.tenant_id,
                     node_id,
-                    &request.agent_id,
-                    &request.target_version,
-                    request.success,
-                    (!request.error_code.is_empty()).then_some(request.error_code.as_str()),
-                    (!request.error_message.is_empty()).then_some(request.error_message.as_str()),
-                )
+                    agent_id: &request.agent_id,
+                    target_version: &request.target_version,
+                    success: request.success,
+                    error_code: (!request.error_code.is_empty())
+                        .then_some(request.error_code.as_str()),
+                    error_message: (!request.error_message.is_empty())
+                        .then_some(request.error_message.as_str()),
+                })
                 .await
                 .map_err(|_| Status::internal("upgrade result persistence failed"))?;
         }
@@ -355,24 +393,40 @@ impl AgentControl for AgentControlService {
     }
 }
 
-fn desired_state(config: DesiredConfigRecord) -> DesiredStateResponse {
-    let signed_config = if config.signature.trim_start().starts_with('{') {
-        config.signature.as_bytes().to_vec()
-    } else {
-        Vec::new()
-    };
-    DesiredStateResponse {
-        generation: config.generation.to_string(),
+fn desired_state(
+    config: DesiredConfigRecord,
+    signer: &crate::signing::ConfigSigner,
+) -> Result<DesiredStateResponse, Status> {
+    if cyberboard_config_compiler::hex_hash(&config.payload) != config.content_hash {
+        tracing::error!(
+            revision_id = %config.revision_id,
+            "stored config payload hash mismatch"
+        );
+        return Err(Status::failed_precondition(
+            "stored config payload hash mismatch",
+        ));
+    }
+    let issued_at = unix_now();
+    let envelope = signer.sign(
+        config.node_id,
+        config.generation.max(0) as u64,
+        config.payload,
+        issued_at,
+    );
+    let signed_config = serde_json::to_vec(&envelope)
+        .map_err(|_| Status::internal("config envelope serialization failed"))?;
+    Ok(DesiredStateResponse {
+        generation: envelope.generation.to_string(),
         core_type: config.core_type,
         core_version: config.core_version,
         signed_config,
-        content_hash: config.content_hash,
-        signature: config.signature,
-        signing_key_id: String::new(),
-        expires_at: unix_now() + 300,
+        content_hash: envelope.content_hash.clone(),
+        signature: STANDARD.encode(&envelope.signature),
+        signing_key_id: envelope.key_id.clone(),
+        expires_at: envelope.expires_at,
         expected_previous_hash: config.expected_previous_hash,
-        generation_number: config.generation.max(0) as u64,
-    }
+        generation_number: envelope.generation,
+    })
 }
 
 fn unix_now() -> i64 {
@@ -387,7 +441,7 @@ mod tests {
     use super::*;
 
     async fn registered() -> (AgentControlService, Uuid, String) {
-        let service = AgentControlService::new(Uuid::from_u128(1), None);
+        let service = AgentControlService::new(Uuid::from_u128(1), None, None);
         let node_id = Uuid::from_u128(2);
         let response = service
             .register_agent(Request::new(RegisterAgentRequest {
@@ -420,22 +474,82 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            service
+                .authenticated(&agent_id, node_id, "attacker-key")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
-    async fn desired_state_is_empty_until_a_signed_database_revision_exists() {
+    async fn desired_state_requires_signer_before_agent_poll() {
         let (service, node_id, agent_id) = registered().await;
-        let response = service
+        let error = service
             .get_desired_state(Request::new(GetDesiredStateRequest {
                 agent_id,
                 node_id: node_id.to_string(),
+                agent_public_key: "test-public-key".to_owned(),
                 ..Default::default()
             }))
             .await
-            .unwrap()
-            .into_inner();
-        assert!(response.signed_config.is_empty());
-        assert_eq!(response.generation, "");
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn desired_state_maps_fresh_signed_envelope_fields() {
+        let signer = crate::signing::ConfigSigner::from_seed([9; 32], "test-key".into(), 60);
+        let node_id = Uuid::from_u128(9);
+        let payload = br#"{}"#.to_vec();
+        let hash = cyberboard_config_compiler::hex_hash(&payload);
+        let response = desired_state(
+            DesiredConfigRecord {
+                revision_id: Uuid::from_u128(8),
+                node_id,
+                generation: 5,
+                core_type: "sing-box".into(),
+                core_version: "1.0".into(),
+                payload,
+                content_hash: hash.clone(),
+                expected_previous_hash: "previous".into(),
+            },
+            &signer,
+        )
+        .unwrap();
+        let envelope: cyberboard_config_compiler::SignedConfigEnvelope =
+            serde_json::from_slice(&response.signed_config).unwrap();
+        assert_eq!(response.generation, "5");
+        assert_eq!(response.generation_number, 5);
+        assert_eq!(response.content_hash, hash);
+        assert_eq!(response.signing_key_id, "test-key");
+        assert_eq!(response.expires_at, envelope.issued_at + 60);
+        assert_eq!(response.signature, STANDARD.encode(&envelope.signature));
+        assert_eq!(response.expected_previous_hash, "previous");
+        assert_eq!(envelope.target_node, node_id);
+        envelope
+            .verify(&signer.verifying_key(), envelope.issued_at)
+            .unwrap();
+    }
+
+    #[test]
+    fn desired_state_rejects_payload_hash_mismatch() {
+        let signer = crate::signing::ConfigSigner::from_seed([9; 32], "test-key".into(), 60);
+        let error = desired_state(
+            DesiredConfigRecord {
+                revision_id: Uuid::from_u128(8),
+                node_id: Uuid::from_u128(9),
+                generation: 5,
+                core_type: "sing-box".into(),
+                core_version: "1.0".into(),
+                payload: b"{}".to_vec(),
+                content_hash: "wrong".into(),
+                expected_previous_hash: String::new(),
+            },
+            &signer,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]
@@ -448,6 +562,7 @@ mod tests {
                 batch_id: "batch".to_owned(),
                 window_start: 10,
                 window_end: 10,
+                agent_public_key: "test-public-key".to_owned(),
                 ..Default::default()
             }))
             .await

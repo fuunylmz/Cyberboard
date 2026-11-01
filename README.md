@@ -61,8 +61,9 @@ mode; database mode always authenticates persisted users and issues persisted
 server-side sessions.
 
 When `CYBERBOARD_DATABASE_URL` is set, API startup connects to PostgreSQL,
-executes the embedded migrations `0001` through the current `0012` release, and ensures the
-configured tenant exists. A failed connection or migration stops startup.
+executes the embedded migrations `0001` through the current `0013` release, and ensures the
+configured tenant exists. A failed connection or migration stops startup. Migrations are
+serialized with a transaction-scoped advisory lock.
 Without a URL, `/readyz` reports `memory_mode`; it does not claim database
 health, and resource writes return a clear `database_unavailable` response.
 
@@ -124,11 +125,21 @@ token; the clear-text value is returned once, while PostgreSQL stores only its
 SHA-256 hash and lifecycle timestamps. `DELETE` on the same endpoint revokes
 the current token, and a later `POST` rotates it.
 
-Publishing a config revision requires `CYBERBOARD_CONFIG_SIGNING_KEY` to be a
-base64-encoded Ed25519 seed (32 bytes). The API stores the signed canonical
-envelope in the revision and the Agent receives that exact envelope through
-`GetDesiredState`; `CYBERBOARD_CONFIG_SIGNING_KEY_ID` defaults to
-`config-key-1`.
+The API reads `CYBERBOARD_CONFIG_SIGNING_KEY` once at startup as standard
+base64 for a 32-byte Ed25519 seed. A set but invalid key stops startup; an unset
+key logs a warning and disables publish/rollback with `signing_key_unavailable`.
+`CYBERBOARD_CONFIG_SIGNING_KEY_ID` defaults to `config-key-1` and
+`CYBERBOARD_CONFIG_ENVELOPE_TTL_SECS` defaults to 300 seconds, clamped to
+60–3600. Every `GetDesiredState` call signs the stored JSON payload afresh; the
+publish-time signature stored on a revision is only an audit artifact.
+
+Config deployments begin as `pending` and change only after the Agent reports
+`applied`, `rolled_back`, or a failure (recorded as `failed`). Admin rollback is
+a roll-forward: it creates a new generation carrying the payload of the newest
+older revision whose latest deployment is `applied`. Draft revisions with a
+generation less than or equal to the new generation can no longer be published.
+Migration `0013_config_deployment_lifecycle.sql` adds applied-state tracking,
+rollback provenance, and deployment report fields.
 
 The Agent stores its registration identity and public-key reference in the
 identity file (default `/var/lib/cyberboard/agent-identity.json`) using an

@@ -35,6 +35,9 @@ pub const ELEVENTH_MIGRATION: &str =
 pub const TWELFTH_MIGRATION_NAME: &str = "0012_session_refresh.sql";
 pub const TWELFTH_MIGRATION: &str =
     include_str!("../../../deploy/migrations/0012_session_refresh.sql");
+pub const THIRTEENTH_MIGRATION_NAME: &str = "0013_config_deployment_lifecycle.sql";
+pub const THIRTEENTH_MIGRATION: &str =
+    include_str!("../../../deploy/migrations/0013_config_deployment_lifecycle.sql");
 
 #[cfg(test)]
 mod tests {
@@ -43,8 +46,8 @@ mod tests {
         FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, INITIAL_MIGRATION_NAME,
         NINTH_MIGRATION, NINTH_MIGRATION_NAME, SECOND_MIGRATION, SECOND_MIGRATION_NAME,
         SEVENTH_MIGRATION, SEVENTH_MIGRATION_NAME, SIXTH_MIGRATION, TENTH_MIGRATION,
-        TENTH_MIGRATION_NAME, THIRD_MIGRATION, THIRD_MIGRATION_NAME, TWELFTH_MIGRATION,
-        TWELFTH_MIGRATION_NAME,
+        TENTH_MIGRATION_NAME, THIRD_MIGRATION, THIRD_MIGRATION_NAME, THIRTEENTH_MIGRATION,
+        THIRTEENTH_MIGRATION_NAME, TWELFTH_MIGRATION, TWELFTH_MIGRATION_NAME,
     };
 
     #[test]
@@ -138,5 +141,17 @@ mod tests {
         assert!(ELEVENTH_MIGRATION.contains("agent_upgrade_results"));
         assert_eq!(TWELFTH_MIGRATION_NAME, "0012_session_refresh.sql");
         assert!(TWELFTH_MIGRATION.contains("refresh_token_hash"));
+        assert_eq!(
+            THIRTEENTH_MIGRATION_NAME,
+            "0013_config_deployment_lifecycle.sql"
+        );
+        for field in [
+            "applied_config_revision",
+            "rollback_of",
+            "reported_at",
+            "retry_count",
+        ] {
+            assert!(THIRTEENTH_MIGRATION.contains(field));
+        }
     }
 }

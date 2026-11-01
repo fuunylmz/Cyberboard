@@ -9,7 +9,7 @@ use std::time::Duration;
 use cyberboard_storage::{
     EIGHTH_MIGRATION, ELEVENTH_MIGRATION, FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION,
     NINTH_MIGRATION, SECOND_MIGRATION, SEVENTH_MIGRATION, SIXTH_MIGRATION, TENTH_MIGRATION,
-    THIRD_MIGRATION, TWELFTH_MIGRATION,
+    THIRD_MIGRATION, THIRTEENTH_MIGRATION, TWELFTH_MIGRATION,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -18,11 +18,31 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod admin_bootstrap;
+include!("config_delivery.rs");
 
 const CREATE_ORDER_SQL: &str = "INSERT INTO orders (tenant_id,user_id,plan_id,status,amount_cents,currency,idempotency_key) SELECT $1,$2,id,'pending',price_cents,currency,$4 FROM plans WHERE tenant_id=$1 AND id=$3 AND status='active' RETURNING id,status,amount_cents,currency,created_at::text AS created_at,paid_at::text AS paid_at, (SELECT name FROM plans WHERE tenant_id=$1 AND id=$3) AS plan";
 const CREATE_ORDER_IDEMPOTENT_SQL: &str = "INSERT INTO orders (tenant_id,user_id,plan_id,status,amount_cents,currency,provider,idempotency_key) SELECT $1,$2,id,'pending',price_cents,currency,'manual',$3 FROM plans WHERE tenant_id=$1 AND id=$4 AND status='active' RETURNING id,user_id,plan_id,status,amount_cents,currency,provider,provider_payment_id,paid_at::text AS paid_at";
 
 pub type DatabaseResult<T> = Result<T, DatabaseError>;
+
+fn sha256_hex(payload: &[u8]) -> String {
+    Sha256::digest(payload)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn deployment_status_from_phase(phase: &str) -> &'static str {
+    match phase {
+        "applied" => "applied",
+        "rolled_back" => "rolled_back",
+        _ => "failed",
+    }
+}
+
+fn truncate_chars(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
 
 pub fn hash_session_token(token: &str) -> String {
     Sha256::digest(token.as_bytes())
@@ -47,6 +67,12 @@ pub enum DatabaseError {
     BootstrapAdminEmailConflict,
     #[error("device limit exceeded")]
     DeviceLimitExceeded,
+    #[error("configuration revision conflict: {0}")]
+    ConfigConflict(&'static str),
+    #[error("configuration revision not found")]
+    ConfigRevisionNotFound,
+    #[error("no applied rollback target")]
+    NoRollbackTarget,
 }
 
 impl DatabaseError {
@@ -82,22 +108,16 @@ impl Database {
 
     pub async fn create_session_with_refresh(
         &self,
-        tenant_id: Uuid,
-        user_id: Uuid,
-        access_token: &str,
-        refresh_token: &str,
-        role: &str,
-        access_ttl_seconds: i64,
-        refresh_ttl_seconds: i64,
+        input: SessionWithRefreshInput<'_>,
     ) -> DatabaseResult<()> {
         sqlx::query("INSERT INTO sessions(tenant_id,user_id,token_hash,role,expires_at,refresh_token_hash,refresh_expires_at) VALUES($1,$2,$3,$4,now()+make_interval(secs=>$5),$6,now()+make_interval(secs=>$7))")
-            .bind(tenant_id)
-            .bind(user_id)
-            .bind(hash_session_token(access_token))
-            .bind(role)
-            .bind(access_ttl_seconds as f64)
-            .bind(hash_session_token(refresh_token))
-            .bind(refresh_ttl_seconds as f64)
+            .bind(input.tenant_id)
+            .bind(input.user_id)
+            .bind(hash_session_token(input.access_token))
+            .bind(input.role)
+            .bind(input.access_ttl_seconds as f64)
+            .bind(hash_session_token(input.refresh_token))
+            .bind(input.refresh_ttl_seconds as f64)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -245,6 +265,10 @@ impl Database {
     /// without changing the API/repository boundary.
     pub async fn migrate(&self) -> DatabaseResult<()> {
         let mut transaction = self.pool.begin().await?;
+        // Serialize schema bootstrap across API and Worker processes.
+        sqlx::query("SELECT pg_advisory_xact_lock(731904218661)")
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS cyberboard_schema_migrations (
                 version TEXT PRIMARY KEY,
@@ -430,6 +454,21 @@ impl Database {
                 .await?;
             sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
                 .bind("0012_session_refresh")
+                .execute(&mut *transaction)
+                .await?;
+        }
+
+        let thirteenth: Option<String> =
+            sqlx::query_scalar("SELECT version FROM cyberboard_schema_migrations WHERE version=$1")
+                .bind("0013_config_deployment_lifecycle")
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if thirteenth.is_none() {
+            sqlx::raw_sql(THIRTEENTH_MIGRATION)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
+                .bind("0013_config_deployment_lifecycle")
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -1524,7 +1563,7 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> DatabaseResult<Vec<ConfigRevisionRecord>> {
-        let rows = sqlx::query("SELECT r.id,COALESCE(r.template_id::text,'') AS template_id,r.node_id,n.name AS node_name,r.generation,r.core_version,r.content_hash,CASE WHEN r.signature='' THEN 'pending' ELSE 'valid' END AS signature_status,r.validation_status,r.publish_status,r.failure_reason,r.created_at::text AS created_at FROM config_revisions r JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id WHERE r.tenant_id=$1 ORDER BY r.created_at DESC,r.id LIMIT $2 OFFSET $3")
+        let rows = sqlx::query("SELECT r.id,COALESCE(r.template_id::text,'') AS template_id,r.node_id,n.name AS node_name,r.generation,r.core_version,r.content_hash,CASE WHEN r.signature='' THEN 'pending' ELSE 'valid' END AS signature_status,r.validation_status,r.publish_status,r.failure_reason,r.created_at::text AS created_at,d.status AS deployment_status,d.kind AS deployment_kind,d.error_code AS deployment_error_code,d.error_message AS deployment_error_message,d.updated_at::text AS deployment_updated_at,r.rollback_of FROM config_revisions r JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id LEFT JOIN LATERAL (SELECT status,kind,error_code,error_message,updated_at FROM config_deployments WHERE tenant_id=r.tenant_id AND config_revision_id=r.id ORDER BY created_at DESC,id DESC LIMIT 1) d ON TRUE WHERE r.tenant_id=$1 ORDER BY r.created_at DESC,r.id LIMIT $2 OFFSET $3")
             .bind(tenant_id).bind(limit).bind(offset).fetch_all(&self.pool).await?;
         Ok(rows
             .into_iter()
@@ -1534,16 +1573,10 @@ impl Database {
 
     pub async fn create_config_revision(
         &self,
-        tenant_id: Uuid,
-        template_id: Uuid,
-        node_id: Uuid,
-        generation: i64,
-        core_version: &str,
-        payload: &serde_json::Value,
-        content_hash: &str,
+        input: ConfigRevisionCreateInput<'_>,
     ) -> DatabaseResult<Option<ConfigRevisionRecord>> {
         let row = sqlx::query("INSERT INTO config_revisions (tenant_id,template_id,node_id,generation,core_type,core_version,content_hash,signature,validation_status,publish_status,payload) SELECT $1,$2,$3,$4,t.core_type,$5,$6,'','validated','draft',$7 FROM config_templates t JOIN nodes n ON n.tenant_id=$1 AND n.id=$3 WHERE t.tenant_id=$1 AND t.id=$2 AND t.status <> 'archived' RETURNING id,COALESCE(template_id::text,'') AS template_id,node_id,generation,core_version,content_hash,'pending' AS signature_status,validation_status,publish_status,failure_reason,created_at::text AS created_at")
-            .bind(tenant_id).bind(template_id).bind(node_id).bind(generation).bind(core_version).bind(content_hash).bind(payload).fetch_optional(&self.pool).await?;
+            .bind(input.tenant_id).bind(input.template_id).bind(input.node_id).bind(input.generation).bind(input.core_version).bind(input.content_hash).bind(input.payload).fetch_optional(&self.pool).await?;
         Ok(row.map(ConfigRevisionRecord::from_row))
     }
 
@@ -1579,74 +1612,198 @@ impl Database {
         )
     }
 
-    pub async fn set_config_publish_status(
+    pub async fn publish_config_revision(
         &self,
-        tenant_id: Uuid,
-        id: Uuid,
-        expected_generation: i64,
-        status: &str,
-        expected_previous_hash: Option<&str>,
-        signed_envelope: Option<&str>,
+        input: ConfigPublishInput<'_>,
     ) -> DatabaseResult<Option<ConfigRevisionRecord>> {
         let mut tx = self.pool.begin().await?;
-        let revision = sqlx::query("SELECT id,template_id,node_id,generation,core_version,content_hash,validation_status,publish_status,failure_reason,created_at::text AS created_at FROM config_revisions WHERE tenant_id=$1 AND id=$2 FOR UPDATE")
-            .bind(tenant_id).bind(id).fetch_optional(&mut *tx).await?;
+        let revision = sqlx::query(
+            "SELECT id,template_id,node_id,generation,core_version,content_hash,validation_status,publish_status,failure_reason,created_at::text AS created_at
+             FROM config_revisions WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
+        )
+        .bind(input.tenant_id)
+        .bind(input.revision_id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let Some(revision) = revision else {
             tx.rollback().await?;
             return Ok(None);
         };
         let node_id: Uuid = revision.get("node_id");
-        let current: Option<Uuid> = sqlx::query_scalar(
+        let node = sqlx::query(
             "SELECT current_config_revision FROM nodes WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
         )
-        .bind(tenant_id)
+        .bind(input.tenant_id)
         .bind(node_id)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
-        let current_hash: Option<String> = if let Some(current_id) = current {
-            sqlx::query_scalar(
-                "SELECT content_hash FROM config_revisions WHERE tenant_id=$1 AND id=$2",
-            )
-            .bind(tenant_id)
-            .bind(current_id)
-            .fetch_optional(&mut *tx)
-            .await?
+        let Some(node) = node else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let current_id: Option<Uuid> = node.get("current_config_revision");
+        let current = if let Some(current_id) = current_id {
+            sqlx::query("SELECT id,generation,content_hash FROM config_revisions WHERE tenant_id=$1 AND id=$2")
+                .bind(input.tenant_id).bind(current_id).fetch_optional(&mut *tx).await?
         } else {
             None
         };
-        if revision.get::<i64, _>("generation") != expected_generation
-            || revision.get::<String, _>("validation_status") != "validated"
-            || expected_previous_hash
-                .is_some_and(|expected| current_hash.as_deref() != Some(expected))
+        let generation: i64 = revision.get("generation");
+        let validation: String = revision.get("validation_status");
+        let publish_status: String = revision.get("publish_status");
+        let conflict = if generation != input.expected_generation {
+            Some("generation_mismatch")
+        } else if validation != "validated" {
+            Some("not_validated")
+        } else if publish_status != "draft" {
+            Some("already_published")
+        } else if current
+            .as_ref()
+            .is_some_and(|row| generation <= row.get::<i64, _>("generation"))
         {
-            tx.rollback().await?;
-            return Ok(None);
-        }
-        let target_revision = if status == "rolled_back" {
-            sqlx::query_scalar::<_, Uuid>(
-                "SELECT id FROM config_revisions
-                 WHERE tenant_id=$1 AND node_id=$2 AND generation < $3
-                   AND publish_status='published'
-                 ORDER BY generation DESC LIMIT 1",
-            )
-            .bind(tenant_id)
-            .bind(node_id)
-            .bind(expected_generation)
-            .fetch_optional(&mut *tx)
-            .await?
+            Some("stale_generation")
+        } else if input.expected_previous_hash.is_some_and(|expected| {
+            current
+                .as_ref()
+                .and_then(|row| row.try_get::<String, _>("content_hash").ok())
+                .unwrap_or_default()
+                != expected
+        }) {
+            Some("previous_hash_mismatch")
         } else {
-            Some(id)
+            None
         };
-        let Some(target_revision) = target_revision else {
+        if let Some(code) = conflict {
             tx.rollback().await?;
-            return Ok(None);
-        };
-        sqlx::query("UPDATE config_revisions SET publish_status=$3,failure_reason=NULL,signature=COALESCE($4,signature) WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(id).bind(status).bind(signed_envelope).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO config_deployments(tenant_id,config_revision_id,node_id,status,expected_generation,applied_generation) VALUES($1,$2,$3,$4,$5,$5)").bind(tenant_id).bind(target_revision).bind(node_id).bind(if status=="published" {"applied"} else {"rolled_back"}).bind(expected_generation).execute(&mut *tx).await?;
-        sqlx::query("UPDATE nodes SET current_config_revision=$3,updated_at=now() WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(node_id).bind(Some(target_revision)).execute(&mut *tx).await?;
-        let row = sqlx::query("SELECT r.id,COALESCE(r.template_id::text,'') AS template_id,r.node_id,n.name AS node_name,r.generation,r.core_version,r.content_hash,CASE WHEN r.signature='' THEN 'pending' ELSE 'valid' END AS signature_status,r.validation_status,r.publish_status,r.failure_reason,r.created_at::text AS created_at FROM config_revisions r JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id WHERE r.tenant_id=$1 AND r.id=$2").bind(tenant_id).bind(id).fetch_one(&mut *tx).await?;
+            return Err(DatabaseError::ConfigConflict(code));
+        }
+        sqlx::query("UPDATE config_revisions SET publish_status='published',failure_reason=NULL,signature=$3 WHERE tenant_id=$1 AND id=$2")
+            .bind(input.tenant_id).bind(input.revision_id).bind(input.signed_envelope).execute(&mut *tx).await?;
+        sqlx::query("UPDATE nodes SET current_config_revision=$3,updated_at=now() WHERE tenant_id=$1 AND id=$2")
+            .bind(input.tenant_id).bind(node_id).bind(input.revision_id).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO config_deployments(tenant_id,config_revision_id,node_id,kind,status,expected_generation,actor_user_id) VALUES($1,$2,$3,'publish','pending',$4,$5)")
+            .bind(input.tenant_id).bind(input.revision_id).bind(node_id).bind(generation).bind(input.actor_user_id).execute(&mut *tx).await?;
+        let details = serde_json::json!({"nodeId":node_id,"generation":generation,"contentHash":revision.get::<String,_>("content_hash"),"previousRevisionId":current_id});
+        Self::insert_audit_in_tx(
+            &mut tx,
+            input.tenant_id,
+            input.actor_user_id,
+            "config.publish",
+            "config_revision",
+            input.revision_id,
+            &details,
+        )
+        .await?;
+        let row = sqlx::query("SELECT r.id,COALESCE(r.template_id::text,'') AS template_id,r.node_id,n.name AS node_name,r.generation,r.core_version,r.content_hash,CASE WHEN r.signature='' THEN 'pending' ELSE 'valid' END AS signature_status,r.validation_status,r.publish_status,r.failure_reason,r.created_at::text AS created_at,r.rollback_of,(SELECT status FROM config_deployments d WHERE d.tenant_id=r.tenant_id AND d.config_revision_id=r.id ORDER BY d.created_at DESC,d.id DESC LIMIT 1) AS deployment_status,(SELECT kind FROM config_deployments d WHERE d.tenant_id=r.tenant_id AND d.config_revision_id=r.id ORDER BY d.created_at DESC,d.id DESC LIMIT 1) AS deployment_kind,(SELECT error_code FROM config_deployments d WHERE d.tenant_id=r.tenant_id AND d.config_revision_id=r.id ORDER BY d.created_at DESC,d.id DESC LIMIT 1) AS deployment_error_code,(SELECT error_message FROM config_deployments d WHERE d.tenant_id=r.tenant_id AND d.config_revision_id=r.id ORDER BY d.created_at DESC,d.id DESC LIMIT 1) AS deployment_error_message,(SELECT updated_at::text FROM config_deployments d WHERE d.tenant_id=r.tenant_id AND d.config_revision_id=r.id ORDER BY d.created_at DESC,d.id DESC LIMIT 1) AS deployment_updated_at FROM config_revisions r JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id WHERE r.tenant_id=$1 AND r.id=$2")
+            .bind(input.tenant_id).bind(input.revision_id).fetch_one(&mut *tx).await?;
         tx.commit().await?;
         Ok(Some(ConfigRevisionRecord::from_row(row)))
+    }
+
+    pub async fn insert_audit_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tenant_id: Uuid,
+        actor_user_id: Uuid,
+        action: &str,
+        resource_type: &str,
+        resource_id: Uuid,
+        details: &serde_json::Value,
+    ) -> DatabaseResult<()> {
+        sqlx::query("INSERT INTO audit_logs(tenant_id,actor_user_id,action,resource_type,resource_id,details) VALUES($1,NULLIF($2,$3),$4,$5,$6,$7)")
+            .bind(tenant_id).bind(actor_user_id).bind(Uuid::nil()).bind(action).bind(resource_type).bind(resource_id).bind(details)
+            .execute(&mut **tx).await?;
+        Ok(())
+    }
+
+    pub async fn rollback_config_revision(
+        &self,
+        input: ConfigRollbackInput<'_>,
+    ) -> DatabaseResult<Option<ConfigRevisionRecord>> {
+        let mut tx = self.pool.begin().await?;
+        let node_row = sqlx::query("SELECT node_id,current_config_revision FROM nodes n JOIN config_revisions r ON r.tenant_id=n.tenant_id AND r.node_id=n.id WHERE n.tenant_id=$1 AND n.current_config_revision=$2 FOR UPDATE OF n")
+            .bind(input.tenant_id).bind(input.revision_id).fetch_optional(&mut *tx).await?;
+        let Some(node_row) = node_row else {
+            tx.rollback().await?;
+            return Err(DatabaseError::ConfigConflict("not_current_desired"));
+        };
+        let node_id: Uuid = node_row.get("node_id");
+        let current = sqlx::query(
+            "SELECT generation,publish_status FROM config_revisions WHERE tenant_id=$1 AND id=$2",
+        )
+        .bind(input.tenant_id)
+        .bind(input.revision_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let from_generation: i64 = current.get("generation");
+        if from_generation != input.expected_generation {
+            tx.rollback().await?;
+            return Err(DatabaseError::ConfigConflict("generation_mismatch"));
+        }
+        if current.get::<String, _>("publish_status") != "published" {
+            tx.rollback().await?;
+            return Err(DatabaseError::ConfigConflict("not_published"));
+        }
+        let target = sqlx::query("SELECT r.id,r.generation,r.template_id,r.core_type,r.core_version,r.payload,r.content_hash FROM config_revisions r WHERE r.tenant_id=$1 AND r.node_id=$2 AND r.generation<$3 AND (SELECT d.status FROM config_deployments d WHERE d.tenant_id=r.tenant_id AND d.config_revision_id=r.id ORDER BY d.created_at DESC LIMIT 1)='applied' ORDER BY r.generation DESC LIMIT 1")
+            .bind(input.tenant_id).bind(node_id).bind(from_generation).fetch_optional(&mut *tx).await?;
+        let Some(target) = target else {
+            tx.rollback().await?;
+            return Err(DatabaseError::NoRollbackTarget);
+        };
+        let target_id: Uuid = target.get("id");
+        let max_generation: i64 = sqlx::query_scalar("SELECT COALESCE(max(generation),0) FROM config_revisions WHERE tenant_id=$1 AND node_id=$2")
+            .bind(input.tenant_id).bind(node_id).fetch_one(&mut *tx).await?;
+        let new_generation = max_generation + 1;
+        let target_payload: serde_json::Value = target.get("payload");
+        let target_bytes = serde_json::to_vec(&target_payload).unwrap_or_default();
+        let target_hash: String = target.get("content_hash");
+        if sha256_hex(&target_bytes) != target_hash {
+            tx.rollback().await?;
+            return Err(DatabaseError::ConfigConflict(
+                "rollback_target_hash_mismatch",
+            ));
+        }
+        let signed_envelope = (input.sign)(node_id, new_generation as u64, target_bytes);
+        let new_id: Uuid = sqlx::query_scalar("INSERT INTO config_revisions(tenant_id,template_id,node_id,generation,core_type,core_version,content_hash,signature,validation_status,publish_status,payload,rollback_of) SELECT $1,template_id,node_id,$2,core_type,core_version,content_hash,$3,'validated','published',payload,$4 FROM config_revisions WHERE tenant_id=$1 AND id=$4 RETURNING id")
+            .bind(input.tenant_id).bind(new_generation).bind(signed_envelope).bind(target_id).fetch_one(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE config_revisions SET publish_status='rolled_back' WHERE tenant_id=$1 AND id=$2",
+        )
+        .bind(input.tenant_id)
+        .bind(input.revision_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE nodes SET current_config_revision=$3,updated_at=now() WHERE tenant_id=$1 AND id=$2")
+            .bind(input.tenant_id).bind(node_id).bind(new_id).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO config_deployments(tenant_id,config_revision_id,node_id,kind,status,expected_generation,actor_user_id) VALUES($1,$2,$3,'rollback','pending',$4,$5)")
+            .bind(input.tenant_id).bind(new_id).bind(node_id).bind(new_generation).bind(input.actor_user_id).execute(&mut *tx).await?;
+        let details = serde_json::json!({"nodeId":node_id,"fromRevisionId":input.revision_id,"fromGeneration":from_generation,"targetRevisionId":target_id,"targetGeneration":target.get::<i64,_>("generation"),"newRevisionId":new_id,"newGeneration":new_generation,"reason":input.reason});
+        Self::insert_audit_in_tx(
+            &mut tx,
+            input.tenant_id,
+            input.actor_user_id,
+            "config.rollback",
+            "config_revision",
+            new_id,
+            &details,
+        )
+        .await?;
+        let row = sqlx::query("SELECT r.id,COALESCE(r.template_id::text,'') AS template_id,r.node_id,n.name AS node_name,r.generation,r.core_version,r.content_hash,CASE WHEN r.signature='' THEN 'pending' ELSE 'valid' END AS signature_status,r.validation_status,r.publish_status,r.failure_reason,r.created_at::text AS created_at,r.rollback_of,(SELECT status FROM config_deployments d WHERE d.tenant_id=r.tenant_id AND d.config_revision_id=r.id ORDER BY d.created_at DESC,d.id DESC LIMIT 1) AS deployment_status,(SELECT kind FROM config_deployments d WHERE d.tenant_id=r.tenant_id AND d.config_revision_id=r.id ORDER BY d.created_at DESC,d.id DESC LIMIT 1) AS deployment_kind,(SELECT error_code FROM config_deployments d WHERE d.tenant_id=r.tenant_id AND d.config_revision_id=r.id ORDER BY d.created_at DESC,d.id DESC LIMIT 1) AS deployment_error_code,(SELECT error_message FROM config_deployments d WHERE d.tenant_id=r.tenant_id AND d.config_revision_id=r.id ORDER BY d.created_at DESC,d.id DESC LIMIT 1) AS deployment_error_message,(SELECT updated_at::text FROM config_deployments d WHERE d.tenant_id=r.tenant_id AND d.config_revision_id=r.id ORDER BY d.created_at DESC,d.id DESC LIMIT 1) AS deployment_updated_at FROM config_revisions r JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id WHERE r.tenant_id=$1 AND r.id=$2")
+            .bind(input.tenant_id).bind(new_id).fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(Some(ConfigRevisionRecord::from_row(row)))
+    }
+
+    #[deprecated(note = "use publish_config_revision or rollback_config_revision")]
+    pub async fn set_config_publish_status(
+        &self,
+        _tenant_id: Uuid,
+        _id: Uuid,
+        _expected_generation: i64,
+        _status: &str,
+        _expected_previous_hash: Option<&str>,
+        _signed_envelope: Option<&str>,
+    ) -> DatabaseResult<Option<ConfigRevisionRecord>> {
+        Err(DatabaseError::ConfigConflict("legacy API is disabled"))
     }
 
     pub async fn create_order_idempotent(
@@ -1867,6 +2024,25 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn desired_generation_for_agent(
+        &self,
+        tenant_id: Uuid,
+        agent_id: &str,
+        node_id: Uuid,
+    ) -> DatabaseResult<Option<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT r.generation FROM nodes n
+             JOIN config_revisions r ON r.tenant_id=n.tenant_id AND r.id=n.current_config_revision
+             WHERE n.tenant_id=$1 AND n.id=$2 AND n.agent_id=$3
+               AND r.publish_status='published' AND r.validation_status='validated'",
+        )
+        .bind(tenant_id)
+        .bind(node_id)
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     pub async fn desired_state_for_agent(
         &self,
         tenant_id: Uuid,
@@ -1874,18 +2050,14 @@ impl Database {
         node_id: Uuid,
     ) -> DatabaseResult<Option<DesiredConfigRecord>> {
         let row = sqlx::query(
-            "SELECT r.generation,r.core_type,r.core_version,r.payload,r.content_hash,
-                    r.signature,r.created_at::text AS issued_at,
-                    COALESCE(prev.content_hash,'') AS expected_previous_hash
+            "SELECT r.id AS revision_id,r.node_id,r.generation,r.core_type,r.core_version,r.payload,r.content_hash,
+                    COALESCE(applied.content_hash,'') AS expected_previous_hash
              FROM nodes n
              JOIN config_revisions r ON r.tenant_id=n.tenant_id AND r.id=n.current_config_revision
-             LEFT JOIN config_revisions prev ON prev.tenant_id=r.tenant_id
-                    AND prev.node_id=r.node_id AND prev.generation < r.generation
-                    AND prev.publish_status='published'
+             LEFT JOIN config_revisions applied
+               ON applied.tenant_id=n.tenant_id AND applied.id=n.applied_config_revision
              WHERE n.tenant_id=$1 AND n.id=$2 AND n.agent_id=$3
-               AND r.publish_status='published' AND r.validation_status='validated'
-             ORDER BY prev.generation DESC NULLS LAST
-             LIMIT 1",
+               AND r.publish_status='published' AND r.validation_status='validated'",
         )
         .bind(tenant_id)
         .bind(node_id)
@@ -1895,72 +2067,47 @@ impl Database {
         let Some(row) = row else {
             return Ok(None);
         };
-        let signature: String = row.get("signature");
-        if signature.is_empty() {
-            return Ok(None);
-        }
         let payload: serde_json::Value = row.get("payload");
         Ok(Some(DesiredConfigRecord {
+            revision_id: row.get("revision_id"),
+            node_id: row.get("node_id"),
             generation: row.get("generation"),
             core_type: row.get("core_type"),
             core_version: row.get("core_version"),
             payload: serde_json::to_vec(&payload).unwrap_or_default(),
             content_hash: row.get("content_hash"),
-            signature,
-            issued_at: row.get("issued_at"),
             expected_previous_hash: row.get("expected_previous_hash"),
         }))
     }
 
     pub async fn record_agent_apply_result(
         &self,
-        tenant_id: Uuid,
-        agent_id: &str,
-        node_id: Uuid,
-        generation: i64,
-        phase: &str,
-        error_code: &str,
-        error_message: &str,
+        input: AgentApplyResultInput<'_>,
     ) -> DatabaseResult<bool> {
-        let status = match phase {
-            "applied" | "succeeded" => "applied",
-            "rolled_back" => "rolled_back",
-            _ => "failed",
-        };
-        let error_detail = match (error_code.trim(), error_message.trim()) {
-            ("", message) => message.to_owned(),
-            (code, "") => code.to_owned(),
-            (code, message) => format!("{code}: {message}"),
-        };
-        let result = sqlx::query(
-            "UPDATE config_deployments d SET status=$5,error_code=NULLIF($6,''),updated_at=now()
-             FROM config_revisions r
-             JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id
-             WHERE d.tenant_id=$1 AND d.node_id=$2 AND n.agent_id=$3
-               AND r.id=d.config_revision_id AND r.generation=$4",
-        )
-        .bind(tenant_id)
-        .bind(node_id)
-        .bind(agent_id)
-        .bind(generation)
-        .bind(status)
-        .bind(error_detail)
-        .execute(&self.pool)
-        .await?;
+        let status = deployment_status_from_phase(input.phase);
+        let message = truncate_chars(input.error_message, 512);
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query("UPDATE config_deployments d SET status=$5,error_code=NULLIF($6,''),error_message=NULLIF($7,''),previous_hash=NULLIF($8,''),applied_hash=NULLIF($9,''),retry_count=$10,reported_at=now(),updated_at=now(),applied_generation=CASE WHEN $5='applied' THEN $4 ELSE d.applied_generation END FROM config_revisions r JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id WHERE d.tenant_id=$1 AND d.node_id=$2 AND n.agent_id=$3 AND r.id=d.config_revision_id AND r.generation=$4 AND d.id=(SELECT d2.id FROM config_deployments d2 WHERE d2.tenant_id=d.tenant_id AND d2.node_id=d.node_id AND d2.config_revision_id=d.config_revision_id ORDER BY d2.created_at DESC,d2.id DESC LIMIT 1)")
+            .bind(input.tenant_id).bind(input.node_id).bind(input.agent_id).bind(input.generation).bind(status).bind(input.error_code).bind(message).bind(input.previous_hash).bind(input.applied_hash).bind(input.retry_count).execute(&mut *tx).await?;
+        if result.rows_affected() == 1 && status == "applied" {
+            sqlx::query("UPDATE nodes SET applied_config_revision=r.id,applied_generation=$3,applied_at=now(),updated_at=now() FROM config_revisions r WHERE nodes.tenant_id=$1 AND nodes.id=$2 AND r.tenant_id=$1 AND r.node_id=$2 AND r.generation=$3")
+                .bind(input.tenant_id).bind(input.node_id).bind(input.generation).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn ingest_agent_usage(
-        &self,
-        tenant_id: Uuid,
-        agent_id: &str,
-        node_id: Uuid,
-        batch_id: &str,
-        sequence: i64,
-        window_start: i64,
-        window_end: i64,
-        payload: &serde_json::Value,
-    ) -> DatabaseResult<bool> {
+    pub async fn ingest_agent_usage(&self, input: AgentUsageInput<'_>) -> DatabaseResult<bool> {
+        let AgentUsageInput {
+            tenant_id,
+            agent_id,
+            node_id,
+            batch_id,
+            sequence,
+            window_start,
+            window_end,
+            payload,
+        } = input;
         if batch_id.trim().is_empty() || window_end <= window_start {
             return Err(DatabaseError::InvalidUsagePayload(
                 "batch_id and usage window are required".to_owned(),
@@ -2067,14 +2214,17 @@ impl Database {
 
     pub async fn record_agent_upgrade_result(
         &self,
-        tenant_id: Uuid,
-        node_id: Uuid,
-        agent_id: &str,
-        target_version: &str,
-        success: bool,
-        error_code: Option<&str>,
-        error_message: Option<&str>,
+        input: AgentUpgradeResultInput<'_>,
     ) -> DatabaseResult<()> {
+        let AgentUpgradeResultInput {
+            tenant_id,
+            node_id,
+            agent_id,
+            target_version,
+            success,
+            error_code,
+            error_message,
+        } = input;
         sqlx::query(
             "INSERT INTO agent_upgrade_results
                 (tenant_id,node_id,agent_id,target_version,success,error_code,error_message)
@@ -2314,13 +2464,13 @@ pub struct AgentHeartbeatInput {
 
 #[derive(Clone, Debug)]
 pub struct DesiredConfigRecord {
+    pub revision_id: Uuid,
+    pub node_id: Uuid,
     pub generation: i64,
     pub core_type: String,
     pub core_version: String,
     pub payload: Vec<u8>,
     pub content_hash: String,
-    pub signature: String,
-    pub issued_at: String,
     pub expected_previous_hash: String,
 }
 
@@ -2639,6 +2789,12 @@ pub struct ConfigRevisionRecord {
     pub publish_status: String,
     pub failure_reason: Option<String>,
     pub created_at: String,
+    pub deployment_status: Option<String>,
+    pub deployment_kind: Option<String>,
+    pub deployment_error_code: Option<String>,
+    pub deployment_error_message: Option<String>,
+    pub deployment_updated_at: Option<String>,
+    pub rollback_of: Option<Uuid>,
 }
 
 #[derive(Clone, Debug)]
@@ -2665,6 +2821,12 @@ impl ConfigRevisionRecord {
             publish_status: row.get("publish_status"),
             failure_reason: row.try_get("failure_reason").ok(),
             created_at: row.get("created_at"),
+            deployment_status: row.try_get("deployment_status").ok().flatten(),
+            deployment_kind: row.try_get("deployment_kind").ok().flatten(),
+            deployment_error_code: row.try_get("deployment_error_code").ok().flatten(),
+            deployment_error_message: row.try_get("deployment_error_message").ok().flatten(),
+            deployment_updated_at: row.try_get("deployment_updated_at").ok().flatten(),
+            rollback_of: row.try_get("rollback_of").ok().flatten(),
         }
     }
 }
@@ -2687,9 +2849,20 @@ impl SubscriptionRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::{CREATE_ORDER_IDEMPOTENT_SQL, CREATE_ORDER_SQL, DatabaseError, parse_usage_events};
+    use super::{
+        CREATE_ORDER_IDEMPOTENT_SQL, CREATE_ORDER_SQL, DatabaseError, deployment_status_from_phase,
+        parse_usage_events,
+    };
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn apply_phases_map_to_deployment_statuses() {
+        assert_eq!(deployment_status_from_phase("applied"), "applied");
+        assert_eq!(deployment_status_from_phase("rolled_back"), "rolled_back");
+        assert_eq!(deployment_status_from_phase("rejected"), "failed");
+        assert_eq!(deployment_status_from_phase("unknown"), "failed");
+    }
 
     #[test]
     fn order_creation_queries_only_select_active_plans() {

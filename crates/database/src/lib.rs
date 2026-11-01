@@ -1613,19 +1613,26 @@ impl Database {
         .bind(token)
         .fetch_all(&self.pool)
         .await?;
+        let credentials = match rows.first().map(|row| row.get::<Uuid, _>("user_id")) {
+            Some(user_id) => Some(
+                self.ensure_user_proxy_credentials(tenant_id, user_id)
+                    .await?,
+            ),
+            None => None,
+        };
         let mut records = Vec::with_capacity(rows.len());
         for row in rows {
             let user_id: Uuid = row.get("user_id");
             let payload = row.try_get("payload").unwrap_or(None);
             let node = NodeRecord::from_row(row);
-            let credentials = self
-                .ensure_user_proxy_credentials(tenant_id, user_id)
-                .await?;
+            let Some(user_credentials) = credentials.as_ref() else {
+                continue;
+            };
             records.push(SubscriptionNodeConfigRecord {
                 node,
                 user_id,
                 payload,
-                credentials,
+                credentials: user_credentials.clone(),
             });
         }
         Ok(records)
@@ -2779,10 +2786,24 @@ fn refresh_payload_users(
     else {
         return Ok(());
     };
-    for inbound in inbounds {
-        let Some(inbound_type) = inbound.get("type").and_then(serde_json::Value::as_str) else {
+    let mut index = 0;
+    while index < inbounds.len() {
+        let inbound_type = inbounds[index]
+            .get("type")
+            .and_then(serde_json::Value::as_str);
+        let Some(inbound_type) = inbound_type else {
+            index += 1;
             continue;
         };
+        if credentials.is_empty()
+            && matches!(
+                inbound_type,
+                "vless" | "vmess" | "trojan" | "shadowsocks" | "mixed"
+            )
+        {
+            inbounds.remove(index);
+            continue;
+        }
         let users = match inbound_type {
             "vless" => credentials
                 .iter()
@@ -2815,7 +2836,7 @@ fn refresh_payload_users(
                 })
                 .collect::<Vec<_>>(),
             "shadowsocks" => {
-                let method = inbound
+                let method = inbounds[index]
                     .get("method")
                     .and_then(serde_json::Value::as_str)
                     .ok_or(DatabaseError::ConfigConflict("invalid_payload"))?;
@@ -2852,9 +2873,13 @@ fn refresh_payload_users(
                     })
                 })
                 .collect::<Vec<_>>(),
-            _ => continue,
+            _ => {
+                index += 1;
+                continue;
+            }
         };
-        inbound["users"] = serde_json::Value::Array(users);
+        inbounds[index]["users"] = serde_json::Value::Array(users);
+        index += 1;
     }
     let stats_users = payload
         .get("inbounds")

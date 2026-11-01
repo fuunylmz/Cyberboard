@@ -749,6 +749,23 @@ mod tests {
     }
 
     #[test]
+    fn checks_config_after_all_authenticated_inbounds_are_removed() {
+        let empty_config = json!({
+            "log": {"level": "error"},
+            "inbounds": [],
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "route": {"final": "direct"},
+            "experimental": {
+                "v2ray_api": {
+                    "listen": V2RAY_API_LISTEN,
+                    "stats": {"enabled": true, "users": []}
+                }
+            }
+        });
+        check_with_sing_box(&empty_config);
+    }
+
+    #[test]
     fn merges_other_experimental_fields_but_owns_v2ray_api() {
         let mut profile = profile();
         profile.experimental =
@@ -782,17 +799,23 @@ mod tests {
         let (server_port, client_port) = match protocol {
             "vless" => (18110, 18111),
             "shadowsocks" => (18112, 18113),
+            "shadowsocks-legacy" => (18116, 18117),
             "trojan" => (18114, 18115),
             _ => unreachable!(),
         };
+        let inbound_type = if protocol == "shadowsocks-legacy" {
+            "shadowsocks"
+        } else {
+            protocol
+        };
         let mut server_inbound = json!({
-            "type": protocol,
+            "type": inbound_type,
             "tag": "proxy-in",
             "listen": "127.0.0.1",
             "listen_port": server_port,
         });
         let mut client_outbound = json!({
-            "type": protocol,
+            "type": inbound_type,
             "tag": "proxy-out",
             "server": "127.0.0.1",
             "server_port": server_port,
@@ -809,6 +832,13 @@ mod tests {
                 client_outbound["method"] = json!("2022-blake3-aes-128-gcm");
                 client_outbound["password"] =
                     json!(format!("{server_password}:{user_ss_password}"));
+            }
+            "shadowsocks-legacy" => {
+                server_inbound["method"] = json!("aes-256-gcm");
+                server_inbound["password"] = json!(server_password);
+                server_inbound["users"] = json!([{"name": user_id, "password": user_ss_password}]);
+                client_outbound["method"] = json!("aes-256-gcm");
+                client_outbound["password"] = json!(user_ss_password);
             }
             "trojan" => {
                 let temp = std::env::temp_dir();
@@ -919,7 +949,7 @@ mod tests {
         let Some(binary) = sing_box_binary() else {
             return;
         };
-        for protocol in ["vless", "shadowsocks", "trojan"] {
+        for protocol in ["vless", "shadowsocks", "shadowsocks-legacy", "trojan"] {
             run_proxy_round_trip(&binary, protocol);
         }
     }

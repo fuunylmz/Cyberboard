@@ -295,4 +295,41 @@ async fn rollback_rebuilds_users_from_current_assignments() {
         user_two.id.to_string()
     );
     assert_ne!(users[0]["name"], user_one.id.to_string());
+
+    database
+        .delete_subscription(tenant_id, actor_id, subscription_two.id)
+        .await
+        .unwrap();
+    let empty_payload = payload("empty");
+    let empty_revision = database
+        .create_config_revision(ConfigRevisionCreateInput {
+            tenant_id,
+            template_id: template.id,
+            node_id: node.id,
+            generation: 5,
+            core_version: "1.14.4",
+            content_hash: &hash(&empty_payload),
+            payload: &empty_payload,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    database
+        .publish_config_revision(ConfigPublishInput {
+            tenant_id,
+            revision_id: empty_revision.id,
+            expected_generation: 5,
+            expected_previous_hash: None,
+            sign: &|_, _, _| "signed".into(),
+            actor_user_id: actor_id,
+        })
+        .await
+        .unwrap();
+    let published_empty = database
+        .config_revision_for_signing(tenant_id, empty_revision.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .payload;
+    assert!(published_empty["inbounds"].as_array().unwrap().is_empty());
 }

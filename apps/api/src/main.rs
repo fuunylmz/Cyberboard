@@ -2337,10 +2337,14 @@ fn applied_subscription_outbound(
     user_id: Uuid,
     credentials: &cyberboard_database::ProxyCredentialsRecord,
 ) -> Option<Value> {
-    let inbounds = payload.get("inbounds")?.as_array()?;
+    let inbounds = payload.get("inbounds").and_then(Value::as_array)?;
     for inbound in inbounds {
-        let inbound_type = inbound.get("type")?.as_str()?;
-        let users = inbound.get("users").and_then(Value::as_array)?;
+        let Some(inbound_type) = inbound.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(users) = inbound.get("users").and_then(Value::as_array) else {
+            continue;
+        };
         let method = inbound.get("method").and_then(Value::as_str);
         let expected_password = match method {
             Some("2022-blake3-aes-128-gcm") => &credentials.shadowsocks_2022_key_128,
@@ -2389,9 +2393,9 @@ fn applied_subscription_outbound(
         if let Some(tls) = inbound.get("tls").and_then(Value::as_object) {
             if tls.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
                 let mut client_tls = serde_json::Map::new();
-                for (key, value) in tls {
-                    if key != "certificate_path" && key != "key_path" {
-                        client_tls.insert(key.clone(), value.clone());
+                for key in ["enabled", "server_name", "alpn"] {
+                    if let Some(value) = tls.get(key) {
+                        client_tls.insert(key.to_owned(), value.clone());
                     }
                 }
                 outbound["tls"] = Value::Object(client_tls);
@@ -2406,9 +2410,24 @@ fn applied_subscription_outbound(
             }
             "trojan" => outbound["password"] = json!(credentials.password),
             "shadowsocks" => {
-                let server_password = inbound.get("password")?.as_str()?;
-                outbound["method"] = json!(method?);
-                outbound["password"] = json!(format!("{server_password}:{expected_password}"));
+                let Some(method) = method else {
+                    continue;
+                };
+                outbound["method"] = json!(method);
+                if matches!(
+                    method,
+                    "2022-blake3-aes-128-gcm"
+                        | "2022-blake3-aes-256-gcm"
+                        | "2022-blake3-chacha20-poly1305"
+                ) {
+                    let Some(server_password) = inbound.get("password").and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    outbound["password"] = json!(format!("{server_password}:{expected_password}"));
+                } else {
+                    outbound["password"] = json!(credentials.password);
+                }
             }
             "mixed" => {
                 outbound["username"] = json!(user_id.to_string());
@@ -3526,6 +3545,68 @@ mod tests {
         assert_eq!(outbound["tls"]["server_name"], "example.test");
         assert!(outbound["tls"].get("certificate_path").is_none());
         assert!(outbound.get("users").is_none());
+    }
+
+    #[test]
+    fn subscription_outbound_handles_legacy_shadowsocks_and_malformed_inbounds() {
+        let user_id = Uuid::from_u128(3);
+        let credentials = cyberboard_database::ProxyCredentialsRecord {
+            user_id,
+            password: "own-password".into(),
+            uuid: Uuid::from_u128(4),
+            shadowsocks_2022_key_128: "own-ss-128".into(),
+            shadowsocks_2022_key_256: "own-ss-256".into(),
+        };
+        let node = cyberboard_database::NodeRecord {
+            id: Uuid::from_u128(5),
+            name: "node".into(),
+            region: "test".into(),
+            address: "127.0.0.1".into(),
+            status: "online".into(),
+            core: "sing-box".into(),
+            core_version: "1.14.4".into(),
+            agent_version: "test".into(),
+            current_config_revision: None,
+            desired_generation: None,
+            applied_config_revision: None,
+            applied_generation: None,
+            applied_at: None,
+            core_state: None,
+            last_heartbeat_at: None,
+            port: 443,
+            tags: json!([]),
+        };
+        let payload = json!({
+            "inbounds": [
+                {"type": "vless", "users": "malformed"},
+                {
+                    "type": "shadowsocks",
+                    "method": "aes-256-gcm",
+                    "password": "server-secret",
+                    "tls": {
+                        "enabled": true,
+                        "server_name": "example.test",
+                        "alpn": ["h2"],
+                        "acme_dns01_provider": "secret-provider-token"
+                    },
+                    "users": [{"name": user_id, "password": credentials.password}]
+                }
+            ]
+        });
+        let outbound =
+            applied_subscription_outbound(&node, &payload, user_id, &credentials).unwrap();
+        assert_eq!(outbound["type"], "shadowsocks");
+        assert_eq!(outbound["method"], "aes-256-gcm");
+        assert_eq!(outbound["password"], credentials.password);
+        assert!(
+            !outbound["password"]
+                .as_str()
+                .unwrap()
+                .contains("server-secret")
+        );
+        assert_eq!(outbound["tls"]["server_name"], "example.test");
+        assert_eq!(outbound["tls"]["alpn"], json!(["h2"]));
+        assert!(outbound["tls"].get("acme_dns01_provider").is_none());
     }
 
     #[tokio::test]

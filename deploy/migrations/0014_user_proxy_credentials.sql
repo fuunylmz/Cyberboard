@@ -14,6 +14,3 @@ CREATE TABLE user_proxy_credentials (
     UNIQUE (tenant_id, uuid),
     FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id)
 );
-
-CREATE INDEX user_proxy_credentials_tenant_uuid_idx
-    ON user_proxy_credentials (tenant_id, uuid);

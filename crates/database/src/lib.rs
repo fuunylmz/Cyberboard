@@ -7,13 +7,14 @@
 use std::time::Duration;
 
 use cyberboard_storage::{
-    EIGHTH_MIGRATION, ELEVENTH_MIGRATION, FIFTEENTH_MIGRATION, FIFTH_MIGRATION, FOURTH_MIGRATION,
-    INITIAL_MIGRATION, NINTH_MIGRATION, SECOND_MIGRATION, SEVENTH_MIGRATION, SIXTH_MIGRATION,
-    TENTH_MIGRATION, THIRD_MIGRATION, THIRTEENTH_MIGRATION, TWELFTH_MIGRATION,
+    EIGHTH_MIGRATION, ELEVENTH_MIGRATION, FIFTEENTH_MIGRATION, FIFTH_MIGRATION,
+    FOURTEENTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, NINTH_MIGRATION,
+    SECOND_MIGRATION, SEVENTH_MIGRATION, SIXTH_MIGRATION, TENTH_MIGRATION, THIRD_MIGRATION,
+    THIRTEENTH_MIGRATION, TWELFTH_MIGRATION,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -42,6 +43,49 @@ fn deployment_status_from_phase(phase: &str) -> &'static str {
 
 fn truncate_chars(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
+}
+
+async fn ensure_proxy_credentials_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    replace: bool,
+) -> DatabaseResult<ProxyCredentialsRecord> {
+    sqlx::query("SELECT id FROM users WHERE tenant_id=$1 AND id=$2 FOR UPDATE")
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    if replace {
+        sqlx::query("DELETE FROM user_proxy_credentials WHERE tenant_id=$1 AND user_id=$2")
+            .bind(tenant_id)
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    // gen_random_bytes is PostgreSQL pgcrypto CSPRNG. The 2022 keys are stored
+    // as standard base64 and selected by method: 128-bit uses 16 bytes, while
+    // AES-256 and ChaCha20 use 32 bytes.
+    sqlx::query(
+        "INSERT INTO user_proxy_credentials
+             (tenant_id,user_id,password,uuid,shadowsocks_2022_key_128,shadowsocks_2022_key_256)
+         VALUES ($1,$2,encode(gen_random_bytes(32),'hex'),gen_random_uuid(),
+                 encode(gen_random_bytes(16),'base64'),encode(gen_random_bytes(32),'base64'))
+         ON CONFLICT (tenant_id,user_id) DO NOTHING",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+    let row = sqlx::query(
+        "SELECT user_id,password,uuid,shadowsocks_2022_key_128,shadowsocks_2022_key_256
+         FROM user_proxy_credentials WHERE tenant_id=$1 AND user_id=$2",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(ProxyCredentialsRecord::from_row(row))
 }
 
 pub fn hash_session_token(token: &str) -> String {
@@ -472,6 +516,20 @@ impl Database {
                 .execute(&mut *transaction)
                 .await?;
         }
+        let fourteenth: Option<String> =
+            sqlx::query_scalar("SELECT version FROM cyberboard_schema_migrations WHERE version=$1")
+                .bind("0014_user_proxy_credentials")
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if fourteenth.is_none() {
+            sqlx::raw_sql(FOURTEENTH_MIGRATION)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
+                .bind("0014_user_proxy_credentials")
+                .execute(&mut *transaction)
+                .await?;
+        }
         let fifteenth: Option<String> =
             sqlx::query_scalar("SELECT version FROM cyberboard_schema_migrations WHERE version=$1")
                 .bind("0015_usage_reporting")
@@ -503,6 +561,19 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Provision a user's stable proxy credentials exactly once.
+    pub async fn ensure_user_proxy_credentials(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> DatabaseResult<ProxyCredentialsRecord> {
+        let mut tx = self.pool.begin().await?;
+        let credentials =
+            ensure_proxy_credentials_in_tx(&mut tx, tenant_id, user_id, false).await?;
+        tx.commit().await?;
+        Ok(credentials)
     }
 
     pub async fn find_user_credentials(
@@ -1296,8 +1367,11 @@ impl Database {
              FROM plans p WHERE p.tenant_id=$1 AND p.id=$3
              RETURNING id",
         ).bind(tenant_id).bind(input.user_id).bind(input.plan_id).bind(&input.starts_at).bind(&input.expires_at).bind(&input.subscription_token)
-        .fetch_optional(&mut *tx).await?.ok_or_else(|| DatabaseError::Sqlx(sqlx::Error::RowNotFound))?;
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| DatabaseError::Sqlx(sqlx::Error::RowNotFound))?;
         let id: Uuid = row.get("id");
+        ensure_proxy_credentials_in_tx(&mut tx, tenant_id, input.user_id, false).await?;
         let record_row = sqlx::query("SELECT s.id,u.email AS user_email,p.name AS plan,s.status,s.traffic_used_bytes,s.traffic_quota_bytes,s.expires_at::text AS expires_at,s.subscription_token,s.subscription_token_version FROM subscriptions s JOIN users u ON u.tenant_id=s.tenant_id AND u.id=s.user_id JOIN plans p ON p.tenant_id=s.tenant_id AND p.id=s.plan_id WHERE s.tenant_id=$1 AND s.id=$2")
             .bind(tenant_id).bind(id).fetch_one(&mut *tx).await?;
         let record = SubscriptionRecord::from_row(record_row);
@@ -1437,6 +1511,7 @@ impl Database {
             return Ok(None);
         };
         let subscription_id: Uuid = row.get("id");
+        ensure_proxy_credentials_in_tx(&mut tx, tenant_id, user_id, true).await?;
         sqlx::query(
             "INSERT INTO audit_logs(tenant_id,actor_user_id,action,resource_type,resource_id,details)
              VALUES($1,$2,'subscription_token.rotate','subscription',$3,jsonb_build_object('tokenVersion',(SELECT subscription_token_version FROM subscriptions WHERE tenant_id=$1 AND id=$3)))",
@@ -1523,6 +1598,58 @@ impl Database {
         let rows = sqlx::query("SELECT n.id,n.name,n.region,n.address,n.status,n.core_type,n.core_version,n.agent_version,n.current_config_revision,last_heartbeat_at::text AS last_heartbeat_at,n.port,n.tags FROM nodes n JOIN subscription_nodes sn ON sn.tenant_id=n.tenant_id AND sn.node_id=n.id JOIN subscriptions s ON s.tenant_id=sn.tenant_id AND s.id=sn.subscription_id WHERE n.tenant_id=$1 AND (s.subscription_token_hash=encode(digest($2,'sha256'),'hex') OR (s.subscription_token_hash IS NULL AND s.subscription_token=$2)) AND s.status='active' AND s.expires_at>now() ORDER BY n.created_at,n.id")
             .bind(tenant_id).bind(token).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(NodeRecord::from_row).collect())
+    }
+
+    pub async fn subscription_node_configs_for_token(
+        &self,
+        tenant_id: Uuid,
+        token: &str,
+    ) -> DatabaseResult<Vec<SubscriptionNodeConfigRecord>> {
+        let rows = sqlx::query(
+            "SELECT n.id,n.name,n.region,n.address,n.status,n.core_type,n.core_version,n.agent_version,
+                    n.current_config_revision,
+                    (SELECT generation FROM config_revisions WHERE tenant_id=n.tenant_id AND id=n.current_config_revision) AS desired_generation,
+                    n.applied_config_revision,n.applied_generation,n.applied_at::text AS applied_at,
+                    n.agent_core_state,n.last_heartbeat_at::text AS last_heartbeat_at,n.port,n.tags,
+                    s.user_id,r.payload
+             FROM nodes n
+             JOIN subscription_nodes sn ON sn.tenant_id=n.tenant_id AND sn.node_id=n.id
+             JOIN subscriptions s ON s.tenant_id=sn.tenant_id AND s.id=sn.subscription_id
+             JOIN users u ON u.tenant_id=s.tenant_id AND u.id=s.user_id AND u.status='active'
+             LEFT JOIN config_revisions r ON r.tenant_id=n.tenant_id AND r.id=n.applied_config_revision
+             WHERE n.tenant_id=$1
+               AND (s.subscription_token_hash=encode(digest($2,'sha256'),'hex')
+                    OR (s.subscription_token_hash IS NULL AND s.subscription_token=$2))
+               AND s.status='active' AND s.expires_at>now()
+             ORDER BY n.created_at,n.id",
+        )
+        .bind(tenant_id)
+        .bind(token)
+        .fetch_all(&self.pool)
+        .await?;
+        let credentials = match rows.first().map(|row| row.get::<Uuid, _>("user_id")) {
+            Some(user_id) => Some(
+                self.ensure_user_proxy_credentials(tenant_id, user_id)
+                    .await?,
+            ),
+            None => None,
+        };
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            let user_id: Uuid = row.get("user_id");
+            let payload = row.try_get("payload").unwrap_or(None);
+            let node = NodeRecord::from_row(row);
+            let Some(user_credentials) = credentials.as_ref() else {
+                continue;
+            };
+            records.push(SubscriptionNodeConfigRecord {
+                node,
+                user_id,
+                payload,
+                credentials: user_credentials.clone(),
+            });
+        }
+        Ok(records)
     }
 
     pub async fn list_orders(
@@ -1665,6 +1792,7 @@ impl Database {
         let plan_id: Uuid = row.get("plan_id");
         sqlx::query("INSERT INTO subscriptions (tenant_id,user_id,plan_id,status,traffic_quota_bytes,starts_at,expires_at,subscription_token) SELECT $1,$2,id,'active',traffic_quota_bytes,now(),now()+make_interval(days=>duration_days),concat('cb_',replace(gen_random_uuid()::text,'-','')) FROM plans WHERE tenant_id=$1 AND id=$3")
             .bind(tenant_id).bind(user_id).bind(plan_id).execute(&mut *tx).await?;
+        ensure_proxy_credentials_in_tx(&mut tx, tenant_id, user_id, false).await?;
         let result = sqlx::query("SELECT o.id,o.status,o.amount_cents,o.currency,o.created_at::text AS created_at,o.paid_at::text AS paid_at,p.name AS plan FROM orders o JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id WHERE o.tenant_id=$1 AND o.id=$2")
             .bind(tenant_id).bind(order_id).fetch_one(&mut *tx).await?;
         tx.commit().await?;
@@ -1949,13 +2077,38 @@ impl Database {
             .fetch_one(&self.pool).await?)
     }
 
+    async fn active_proxy_credentials_for_node_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        tenant_id: Uuid,
+        node_id: Uuid,
+    ) -> DatabaseResult<Vec<ProxyCredentialsRecord>> {
+        let user_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT DISTINCT u.id
+             FROM users u
+             JOIN subscriptions s ON s.tenant_id=u.tenant_id AND s.user_id=u.id
+             JOIN subscription_nodes sn ON sn.tenant_id=s.tenant_id AND sn.subscription_id=s.id
+             WHERE u.tenant_id=$1 AND sn.node_id=$2 AND u.status='active'
+               AND s.status='active' AND s.expires_at>now()
+             ORDER BY u.id",
+        )
+        .bind(tenant_id)
+        .bind(node_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        let mut credentials = Vec::with_capacity(user_ids.len());
+        for user_id in user_ids {
+            credentials.push(ensure_proxy_credentials_in_tx(tx, tenant_id, user_id, false).await?);
+        }
+        Ok(credentials)
+    }
+
     pub async fn publish_config_revision(
         &self,
         input: ConfigPublishInput<'_>,
     ) -> DatabaseResult<Option<ConfigRevisionRecord>> {
         let mut tx = self.pool.begin().await?;
         let revision = sqlx::query(
-            "SELECT id,template_id,node_id,generation,core_version,content_hash,validation_status,publish_status,failure_reason,created_at::text AS created_at
+            "SELECT id,template_id,node_id,generation,core_version,content_hash,payload,validation_status,publish_status,failure_reason,created_at::text AS created_at
              FROM config_revisions WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
         )
         .bind(input.tenant_id)
@@ -2014,13 +2167,27 @@ impl Database {
             tx.rollback().await?;
             return Err(DatabaseError::ConfigConflict(code));
         }
-        sqlx::query("UPDATE config_revisions SET publish_status='published',failure_reason=NULL,signature=$3 WHERE tenant_id=$1 AND id=$2")
-            .bind(input.tenant_id).bind(input.revision_id).bind(input.signed_envelope).execute(&mut *tx).await?;
+        let mut payload: serde_json::Value = revision.get("payload");
+        let credentials =
+            Self::active_proxy_credentials_for_node_tx(&mut tx, input.tenant_id, node_id).await?;
+        refresh_payload_users(&mut payload, &credentials)?;
+        let payload_bytes = serde_json::to_vec(&payload)
+            .map_err(|_| DatabaseError::ConfigConflict("invalid_payload"))?;
+        let content_hash = sha256_hex(&payload_bytes);
+        let signed_envelope = (input.sign)(node_id, generation as u64, payload_bytes);
+        sqlx::query("UPDATE config_revisions SET payload=$3,content_hash=$4,publish_status='published',failure_reason=NULL,signature=$5 WHERE tenant_id=$1 AND id=$2")
+            .bind(input.tenant_id)
+            .bind(input.revision_id)
+            .bind(&payload)
+            .bind(&content_hash)
+            .bind(signed_envelope)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("UPDATE nodes SET current_config_revision=$3,updated_at=now() WHERE tenant_id=$1 AND id=$2")
             .bind(input.tenant_id).bind(node_id).bind(input.revision_id).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO config_deployments(tenant_id,config_revision_id,node_id,kind,status,expected_generation,actor_user_id) VALUES($1,$2,$3,'publish','pending',$4,$5)")
             .bind(input.tenant_id).bind(input.revision_id).bind(node_id).bind(generation).bind(input.actor_user_id).execute(&mut *tx).await?;
-        let details = serde_json::json!({"nodeId":node_id,"generation":generation,"contentHash":revision.get::<String,_>("content_hash"),"previousRevisionId":current_id});
+        let details = serde_json::json!({"nodeId":node_id,"generation":generation,"contentHash":content_hash,"previousRevisionId":current_id});
         Self::insert_audit_in_tx(
             &mut tx,
             input.tenant_id,
@@ -2090,18 +2257,33 @@ impl Database {
         let max_generation: i64 = sqlx::query_scalar("SELECT COALESCE(max(generation),0) FROM config_revisions WHERE tenant_id=$1 AND node_id=$2")
             .bind(input.tenant_id).bind(node_id).fetch_one(&mut *tx).await?;
         let new_generation = max_generation + 1;
-        let target_payload: serde_json::Value = target.get("payload");
-        let target_bytes = serde_json::to_vec(&target_payload).unwrap_or_default();
-        let target_hash: String = target.get("content_hash");
-        if sha256_hex(&target_bytes) != target_hash {
+        let mut target_payload: serde_json::Value = target.get("payload");
+        let original_target_hash: String = target.get("content_hash");
+        let original_target_bytes = serde_json::to_vec(&target_payload)
+            .map_err(|_| DatabaseError::ConfigConflict("rollback_target_invalid"))?;
+        if sha256_hex(&original_target_bytes) != original_target_hash {
             tx.rollback().await?;
             return Err(DatabaseError::ConfigConflict(
                 "rollback_target_hash_mismatch",
             ));
         }
+        let credentials =
+            Self::active_proxy_credentials_for_node_tx(&mut tx, input.tenant_id, node_id).await?;
+        refresh_payload_users(&mut target_payload, &credentials)?;
+        let target_bytes = serde_json::to_vec(&target_payload)
+            .map_err(|_| DatabaseError::ConfigConflict("rollback_target_invalid"))?;
+        let target_hash = sha256_hex(&target_bytes);
         let signed_envelope = (input.sign)(node_id, new_generation as u64, target_bytes);
-        let new_id: Uuid = sqlx::query_scalar("INSERT INTO config_revisions(tenant_id,template_id,node_id,generation,core_type,core_version,content_hash,signature,validation_status,publish_status,payload,rollback_of) SELECT $1,template_id,node_id,$2,core_type,core_version,content_hash,$3,'validated','published',payload,$4 FROM config_revisions WHERE tenant_id=$1 AND id=$4 RETURNING id")
-            .bind(input.tenant_id).bind(new_generation).bind(signed_envelope).bind(target_id).fetch_one(&mut *tx).await?;
+        let new_id: Uuid = sqlx::query_scalar("INSERT INTO config_revisions(tenant_id,template_id,node_id,generation,core_type,core_version,content_hash,signature,validation_status,publish_status,payload,rollback_of) SELECT $1,template_id,node_id,$2,core_type,core_version,$3,$4,'validated','published',$5,$6 FROM config_revisions WHERE tenant_id=$1 AND id=$7 RETURNING id")
+            .bind(input.tenant_id)
+            .bind(new_generation)
+            .bind(&target_hash)
+            .bind(signed_envelope)
+            .bind(&target_payload)
+            .bind(target_id)
+            .bind(target_id)
+            .fetch_one(&mut *tx)
+            .await?;
         sqlx::query(
             "UPDATE config_revisions SET publish_status='rolled_back' WHERE tenant_id=$1 AND id=$2",
         )
@@ -2188,6 +2370,7 @@ impl Database {
         sqlx::query("INSERT INTO payments (tenant_id,order_id,provider,provider_payment_id,provider_event_id,status,raw_event) VALUES ($1,$2,'manual',$3,$4,'succeeded','{}'::jsonb) ON CONFLICT (tenant_id,provider,provider_event_id) DO NOTHING").bind(tenant_id).bind(order_id).bind(format!("manual-{order_id}")).bind(provider_event_id).execute(&mut *tx).await?;
         sqlx::query("UPDATE orders SET status='paid',provider_payment_id=$3,paid_at=now(),updated_at=now() WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(order_id).bind(format!("manual-{order_id}")).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO subscriptions (tenant_id,user_id,plan_id,status,traffic_quota_bytes,starts_at,expires_at,subscription_token) SELECT $1,o.user_id,o.plan_id,'active',p.traffic_quota_bytes,now(),now()+make_interval(days=>p.duration_days),concat('cb_',replace(gen_random_uuid()::text,'-','')) FROM orders o JOIN plans p ON p.tenant_id=o.tenant_id AND p.id=o.plan_id WHERE o.tenant_id=$1 AND o.id=$2").bind(tenant_id).bind(order_id).execute(&mut *tx).await?;
+        ensure_proxy_credentials_in_tx(&mut tx, tenant_id, current.user_id, false).await?;
         let updated = sqlx::query("SELECT id,user_id,plan_id,status,amount_cents,currency,provider,provider_payment_id,paid_at::text AS paid_at FROM orders WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(order_id).fetch_one(&mut *tx).await?;
         tx.commit().await?;
         Ok(PaymentOrderRecord::from_row(updated))
@@ -2219,6 +2402,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         sqlx::query("UPDATE subscriptions SET status='revoked',updated_at=now() WHERE tenant_id=$1 AND user_id=$2 AND plan_id=$3 AND status='active'").bind(tenant_id).bind(current.user_id).bind(current.plan_id).execute(&mut *tx).await?;
+        ensure_proxy_credentials_in_tx(&mut tx, tenant_id, current.user_id, false).await?;
         let updated = sqlx::query("SELECT id,user_id,plan_id,status,amount_cents,currency,provider,provider_payment_id,paid_at::text AS paid_at FROM orders WHERE tenant_id=$1 AND id=$2").bind(tenant_id).bind(order_id).fetch_one(&mut *tx).await?;
         tx.commit().await?;
         Ok(PaymentOrderRecord::from_row(updated))
@@ -2661,6 +2845,151 @@ struct ParsedUsageEvent {
     upload_bytes: i64,
 }
 
+fn refresh_payload_users(
+    payload: &mut serde_json::Value,
+    credentials: &[ProxyCredentialsRecord],
+) -> DatabaseResult<()> {
+    let Some(inbounds) = payload
+        .get_mut("inbounds")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    let mut index = 0;
+    while index < inbounds.len() {
+        let inbound_type = inbounds[index]
+            .get("type")
+            .and_then(serde_json::Value::as_str);
+        let Some(inbound_type) = inbound_type else {
+            index += 1;
+            continue;
+        };
+        if credentials.is_empty()
+            && matches!(
+                inbound_type,
+                "vless" | "vmess" | "trojan" | "shadowsocks" | "mixed"
+            )
+        {
+            inbounds.remove(index);
+            continue;
+        }
+        let users = match inbound_type {
+            "vless" => credentials
+                .iter()
+                .map(|credential| {
+                    // WP-F maps sing-box accounting names back to user_id. Keep
+                    // this name equal to the UUID string for every named protocol.
+                    serde_json::json!({
+                        "name": credential.user_id.to_string(),
+                        "uuid": credential.uuid,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "vmess" => credentials
+                .iter()
+                .map(|credential| {
+                    serde_json::json!({
+                        "name": credential.user_id.to_string(),
+                        "uuid": credential.uuid,
+                        "alterId": 0,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "trojan" => credentials
+                .iter()
+                .map(|credential| {
+                    serde_json::json!({
+                        "name": credential.user_id.to_string(),
+                        "password": credential.password,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "shadowsocks" => {
+                let method = inbounds[index]
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(DatabaseError::ConfigConflict("invalid_payload"))?;
+                let key_2022 = match method {
+                    "2022-blake3-aes-128-gcm" => Some(true),
+                    "2022-blake3-aes-256-gcm" | "2022-blake3-chacha20-poly1305" => Some(false),
+                    _ => None,
+                };
+                credentials
+                    .iter()
+                    .map(|credential| {
+                        let password = key_2022
+                            .map(|is_128| {
+                                if is_128 {
+                                    credential.shadowsocks_2022_key_128.clone()
+                                } else {
+                                    credential.shadowsocks_2022_key_256.clone()
+                                }
+                            })
+                            .unwrap_or_else(|| credential.password.clone());
+                        serde_json::json!({
+                            "name": credential.user_id.to_string(),
+                            "password": password,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            }
+            "mixed" => credentials
+                .iter()
+                .map(|credential| {
+                    serde_json::json!({
+                        "username": credential.user_id.to_string(),
+                        "password": credential.password,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        inbounds[index]["users"] = serde_json::Value::Array(users);
+        index += 1;
+    }
+    let stats_users = payload
+        .get("inbounds")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|inbound| {
+            inbound["users"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|user| {
+                    user["name"]
+                        .as_str()
+                        .or_else(|| user["username"].as_str())
+                        .map(str::to_owned)
+                })
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if !payload
+        .get("experimental")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        payload["experimental"] = serde_json::json!({});
+    }
+    let experimental = payload
+        .get_mut("experimental")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("experimental object was initialized");
+    experimental.insert(
+        "v2ray_api".to_owned(),
+        serde_json::json!({
+            "listen": "127.0.0.1:10085",
+            "stats": {
+                "enabled": true,
+                "users": stats_users.into_iter().collect::<Vec<_>>(),
+            }
+        }),
+    );
+    Ok(())
+}
 fn parse_usage_events(
     payload: &serde_json::Value,
     default_window_start: i64,
@@ -2719,6 +3048,27 @@ fn parse_usage_events(
         })
         .collect::<DatabaseResult<Vec<_>>>()
         .map(|events| events.into_iter().flatten().collect())
+}
+
+#[derive(Clone, Debug)]
+pub struct ProxyCredentialsRecord {
+    pub user_id: Uuid,
+    pub password: String,
+    pub uuid: Uuid,
+    pub shadowsocks_2022_key_128: String,
+    pub shadowsocks_2022_key_256: String,
+}
+
+impl ProxyCredentialsRecord {
+    fn from_row(row: sqlx::postgres::PgRow) -> Self {
+        Self {
+            user_id: row.get("user_id"),
+            password: row.get("password"),
+            uuid: row.get("uuid"),
+            shadowsocks_2022_key_128: row.get("shadowsocks_2022_key_128"),
+            shadowsocks_2022_key_256: row.get("shadowsocks_2022_key_256"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3006,6 +3356,14 @@ impl NodeRecord {
             tags: row.get("tags"),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct SubscriptionNodeConfigRecord {
+    pub node: NodeRecord,
+    pub user_id: Uuid,
+    pub payload: Option<serde_json::Value>,
+    pub credentials: ProxyCredentialsRecord,
 }
 
 #[derive(Clone, Debug)]

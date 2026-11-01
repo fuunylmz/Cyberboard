@@ -38,6 +38,9 @@ pub const TWELFTH_MIGRATION: &str =
 pub const THIRTEENTH_MIGRATION_NAME: &str = "0013_config_deployment_lifecycle.sql";
 pub const THIRTEENTH_MIGRATION: &str =
     include_str!("../../../deploy/migrations/0013_config_deployment_lifecycle.sql");
+pub const FOURTEENTH_MIGRATION_NAME: &str = "0014_user_proxy_credentials.sql";
+pub const FOURTEENTH_MIGRATION: &str =
+    include_str!("../../../deploy/migrations/0014_user_proxy_credentials.sql");
 pub const FIFTEENTH_MIGRATION_NAME: &str = "0015_usage_reporting.sql";
 pub const FIFTEENTH_MIGRATION: &str =
     include_str!("../../../deploy/migrations/0015_usage_reporting.sql");
@@ -46,7 +49,8 @@ pub const FIFTEENTH_MIGRATION: &str =
 mod tests {
     use super::{
         EIGHTH_MIGRATION, EIGHTH_MIGRATION_NAME, ELEVENTH_MIGRATION, ELEVENTH_MIGRATION_NAME,
-        FIFTEENTH_MIGRATION, FIFTEENTH_MIGRATION_NAME, FIFTH_MIGRATION, FOURTH_MIGRATION,
+        FIFTEENTH_MIGRATION, FIFTEENTH_MIGRATION_NAME, FIFTH_MIGRATION, FOURTEENTH_MIGRATION,
+        FOURTEENTH_MIGRATION_NAME, FOURTH_MIGRATION,
         INITIAL_MIGRATION, INITIAL_MIGRATION_NAME, NINTH_MIGRATION, NINTH_MIGRATION_NAME,
         SECOND_MIGRATION, SECOND_MIGRATION_NAME, SEVENTH_MIGRATION, SEVENTH_MIGRATION_NAME,
         SIXTH_MIGRATION, TENTH_MIGRATION, TENTH_MIGRATION_NAME, THIRD_MIGRATION,
@@ -156,6 +160,14 @@ mod tests {
             "retry_count",
         ] {
             assert!(THIRTEENTH_MIGRATION.contains(field));
+        }
+        assert_eq!(FOURTEENTH_MIGRATION_NAME, "0014_user_proxy_credentials.sql");
+        for field in [
+            "user_proxy_credentials",
+            "shadowsocks_2022_key_128",
+            "shadowsocks_2022_key_256",
+        ] {
+            assert!(FOURTEENTH_MIGRATION.contains(field));
         }
         assert_eq!(FIFTEENTH_MIGRATION_NAME, "0015_usage_reporting.sql");
         assert!(FIFTEENTH_MIGRATION.contains("payload_version"));

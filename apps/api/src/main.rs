@@ -2337,16 +2337,146 @@ async fn me_usage(
     match database.usage_summary(state.config.tenant_id, user_id).await { Ok(usage) => Json(json!({"usedBytes":usage.used_bytes,"quotaBytes":0,"todayBytes":0,"projectedBytes":usage.used_bytes,"periodStart":usage.period_start.unwrap_or_default(),"periodEnd":usage.period_end.unwrap_or_default(),"daily":[]})).into_response(), Err(_) => internal_database_response() }
 }
 
+fn uuid_value_matches(value: &Value, expected: Uuid) -> bool {
+    value
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .is_some_and(|value| value == expected)
+}
+
+fn applied_subscription_outbound(
+    node: &cyberboard_database::NodeRecord,
+    payload: &Value,
+    user_id: Uuid,
+    credentials: &cyberboard_database::ProxyCredentialsRecord,
+) -> Option<Value> {
+    let inbounds = payload.get("inbounds").and_then(Value::as_array)?;
+    for inbound in inbounds {
+        let Some(inbound_type) = inbound.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(users) = inbound.get("users").and_then(Value::as_array) else {
+            continue;
+        };
+        let method = inbound.get("method").and_then(Value::as_str);
+        let expected_password = match method {
+            Some("2022-blake3-aes-128-gcm") => &credentials.shadowsocks_2022_key_128,
+            Some("2022-blake3-aes-256-gcm") | Some("2022-blake3-chacha20-poly1305") => {
+                &credentials.shadowsocks_2022_key_256
+            }
+            _ => &credentials.password,
+        };
+        let user_name = user_id.to_string();
+        let has_user = users.iter().any(|user| match inbound_type {
+            "vless" | "vmess" => {
+                user["name"].as_str() == Some(user_name.as_str())
+                    && uuid_value_matches(&user["uuid"], credentials.uuid)
+            }
+            "trojan" => {
+                user["name"].as_str() == Some(user_name.as_str())
+                    && user["password"].as_str() == Some(credentials.password.as_str())
+            }
+            "shadowsocks" => {
+                user["name"].as_str() == Some(user_name.as_str())
+                    && user["password"].as_str() == Some(expected_password.as_str())
+            }
+            "mixed" => {
+                user["username"].as_str() == Some(user_name.as_str())
+                    && user["password"].as_str() == Some(credentials.password.as_str())
+            }
+            _ => false,
+        });
+        if !has_user {
+            continue;
+        }
+        let outbound_type = if inbound_type == "mixed" {
+            "socks"
+        } else {
+            inbound_type
+        };
+        let mut outbound = json!({
+            "type": outbound_type,
+            "tag": format!("node-{}", node.id.simple()),
+            "server": node.address,
+            "server_port": node.port,
+        });
+        if let Some(transport) = inbound.get("transport") {
+            outbound["transport"] = transport.clone();
+        }
+        if let Some(tls) = inbound.get("tls").and_then(Value::as_object) {
+            if tls.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
+                let mut client_tls = serde_json::Map::new();
+                for key in ["enabled", "server_name", "alpn"] {
+                    if let Some(value) = tls.get(key) {
+                        client_tls.insert(key.to_owned(), value.clone());
+                    }
+                }
+                outbound["tls"] = Value::Object(client_tls);
+            }
+        }
+        match inbound_type {
+            "vless" | "vmess" => {
+                outbound["uuid"] = json!(credentials.uuid);
+                if inbound_type == "vmess" {
+                    outbound["alter_id"] = json!(0);
+                }
+            }
+            "trojan" => outbound["password"] = json!(credentials.password),
+            "shadowsocks" => {
+                let Some(method) = method else {
+                    continue;
+                };
+                outbound["method"] = json!(method);
+                if matches!(
+                    method,
+                    "2022-blake3-aes-128-gcm"
+                        | "2022-blake3-aes-256-gcm"
+                        | "2022-blake3-chacha20-poly1305"
+                ) {
+                    let Some(server_password) = inbound.get("password").and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    outbound["password"] = json!(format!("{server_password}:{expected_password}"));
+                } else {
+                    outbound["password"] = json!(credentials.password);
+                }
+            }
+            "mixed" => {
+                outbound["username"] = json!(user_id.to_string());
+                outbound["password"] = json!(credentials.password);
+            }
+            _ => continue,
+        }
+        return Some(outbound);
+    }
+    None
+}
+
 async fn public_subscription(State(state): State<AppState>, Path(token): Path<String>) -> Response {
     let Some(database) = state.database.as_ref() else {
         return service_unavailable_response();
     };
     match database
-        .nodes_for_subscription_token(state.config.tenant_id, &token)
+        .subscription_node_configs_for_token(state.config.tenant_id, &token)
         .await
     {
-        Ok(nodes) if !nodes.is_empty() => {
-            let outbounds: Vec<Value> = nodes.iter().map(|node| json!({"type":"socks","tag":format!("node-{}",node.id.simple()),"server":node.address,"server_port":node.port})).collect();
+        Ok(records) => {
+            let outbounds: Vec<Value> = records
+                .iter()
+                .filter_map(|record| {
+                    let payload = record.payload.as_ref()?;
+                    applied_subscription_outbound(
+                        &record.node,
+                        payload,
+                        record.user_id,
+                        &record.credentials,
+                    )
+                })
+                .collect();
+            if outbounds.is_empty() {
+                return not_found_response("订阅不存在、已过期或没有可用节点");
+            }
             let mut response = Json(json!({
                 "version": 1,
                 "experimental": false,
@@ -2364,7 +2494,6 @@ async fn public_subscription(State(state): State<AppState>, Path(token): Path<St
             );
             response
         }
-        Ok(_) => not_found_response("订阅不存在、已过期或没有可用节点"),
         Err(_) => internal_database_response(),
     }
 }
@@ -2426,38 +2555,6 @@ struct ConfigRevisionCreateRequest {
     core_version: String,
     #[serde(alias = "config")]
     payload: Value,
-}
-
-async fn signed_envelope_for_revision(
-    database: &Database,
-    signer: &signing::ConfigSigner,
-    tenant_id: Uuid,
-    revision_id: Uuid,
-) -> Result<String, Response> {
-    let Some(revision) = database
-        .config_revision_for_signing(tenant_id, revision_id)
-        .await
-        .map_err(|_| internal_database_response())?
-    else {
-        return Err(not_found_response("配置版本不存在"));
-    };
-    let payload =
-        serde_json::to_vec(&revision.payload).map_err(|_| internal_database_response())?;
-    if hex_hash(&payload) != revision.content_hash {
-        return Err(invalid_input_response(
-            "配置版本内容 hash 与 payload 不一致",
-        ));
-    }
-    let envelope = signer.sign(
-        revision.node_id,
-        revision.generation.max(0) as u64,
-        payload,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
-    );
-    serde_json::to_string(&envelope).map_err(|_| internal_database_response())
 }
 
 fn config_template_json(record: ConfigTemplateRecord) -> Value {
@@ -2664,18 +2761,21 @@ async fn publish_config_revision(
     let Some(generation) = action.expected_generation else {
         return invalid_input_response("expectedGeneration不能为空");
     };
-    let signed_envelope =
-        match signed_envelope_for_revision(db, signer, identity.tenant_id, id).await {
-            Ok(value) => value,
-            Err(response) => return response,
-        };
+    let sign = |node_id, generation, payload| {
+        let issued_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        serde_json::to_string(&signer.sign(node_id, generation, payload, issued_at))
+            .unwrap_or_default()
+    };
     match db
         .publish_config_revision(ConfigPublishInput {
             tenant_id: identity.tenant_id,
             revision_id: id,
             expected_generation: generation,
             expected_previous_hash: action.expected_previous_hash.as_deref(),
-            signed_envelope: &signed_envelope,
+            sign: &sign,
             actor_user_id: identity.user_id,
         })
         .await
@@ -3331,14 +3431,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         DEMO_ACCESS_TOKEN, DEMO_GENERATED_AT, DEMO_PORTAL_ACCESS_TOKEN,
-        create_order_error_response, router,
+        applied_subscription_outbound, create_order_error_response, router,
     };
     use axum::{
         body::{Body, to_bytes},
         http::{HeaderMap, Request, StatusCode, header},
     };
     use cyberboard_config::ApiConfig;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -3392,6 +3492,7 @@ mod tests {
                 listen: "0.0.0.0".into(),
                 listen_port: 443,
                 inbound_type: "vless".into(),
+                method: None,
                 transport: Transport::Websocket { path: "/ws".into() },
                 tls: None,
                 credential: Credential::Uuid {
@@ -3400,11 +3501,125 @@ mod tests {
             }],
             outbounds: vec![],
             route: Route::default(),
+            experimental: None,
         };
         let rendered = profile.render_sing_box().unwrap();
         let first = serde_json::to_vec(&rendered).unwrap();
         let round_trip: Value = serde_json::from_slice(&first).unwrap();
         assert_eq!(serde_json::to_vec(&round_trip).unwrap(), first);
+    }
+
+    #[test]
+    fn subscription_outbound_uses_applied_protocol_and_own_credential() {
+        let user_id = Uuid::from_u128(3);
+        let credentials = cyberboard_database::ProxyCredentialsRecord {
+            user_id,
+            password: "own-password".into(),
+            uuid: Uuid::from_u128(4),
+            shadowsocks_2022_key_128: "own-ss-128".into(),
+            shadowsocks_2022_key_256: "own-ss-256".into(),
+        };
+        let node = cyberboard_database::NodeRecord {
+            id: Uuid::from_u128(5),
+            name: "node".into(),
+            region: "test".into(),
+            address: "127.0.0.1".into(),
+            status: "online".into(),
+            core: "sing-box".into(),
+            core_version: "1.14.4".into(),
+            agent_version: "test".into(),
+            current_config_revision: Some(Uuid::from_u128(6)),
+            desired_generation: Some(2),
+            applied_config_revision: Some(Uuid::from_u128(6)),
+            applied_generation: Some(2),
+            applied_at: Some("now".into()),
+            core_state: Some("running".into()),
+            last_heartbeat_at: None,
+            port: 443,
+            tags: json!([]),
+        };
+        let payload = json!({
+            "inbounds": [{
+                "type": "vless",
+                "transport": {"type": "ws", "path": "/ws"},
+                "tls": {"enabled": true, "server_name": "example.test", "certificate_path": "/secret/cert", "key_path": "/secret/key"},
+                "users": [
+                    {"name": user_id, "uuid": credentials.uuid},
+                    {"name": Uuid::from_u128(7), "uuid": Uuid::from_u128(8)}
+                ]
+            }]
+        });
+        let outbound =
+            applied_subscription_outbound(&node, &payload, user_id, &credentials).unwrap();
+        assert_eq!(outbound["type"], "vless");
+        assert_eq!(outbound["server_port"], 443);
+        assert_eq!(outbound["uuid"], json!(credentials.uuid));
+        assert_eq!(outbound["transport"]["path"], "/ws");
+        assert_eq!(outbound["tls"]["server_name"], "example.test");
+        assert!(outbound["tls"].get("certificate_path").is_none());
+        assert!(outbound.get("users").is_none());
+    }
+
+    #[test]
+    fn subscription_outbound_handles_legacy_shadowsocks_and_malformed_inbounds() {
+        let user_id = Uuid::from_u128(3);
+        let credentials = cyberboard_database::ProxyCredentialsRecord {
+            user_id,
+            password: "own-password".into(),
+            uuid: Uuid::from_u128(4),
+            shadowsocks_2022_key_128: "own-ss-128".into(),
+            shadowsocks_2022_key_256: "own-ss-256".into(),
+        };
+        let node = cyberboard_database::NodeRecord {
+            id: Uuid::from_u128(5),
+            name: "node".into(),
+            region: "test".into(),
+            address: "127.0.0.1".into(),
+            status: "online".into(),
+            core: "sing-box".into(),
+            core_version: "1.14.4".into(),
+            agent_version: "test".into(),
+            current_config_revision: None,
+            desired_generation: None,
+            applied_config_revision: None,
+            applied_generation: None,
+            applied_at: None,
+            core_state: None,
+            last_heartbeat_at: None,
+            port: 443,
+            tags: json!([]),
+        };
+        let payload = json!({
+            "inbounds": [
+                {"type": "vless", "users": "malformed"},
+                {
+                    "type": "shadowsocks",
+                    "method": "aes-256-gcm",
+                    "password": "server-secret",
+                    "tls": {
+                        "enabled": true,
+                        "server_name": "example.test",
+                        "alpn": ["h2"],
+                        "acme_dns01_provider": "secret-provider-token"
+                    },
+                    "users": [{"name": user_id, "password": credentials.password}]
+                }
+            ]
+        });
+        let outbound =
+            applied_subscription_outbound(&node, &payload, user_id, &credentials).unwrap();
+        assert_eq!(outbound["type"], "shadowsocks");
+        assert_eq!(outbound["method"], "aes-256-gcm");
+        assert_eq!(outbound["password"], credentials.password);
+        assert!(
+            !outbound["password"]
+                .as_str()
+                .unwrap()
+                .contains("server-secret")
+        );
+        assert_eq!(outbound["tls"]["server_name"], "example.test");
+        assert_eq!(outbound["tls"]["alpn"], json!(["h2"]));
+        assert!(outbound["tls"].get("acme_dns01_provider").is_none());
     }
 
     #[tokio::test]

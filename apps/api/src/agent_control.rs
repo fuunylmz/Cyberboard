@@ -16,7 +16,8 @@ use cyberboard_agent_protocol::{
     },
 };
 use cyberboard_database::{
-    AgentApplyResultInput, AgentHeartbeatInput, Database, DesiredConfigRecord,
+    AgentApplyResultInput, AgentHeartbeatInput, AgentUpgradeResultInput, AgentUsageInput, Database,
+    DesiredConfigRecord,
 };
 use serde_json::Value;
 use tonic::{Request, Response, Status};
@@ -307,16 +308,16 @@ impl AgentControl for AgentControlService {
         };
         if let Some(database) = &self.database {
             let _accepted = database
-                .ingest_agent_usage(
-                    self.tenant_id,
-                    &request.agent_id,
+                .ingest_agent_usage(AgentUsageInput {
+                    tenant_id: self.tenant_id,
+                    agent_id: &request.agent_id,
                     node_id,
-                    &request.batch_id,
-                    request.sequence as i64,
-                    request.window_start,
-                    request.window_end,
-                    &payload,
-                )
+                    batch_id: &request.batch_id,
+                    sequence: request.sequence as i64,
+                    window_start: request.window_start,
+                    window_end: request.window_end,
+                    payload: &payload,
+                })
                 .await
                 .map_err(|error| match error {
                     cyberboard_database::DatabaseError::InvalidUsagePayload(message) => {
@@ -371,15 +372,17 @@ impl AgentControl for AgentControlService {
             .await?;
         if let Some(database) = &self.database {
             database
-                .record_agent_upgrade_result(
-                    self.tenant_id,
+                .record_agent_upgrade_result(AgentUpgradeResultInput {
+                    tenant_id: self.tenant_id,
                     node_id,
-                    &request.agent_id,
-                    &request.target_version,
-                    request.success,
-                    (!request.error_code.is_empty()).then_some(request.error_code.as_str()),
-                    (!request.error_message.is_empty()).then_some(request.error_message.as_str()),
-                )
+                    agent_id: &request.agent_id,
+                    target_version: &request.target_version,
+                    success: request.success,
+                    error_code: (!request.error_code.is_empty())
+                        .then_some(request.error_code.as_str()),
+                    error_message: (!request.error_message.is_empty())
+                        .then_some(request.error_message.as_str()),
+                })
                 .await
                 .map_err(|_| Status::internal("upgrade result persistence failed"))?;
         }

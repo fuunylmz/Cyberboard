@@ -1,6 +1,6 @@
 use cyberboard_database::{
-    AgentApplyResultInput, ConfigPublishInput, ConfigRollbackInput, ConfigTemplateInput, Database,
-    NodeInput,
+    AgentApplyResultInput, ConfigPublishInput, ConfigRevisionCreateInput, ConfigRollbackInput,
+    ConfigTemplateInput, Database, NodeInput,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -72,15 +72,15 @@ async fn config_deployment_lifecycle_is_honest_and_rolls_forward() {
     let payload_one = json!({"inbounds":[{"tag":"one"}]});
     let hash_one = content_hash(&payload_one);
     let revision_one = database
-        .create_config_revision(
+        .create_config_revision(ConfigRevisionCreateInput {
             tenant_id,
-            template.id,
-            node.id,
-            1,
-            "1.0",
-            &payload_one,
-            &hash_one,
-        )
+            template_id: template.id,
+            node_id: node.id,
+            generation: 1,
+            core_version: "1.0",
+            payload: &payload_one,
+            content_hash: &hash_one,
+        })
         .await
         .unwrap()
         .unwrap();
@@ -139,15 +139,15 @@ async fn config_deployment_lifecycle_is_honest_and_rolls_forward() {
     let payload_two = json!({"inbounds":[{"tag":"two"}]});
     let hash_two = content_hash(&payload_two);
     let revision_two = database
-        .create_config_revision(
+        .create_config_revision(ConfigRevisionCreateInput {
             tenant_id,
-            template.id,
-            node.id,
-            2,
-            "1.0",
-            &payload_two,
-            &hash_two,
-        )
+            template_id: template.id,
+            node_id: node.id,
+            generation: 2,
+            core_version: "1.0",
+            payload: &payload_two,
+            content_hash: &hash_two,
+        })
         .await
         .unwrap()
         .unwrap();
@@ -182,15 +182,15 @@ async fn config_deployment_lifecycle_is_honest_and_rolls_forward() {
 
     let payload_draft = json!({"inbounds":[{"tag":"draft-three"}]});
     let draft_three = database
-        .create_config_revision(
+        .create_config_revision(ConfigRevisionCreateInput {
             tenant_id,
-            template.id,
-            node.id,
-            3,
-            "1.0",
-            &payload_draft,
-            &content_hash(&payload_draft),
-        )
+            template_id: template.id,
+            node_id: node.id,
+            generation: 3,
+            core_version: "1.0",
+            payload: &payload_draft,
+            content_hash: &content_hash(&payload_draft),
+        })
         .await
         .unwrap()
         .unwrap();

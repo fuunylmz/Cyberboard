@@ -19,10 +19,10 @@ use cyberboard_config::ApiConfig;
 use cyberboard_config_compiler::{ConfigProfile, hex_hash};
 use cyberboard_database::hash_session_token;
 use cyberboard_database::{
-    ConfigPublishInput, ConfigRevisionRecord, ConfigRollbackInput, ConfigTemplateInput,
-    ConfigTemplateRecord, ConfigTemplateUpdate, Database, NodeInput, NodeRecord, NodeUpdate,
-    PlanInput, PlanRecord, PlanUpdate, SubscriptionInput, SubscriptionRecord, SubscriptionUpdate,
-    UserRecord,
+    ConfigPublishInput, ConfigRevisionCreateInput, ConfigRevisionRecord, ConfigRollbackInput,
+    ConfigTemplateInput, ConfigTemplateRecord, ConfigTemplateUpdate, Database, NodeInput,
+    NodeRecord, NodeUpdate, PlanInput, PlanRecord, PlanUpdate, SubscriptionInput,
+    SubscriptionRecord, SubscriptionUpdate, UserRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -544,15 +544,15 @@ async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>)
             let refresh_token = new_refresh_token();
             refresh_token_response = Some(refresh_token.clone());
             if database
-                .create_session_with_refresh(
-                    state.config.tenant_id,
-                    user.id,
-                    &access_token,
-                    &refresh_token,
-                    "admin",
-                    ACCESS_TOKEN_TTL_SECS,
-                    REFRESH_TOKEN_TTL_SECS,
-                )
+                .create_session_with_refresh(cyberboard_database::SessionWithRefreshInput {
+                    tenant_id: state.config.tenant_id,
+                    user_id: user.id,
+                    access_token: &access_token,
+                    refresh_token: &refresh_token,
+                    role: "admin",
+                    access_ttl_seconds: ACCESS_TOKEN_TTL_SECS,
+                    refresh_ttl_seconds: REFRESH_TOKEN_TTL_SECS,
+                })
                 .await
                 .is_err()
             {
@@ -614,15 +614,15 @@ async fn portal_login(
             );
         }
         if database
-            .create_session_with_refresh(
-                state.config.tenant_id,
-                credentials.id,
-                &token,
-                &refresh_token,
-                "user",
-                ACCESS_TOKEN_TTL_SECS,
-                REFRESH_TOKEN_TTL_SECS,
-            )
+            .create_session_with_refresh(cyberboard_database::SessionWithRefreshInput {
+                tenant_id: state.config.tenant_id,
+                user_id: credentials.id,
+                access_token: &token,
+                refresh_token: &refresh_token,
+                role: "user",
+                access_ttl_seconds: ACCESS_TOKEN_TTL_SECS,
+                refresh_ttl_seconds: REFRESH_TOKEN_TTL_SECS,
+            })
             .await
             .is_err()
         {
@@ -2550,15 +2550,15 @@ async fn create_config_revision(
     };
     let content_hash = hex_hash(&payload);
     match db
-        .create_config_revision(
-            state.config.tenant_id,
-            request.template_id,
-            request.node_id,
-            request.generation,
-            request.core_version.trim(),
-            &rendered,
-            &content_hash,
-        )
+        .create_config_revision(ConfigRevisionCreateInput {
+            tenant_id: state.config.tenant_id,
+            template_id: request.template_id,
+            node_id: request.node_id,
+            generation: request.generation,
+            core_version: request.core_version.trim(),
+            payload: &rendered,
+            content_hash: &content_hash,
+        })
         .await
     {
         Ok(Some(record)) => {

@@ -105,22 +105,16 @@ impl Database {
 
     pub async fn create_session_with_refresh(
         &self,
-        tenant_id: Uuid,
-        user_id: Uuid,
-        access_token: &str,
-        refresh_token: &str,
-        role: &str,
-        access_ttl_seconds: i64,
-        refresh_ttl_seconds: i64,
+        input: SessionWithRefreshInput<'_>,
     ) -> DatabaseResult<()> {
         sqlx::query("INSERT INTO sessions(tenant_id,user_id,token_hash,role,expires_at,refresh_token_hash,refresh_expires_at) VALUES($1,$2,$3,$4,now()+make_interval(secs=>$5),$6,now()+make_interval(secs=>$7))")
-            .bind(tenant_id)
-            .bind(user_id)
-            .bind(hash_session_token(access_token))
-            .bind(role)
-            .bind(access_ttl_seconds as f64)
-            .bind(hash_session_token(refresh_token))
-            .bind(refresh_ttl_seconds as f64)
+            .bind(input.tenant_id)
+            .bind(input.user_id)
+            .bind(hash_session_token(input.access_token))
+            .bind(input.role)
+            .bind(input.access_ttl_seconds as f64)
+            .bind(hash_session_token(input.refresh_token))
+            .bind(input.refresh_ttl_seconds as f64)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -1576,16 +1570,10 @@ impl Database {
 
     pub async fn create_config_revision(
         &self,
-        tenant_id: Uuid,
-        template_id: Uuid,
-        node_id: Uuid,
-        generation: i64,
-        core_version: &str,
-        payload: &serde_json::Value,
-        content_hash: &str,
+        input: ConfigRevisionCreateInput<'_>,
     ) -> DatabaseResult<Option<ConfigRevisionRecord>> {
         let row = sqlx::query("INSERT INTO config_revisions (tenant_id,template_id,node_id,generation,core_type,core_version,content_hash,signature,validation_status,publish_status,payload) SELECT $1,$2,$3,$4,t.core_type,$5,$6,'','validated','draft',$7 FROM config_templates t JOIN nodes n ON n.tenant_id=$1 AND n.id=$3 WHERE t.tenant_id=$1 AND t.id=$2 AND t.status <> 'archived' RETURNING id,COALESCE(template_id::text,'') AS template_id,node_id,generation,core_version,content_hash,'pending' AS signature_status,validation_status,publish_status,failure_reason,created_at::text AS created_at")
-            .bind(tenant_id).bind(template_id).bind(node_id).bind(generation).bind(core_version).bind(content_hash).bind(payload).fetch_optional(&self.pool).await?;
+            .bind(input.tenant_id).bind(input.template_id).bind(input.node_id).bind(input.generation).bind(input.core_version).bind(input.content_hash).bind(input.payload).fetch_optional(&self.pool).await?;
         Ok(row.map(ConfigRevisionRecord::from_row))
     }
 
@@ -2106,17 +2094,17 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn ingest_agent_usage(
-        &self,
-        tenant_id: Uuid,
-        agent_id: &str,
-        node_id: Uuid,
-        batch_id: &str,
-        sequence: i64,
-        window_start: i64,
-        window_end: i64,
-        payload: &serde_json::Value,
-    ) -> DatabaseResult<bool> {
+    pub async fn ingest_agent_usage(&self, input: AgentUsageInput<'_>) -> DatabaseResult<bool> {
+        let AgentUsageInput {
+            tenant_id,
+            agent_id,
+            node_id,
+            batch_id,
+            sequence,
+            window_start,
+            window_end,
+            payload,
+        } = input;
         if batch_id.trim().is_empty() || window_end <= window_start {
             return Err(DatabaseError::InvalidUsagePayload(
                 "batch_id and usage window are required".to_owned(),
@@ -2223,14 +2211,17 @@ impl Database {
 
     pub async fn record_agent_upgrade_result(
         &self,
-        tenant_id: Uuid,
-        node_id: Uuid,
-        agent_id: &str,
-        target_version: &str,
-        success: bool,
-        error_code: Option<&str>,
-        error_message: Option<&str>,
+        input: AgentUpgradeResultInput<'_>,
     ) -> DatabaseResult<()> {
+        let AgentUpgradeResultInput {
+            tenant_id,
+            node_id,
+            agent_id,
+            target_version,
+            success,
+            error_code,
+            error_message,
+        } = input;
         sqlx::query(
             "INSERT INTO agent_upgrade_results
                 (tenant_id,node_id,agent_id,target_version,success,error_code,error_message)

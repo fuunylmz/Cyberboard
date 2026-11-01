@@ -1057,7 +1057,7 @@ impl Database {
             "SELECT n.id,n.name,n.region,n.address,n.status,n.core_type,n.core_version,n.agent_version,
                     n.current_config_revision,(SELECT generation FROM config_revisions WHERE tenant_id=n.tenant_id AND id=n.current_config_revision) AS desired_generation,
                     n.applied_config_revision,n.applied_generation,n.applied_at::text AS applied_at,n.agent_core_state,
-                    n.last_heartbeat_at::text AS last_heartbeat_at,COALESCE((SELECT sum(e.download_bytes+e.upload_bytes)::bigint FROM usage_events e WHERE e.tenant_id=n.tenant_id AND e.node_id=n.id AND e.received_at >= now()-interval '24 hours'),0)::bigint AS traffic_bytes_24h,n.port,n.tags
+                    n.last_heartbeat_at::text AS last_heartbeat_at,n.agent_memory_bytes,n.agent_cpu_percent,COALESCE((SELECT sum(e.download_bytes+e.upload_bytes)::bigint FROM usage_events e WHERE e.tenant_id=n.tenant_id AND e.node_id=n.id AND e.received_at >= now()-interval '24 hours'),0)::bigint AS traffic_bytes_24h,n.port,n.tags
              FROM nodes n WHERE n.tenant_id=$1 AND ($2::text IS NULL OR n.name ILIKE '%' || $2 || '%' OR n.address ILIKE '%' || $2 || '%') AND ($3::text IS NULL OR n.status=$3) ORDER BY n.created_at DESC,n.id LIMIT $4 OFFSET $5",
         )
         .bind(tenant_id).bind(search).bind(status).bind(limit).bind(offset)
@@ -1092,7 +1092,7 @@ impl Database {
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
              RETURNING id,name,region,address,status,core_type,core_version,agent_version,
                        current_config_revision,NULL::bigint AS desired_generation,applied_config_revision,applied_generation,applied_at::text AS applied_at,agent_core_state,
-                       last_heartbeat_at::text AS last_heartbeat_at,port,tags",
+                       last_heartbeat_at::text AS last_heartbeat_at,agent_memory_bytes,agent_cpu_percent,port,tags",
         )
         .bind(tenant_id)
         .bind(&node.name)
@@ -1147,7 +1147,7 @@ impl Database {
              RETURNING id,name,region,address,status,core_type,core_version,agent_version,
                        current_config_revision,(SELECT generation FROM config_revisions WHERE tenant_id=nodes.tenant_id AND id=nodes.current_config_revision) AS desired_generation,
                        applied_config_revision,applied_generation,applied_at::text AS applied_at,agent_core_state,
-                       last_heartbeat_at::text AS last_heartbeat_at,port,tags",
+                       last_heartbeat_at::text AS last_heartbeat_at,agent_memory_bytes,agent_cpu_percent,port,tags",
         )
         .bind(tenant_id).bind(node_id).bind(&node.name).bind(&node.region).bind(&node.address)
         .bind(node.port).bind(&node.core).bind(&node.core_version).bind(&node.status).bind(&node.tags)
@@ -2353,7 +2353,7 @@ impl Database {
         .bind(&heartbeat.platform)
         .bind(&heartbeat.architecture)
         .bind(&heartbeat.core_state)
-        .bind(heartbeat.memory_bytes as i64)
+        .bind(heartbeat.memory_bytes.map(|value| value as i64))
         .bind(heartbeat.disk_free_bytes as i64)
         .bind(heartbeat.cpu_percent)
         .execute(&self.pool)
@@ -2434,7 +2434,10 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn ingest_agent_usage(&self, input: AgentUsageInput<'_>) -> DatabaseResult<bool> {
+    pub async fn ingest_agent_usage(
+        &self,
+        input: AgentUsageInput<'_>,
+    ) -> DatabaseResult<UsageIngestOutcome> {
         let AgentUsageInput {
             tenant_id,
             agent_id,
@@ -2460,12 +2463,23 @@ impl Database {
             }
         }
 
-        let mut transaction = self.pool.begin().await?;
+        let node_matches_agent: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE tenant_id=$1 AND id=$2 AND agent_id=$3)",
+        )
+        .bind(tenant_id)
+        .bind(node_id)
+        .bind(agent_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !node_matches_agent {
+            transaction.rollback().await?;
+            tracing::warn!(tenant_id = %tenant_id, node_id = %node_id, agent_id, "usage report rejected because agent is not bound to node");
+            return Ok(UsageIngestOutcome::NodeMismatch);
+        }
         let receipt = sqlx::query(
             "INSERT INTO agent_usage_receipts
                 (tenant_id,node_id,agent_id,batch_id,sequence,window_start,window_end,usage_payload)
-             SELECT $1,$2,$3,$4,$5,to_timestamp($6),to_timestamp($7),$8
-             WHERE EXISTS (SELECT 1 FROM nodes WHERE tenant_id=$1 AND id=$2 AND agent_id=$3)
+             VALUES ($1,$2,$3,$4,$5,to_timestamp($6),to_timestamp($7),$8)
              ON CONFLICT (tenant_id,agent_id,batch_id) DO NOTHING",
         )
         .bind(tenant_id)
@@ -2480,7 +2494,7 @@ impl Database {
         .await?;
         if receipt.rows_affected() == 0 {
             transaction.commit().await?;
-            return Ok(false);
+            return Ok(UsageIngestOutcome::Duplicate);
         }
 
         for event in events {
@@ -2495,12 +2509,16 @@ impl Database {
                  JOIN subscription_nodes sn ON sn.tenant_id=s.tenant_id
                    AND sn.subscription_id=s.id AND sn.node_id=$3
                  WHERE u.tenant_id=$1 AND u.id=$2 AND u.status NOT IN ('deleted','banned')
-                   AND s.status='active' AND s.expires_at > now()
+                   AND s.status <> 'revoked'
+                   AND (s.starts_at IS NULL OR s.starts_at <= to_timestamp($4))
+                   AND s.expires_at >= to_timestamp($5)
                  ORDER BY s.created_at DESC,s.id LIMIT 1",
             )
             .bind(tenant_id)
             .bind(user_id)
             .bind(node_id)
+            .bind(event.window_start)
+            .bind(event.window_end)
             .fetch_optional(&mut *transaction)
             .await?;
             let Some(subscription_id) = subscription_id else {
@@ -2557,7 +2575,7 @@ impl Database {
             .await?;
         }
         transaction.commit().await?;
-        Ok(true)
+        Ok(UsageIngestOutcome::Inserted)
     }
 
     pub async fn active_agent_release(
@@ -2608,6 +2626,13 @@ impl Database {
         .await?;
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UsageIngestOutcome {
+    Inserted,
+    Duplicate,
+    NodeMismatch,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2669,6 +2694,9 @@ fn parse_usage_events(
                     "username is invalid".to_owned(),
                 ));
             }
+            if counter.download_bytes == 0 && counter.upload_bytes == 0 {
+                return Ok(None);
+            }
             let download_bytes = i64::try_from(counter.download_bytes).map_err(|_| {
                 DatabaseError::InvalidUsagePayload(
                     "download counter exceeds supported range".to_owned(),
@@ -2679,7 +2707,7 @@ fn parse_usage_events(
                     "upload counter exceeds supported range".to_owned(),
                 )
             })?;
-            Ok(ParsedUsageEvent {
+            Ok(Some(ParsedUsageEvent {
                 event_key: format!("{batch_id}:{}", counter.username),
                 user_id: Uuid::parse_str(&counter.username).ok(),
                 username: counter.username,
@@ -2687,9 +2715,10 @@ fn parse_usage_events(
                 window_end: default_window_end,
                 download_bytes,
                 upload_bytes,
-            })
+            }))
         })
-        .collect()
+        .collect::<DatabaseResult<Vec<_>>>()
+        .map(|events| events.into_iter().flatten().collect())
 }
 
 #[derive(Clone, Debug)]
@@ -2822,9 +2851,9 @@ pub struct AgentHeartbeatInput {
     pub platform: String,
     pub architecture: String,
     pub core_state: String,
-    pub memory_bytes: u64,
+    pub memory_bytes: Option<u64>,
     pub disk_free_bytes: u64,
-    pub cpu_percent: f64,
+    pub cpu_percent: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -2945,6 +2974,8 @@ pub struct NodeRecord {
     pub applied_at: Option<String>,
     pub core_state: Option<String>,
     pub last_heartbeat_at: Option<String>,
+    pub agent_memory_bytes: Option<i64>,
+    pub agent_cpu_percent: Option<f64>,
     pub traffic_bytes_24h: i64,
     pub port: i32,
     pub tags: serde_json::Value,
@@ -2968,6 +2999,8 @@ impl NodeRecord {
             applied_at: row.try_get("applied_at").ok().flatten(),
             core_state: row.try_get("agent_core_state").ok().flatten(),
             last_heartbeat_at: row.try_get("last_heartbeat_at").ok(),
+            agent_memory_bytes: row.try_get("agent_memory_bytes").ok(),
+            agent_cpu_percent: row.try_get("agent_cpu_percent").ok(),
             traffic_bytes_24h: row.try_get("traffic_bytes_24h").unwrap_or(0),
             port: row.get("port"),
             tags: row.get("tags"),

@@ -519,10 +519,52 @@ pub async fn binary_has_v2ray_api(binary: &Path) -> bool {
 }
 
 pub struct ProcessMetrics {
-    pub memory_bytes: u64,
-    pub cpu_percent: f64,
+    pub memory_bytes: Option<u64>,
+    pub cpu_percent: Option<f64>,
 }
 
+#[cfg(target_os = "linux")]
+pub async fn process_metrics(pids: &[u32]) -> Option<ProcessMetrics> {
+    use std::{collections::HashMap, fs};
+
+    fn read_proc(pids: &[u32]) -> HashMap<u32, (u64, u64)> {
+        let mut values = HashMap::new();
+        for pid in pids.iter().copied().filter(|pid| *pid > 0) {
+            let base = PathBuf::from(format!("/proc/{pid}"));
+            let Ok(stat) = fs::read_to_string(base.join("stat")) else { continue; };
+            let Some(close) = stat.rfind(')') else { continue; };
+            let fields: Vec<_> = stat[close + 1..].split_whitespace().collect();
+            if fields.len() <= 12 { continue; }
+            let (Ok(user_ticks), Ok(system_ticks)) = (fields[11].parse::<u64>(), fields[12].parse::<u64>()) else { continue; };
+            let Ok(status) = fs::read_to_string(base.join("status")) else { continue; };
+            let rss_kib = status.lines().find_map(|line| {
+                line.strip_prefix("VmRSS:")?.split_whitespace().next()?.parse::<u64>().ok()
+            });
+            if let Some(rss_kib) = rss_kib {
+                values.insert(pid, (rss_kib.saturating_mul(1024), user_ticks.saturating_add(system_ticks)));
+            }
+        }
+        values
+    }
+
+    let first = read_proc(pids);
+    if first.is_empty() { return None; }
+    let started = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let elapsed = started.elapsed().as_secs_f64();
+    let second = read_proc(pids);
+    let memory_bytes = second.values().map(|(rss, _)| *rss).sum();
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let cpu_percent = if ticks_per_second > 0 && !second.is_empty() && second.keys().all(|pid| first.contains_key(pid)) {
+        let cpu_ticks = second.iter().map(|(pid, (_, ticks))| ticks.saturating_sub(first[pid].1)).sum::<u64>();
+        Some((cpu_ticks as f64 / ticks_per_second as f64 / elapsed * 100.0).max(0.0))
+    } else {
+        None
+    };
+    Some(ProcessMetrics { memory_bytes: Some(memory_bytes), cpu_percent })
+}
+
+#[cfg(not(target_os = "linux"))]
 pub async fn process_metrics(pids: &[u32]) -> Option<ProcessMetrics> {
     let pid_list = pids
         .iter()
@@ -567,8 +609,8 @@ pub async fn process_metrics(pids: &[u32]) -> Option<ProcessMetrics> {
         found = true;
     }
     found.then_some(ProcessMetrics {
-        memory_bytes: memory_kib.saturating_mul(1024),
-        cpu_percent,
+        memory_bytes: Some(memory_kib.saturating_mul(1024)),
+        cpu_percent: Some(cpu_percent),
     })
 }
 
@@ -694,26 +736,29 @@ mod tests {
                 return;
             }
         };
-        let listener = match std::net::TcpListener::bind(("127.0.0.1", 18149)) {
-            Ok(listener) => listener,
-            Err(error) => {
-                eprintln!(
-                    "skipping real sing-box restart test: 127.0.0.1:18149 unavailable: {error}"
-                );
-                return;
-            }
-        };
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
         drop(listener);
 
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("sing-box.json");
-        let payload = br#"{"log":{"level":"error"},"inbounds":[{"type":"socks","tag":"local-socks","listen":"127.0.0.1","listen_port":18149}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}"#;
+        let payload = serde_json::json!({
+            "log": {"level": "error"},
+            "inbounds": [{"type": "socks", "tag": "local-socks", "listen": "127.0.0.1", "listen_port": port}],
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "route": {"final": "direct"}
+        });
+        let payload = serde_json::to_vec(&payload).unwrap();
         let mut supervisor =
             CoreSupervisor::new(&binary, &config, Duration::from_millis(500)).await;
         supervisor.initialize().await.unwrap();
+        let outcome = supervisor.apply(&payload, 1, &hash(&payload)).await;
         assert_eq!(
-            supervisor.apply(payload, 1, &hash(payload)).await.phase,
-            "applied"
+            outcome.phase,
+            "applied",
+            "apply failed: {}: {}",
+            outcome.error_code,
+            outcome.error_message
         );
         supervisor.shutdown().await;
 

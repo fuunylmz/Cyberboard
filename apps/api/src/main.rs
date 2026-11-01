@@ -811,6 +811,8 @@ struct NodeSummaryOwnedResponse {
     core_state: Option<String>,
     latency_ms: Option<u64>,
     last_heartbeat_at: Option<String>,
+    memory_bytes: Option<i64>,
+    cpu_percent: Option<f64>,
     traffic_bytes_24h: i64,
 }
 
@@ -1473,6 +1475,8 @@ fn node_summary_owned(record: NodeRecord) -> NodeSummaryOwnedResponse {
         core_state: record.core_state,
         latency_ms: None,
         last_heartbeat_at: record.last_heartbeat_at,
+        memory_bytes: record.agent_memory_bytes,
+        cpu_percent: record.agent_cpu_percent,
         traffic_bytes_24h: record.traffic_bytes_24h,
     }
 }

@@ -192,9 +192,9 @@ impl AgentControl for AgentControlService {
                         platform: request.platform.clone(),
                         architecture: request.architecture.clone(),
                         core_state: request.core_state.clone(),
-                        memory_bytes: request.memory_bytes.unwrap_or(0),
+                        memory_bytes: request.memory_bytes,
                         disk_free_bytes: request.disk_free_bytes,
-                        cpu_percent: request.cpu_percent.unwrap_or(0.0),
+                        cpu_percent: request.cpu_percent,
                     },
                 )
                 .await
@@ -319,7 +319,7 @@ impl AgentControl for AgentControlService {
             })).collect::<Vec<_>>(),
         });
         if let Some(database) = &self.database {
-            let _accepted = database
+            let outcome = database
                 .ingest_agent_usage(AgentUsageInput {
                     tenant_id: self.tenant_id,
                     agent_id: &request.agent_id,
@@ -337,6 +337,11 @@ impl AgentControl for AgentControlService {
                     }
                     _ => Status::internal("usage receipt persistence failed"),
                 })?;
+            if outcome == cyberboard_database::UsageIngestOutcome::NodeMismatch {
+                return Err(Status::permission_denied(
+                    "agent identity is not bound to the reported node",
+                ));
+            }
         }
         Ok(Response::new(Ack {
             request_id: Uuid::new_v4().to_string(),

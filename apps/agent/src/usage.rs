@@ -20,7 +20,7 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use tokio::time::{MissedTickBehavior, interval};
 use tonic::{
-    Request,
+    Code, Request,
     transport::{Channel, Endpoint},
 };
 use tracing::{info, warn};
@@ -31,6 +31,7 @@ use crate::tonic_transport::TonicAgentTransport;
 pub const USAGE_PAYLOAD_VERSION: u32 = 1;
 pub const USAGE_BUCKET_SECS: i64 = 60;
 pub const MAX_QUEUE_BATCHES: usize = 256;
+pub const MAX_DEAD_LETTERS: usize = 256;
 
 type CollectorFuture<'a> = Pin<Box<dyn Future<Output = io::Result<UsageSnapshot>> + Send + 'a>>;
 
@@ -58,6 +59,73 @@ pub struct UsageBatch {
     pub window_start: i64,
     pub window_end: i64,
     pub payload: UsageSnapshot,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DeadLetter {
+    batch: UsageBatch,
+    code: String,
+    message: String,
+}
+
+#[derive(Debug)]
+struct DeadLetterStore {
+    path: PathBuf,
+    entries: Vec<DeadLetter>,
+}
+
+impl DeadLetterStore {
+    fn open(queue_path: &Path) -> io::Result<Self> {
+        let path = queue_path.with_extension("dead-letter.json");
+        let entries = if path.exists() {
+            serde_json::from_slice(&fs::read(&path)?).map_err(|error| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("usage dead letter: {error}"))
+            })?
+        } else {
+            Vec::new()
+        };
+        Ok(Self { path, entries })
+    }
+
+    fn contains(&self, batch_id: &str) -> bool {
+        self.entries.iter().any(|entry| entry.batch.batch_id == batch_id)
+    }
+
+    fn append(&mut self, batch: UsageBatch, code: &str, message: &str) -> io::Result<()> {
+        if self.contains(&batch.batch_id) {
+            return Ok(());
+        }
+        self.entries.push(DeadLetter {
+            batch,
+            code: code.to_owned(),
+            message: message.chars().take(512).collect(),
+        });
+        if self.entries.len() > MAX_DEAD_LETTERS {
+            self.entries.remove(0);
+            warn!(max_entries = MAX_DEAD_LETTERS, "dropping oldest usage dead letter after capacity was reached");
+        }
+        let temp = self.path.with_extension("dead-letter-tmp");
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec_pretty(&self.entries)
+            .map_err(|error| io::Error::other(format!("serialize usage dead letter: {error}")))?;
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(temp, &self.path)?;
+        if let Some(parent) = self.path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -364,6 +432,16 @@ pub async fn run_reporting_loop(
             return;
         }
     };
+    let mut dead_letters = match DeadLetterStore::open(&queue_path) {
+        Ok(store) => store,
+        Err(error) => {
+            warn!(%error, "usage dead-letter file could not be opened; permanent errors will remain queued");
+            DeadLetterStore {
+                path: queue_path.with_extension("dead-letter.json"),
+                entries: Vec::new(),
+            }
+        }
+    };
     let mut collector: Option<Box<dyn UsageCollector>> = None;
     if !v2ray_api_supported {
         warn!("sing-box binary lacks with_v2ray_api; V2Ray traffic collection is disabled");
@@ -409,25 +487,43 @@ pub async fn run_reporting_loop(
             }
             _ = reporter.tick() => {
                 if let Err(error) = queue.flush_due(unix_now()) { warn!(%error, "usage bucket could not be persisted"); }
-                if queue.is_empty() {
-                    continue;
-                }
-                let batch = queue.front().cloned().expect("non-empty usage queue");
-                if transport.is_none() {
-                    match TonicAgentTransport::connect_with_backoff(&config, 1).await {
-                        Ok(client) => transport = Some(client),
-                        Err(error) => { warn!(%error, "could not connect to control plane for queued usage report"); continue; }
+                while let Some(batch) = queue.front().cloned() {
+                    if dead_letters.contains(&batch.batch_id) {
+                        if let Err(error) = queue.acknowledge(&batch.batch_id) { warn!(%error, "dead-lettered usage batch could not be removed"); break; }
+                        continue;
                     }
-                }
-                let request = ReportUsageRequest {
-                    agent_id: agent_id.clone(), node_id: node_id.clone(), batch_id: batch.batch_id.clone(),
-                    sequence: batch.sequence, window_start: batch.window_start, window_end: batch.window_end,
-                    usage_payload: to_proto_payload(&batch.payload).encode_to_vec(), agent_public_key: public_key.clone(),
-                };
-                match transport.as_mut().unwrap().report_usage(request).await {
-                    Ok(true) => { if let Err(error) = queue.acknowledge(&batch.batch_id) { warn!(%error, "acknowledged usage batch could not be removed"); } }
-                    Ok(false) => warn!(batch_id = %batch.batch_id, "control plane did not accept usage batch; it remains queued"),
-                    Err(error) => { warn!(%error, "usage report failed; batch remains queued for retry"); transport = None; }
+                    if transport.is_none() {
+                        match TonicAgentTransport::connect_with_backoff(&config, 1).await {
+                            Ok(client) => transport = Some(client),
+                            Err(error) => { warn!(%error, "could not connect to control plane for queued usage report"); break; }
+                        }
+                    }
+                    let request = ReportUsageRequest {
+                        agent_id: agent_id.clone(), node_id: node_id.clone(), batch_id: batch.batch_id.clone(),
+                        sequence: batch.sequence, window_start: batch.window_start, window_end: batch.window_end,
+                        usage_payload: to_proto_payload(&batch.payload).encode_to_vec(), agent_public_key: public_key.clone(),
+                    };
+                    match transport.as_mut().expect("transport connected").report_usage(request).await {
+                        Ok(true) => {
+                            if let Err(error) = queue.acknowledge(&batch.batch_id) { warn!(%error, "acknowledged usage batch could not be removed"); break; }
+                        }
+                        Ok(false) => {
+                            warn!(batch_id = %batch.batch_id, "control plane rejected usage batch; moving it to dead-letter store");
+                            if let Err(error) = dead_letters.append(batch.clone(), "rejected", "control plane rejected usage batch") { warn!(%error, "usage dead-letter append failed"); break; }
+                            if let Err(error) = queue.acknowledge(&batch.batch_id) { warn!(%error, "rejected usage batch could not be removed"); break; }
+                        }
+                        Err(error) if matches!(error.code(), Code::InvalidArgument | Code::PermissionDenied | Code::Unauthenticated | Code::FailedPrecondition) => {
+                            let code = format!("{:?}", error.code());
+                            error!(batch_id = %batch.batch_id, code, message = %error.message(), "permanent usage report failure moved to dead-letter store");
+                            if let Err(store_error) = dead_letters.append(batch.clone(), &code, error.message()) { warn!(%store_error, "usage dead-letter append failed"); break; }
+                            if let Err(store_error) = queue.acknowledge(&batch.batch_id) { warn!(%store_error, "dead-lettered usage batch could not be removed"); break; }
+                        }
+                        Err(error) => {
+                            warn!(%error, batch_id = %batch.batch_id, "transient usage report failure; batch remains queued for retry");
+                            transport = None;
+                            break;
+                        }
+                    }
                 }
             }
         }

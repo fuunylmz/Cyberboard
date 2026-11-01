@@ -365,13 +365,13 @@ async fn reconcile_once<T: AgentTransport>(
             state.generation.to_string()
         },
         core_state: core.core_state().into(),
-        memory_bytes: metrics.as_ref().map(|value| value.memory_bytes),
+        memory_bytes: metrics.as_ref().and_then(|value| value.memory_bytes),
         disk_free_bytes: runtime::disk_free_bytes(
             core.config_path()
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new(".")),
         ),
-        cpu_percent: metrics.map(|value| value.cpu_percent),
+        cpu_percent: metrics.and_then(|value| value.cpu_percent),
         unix_time: now,
         nonce: uuid::Uuid::new_v4().to_string(),
         agent_public_key: public_key.into(),

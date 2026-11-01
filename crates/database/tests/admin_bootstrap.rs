@@ -63,6 +63,7 @@ async fn admin_bootstrap_is_transactional_and_idempotent() {
     database
         .create_user(
             conflict_tenant,
+            Uuid::nil(),
             "existing@example.com",
             "existing-hash",
             "Existing User",

@@ -1308,6 +1308,7 @@ async fn admin_users(
 async fn create_admin_user(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
     Json(request): Json<CreateUserRequest>,
 ) -> Response {
     if let Err(response) = require_auth(&state, &headers) {
@@ -1336,6 +1337,7 @@ async fn create_admin_user(
     match database
         .create_user(
             state.config.tenant_id,
+            identity.user_id,
             request.email.trim(),
             &password_hash,
             request.display_name.trim(),
@@ -1351,6 +1353,7 @@ async fn create_admin_user(
 async fn update_admin_user(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
     Path(user_id): Path<uuid::Uuid>,
     Json(request): Json<UpdateUserRequest>,
 ) -> Response {
@@ -1371,6 +1374,7 @@ async fn update_admin_user(
     match database
         .update_user(
             state.config.tenant_id,
+            identity.user_id,
             user_id,
             request.email.as_deref(),
             request.display_name.as_deref(),
@@ -1395,6 +1399,7 @@ async fn update_admin_user(
 async fn delete_admin_user(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
     Path(user_id): Path<uuid::Uuid>,
 ) -> Response {
     if let Err(response) = require_auth(&state, &headers) {
@@ -1403,7 +1408,10 @@ async fn delete_admin_user(
     let Some(database) = state.database.as_ref() else {
         return service_unavailable_response();
     };
-    match database.delete_user(state.config.tenant_id, user_id).await {
+    match database
+        .delete_user(state.config.tenant_id, identity.user_id, user_id)
+        .await
+    {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
@@ -1599,6 +1607,7 @@ async fn admin_plans(
 async fn create_admin_plan(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
     Json(request): Json<PlanRequest>,
 ) -> Response {
     if let Err(response) = require_auth(&state, &headers) {
@@ -1625,7 +1634,10 @@ async fn create_admin_plan(
                 .collect(),
         ),
     };
-    match database.create_plan(state.config.tenant_id, &input).await {
+    match database
+        .create_plan(state.config.tenant_id, identity.user_id, &input)
+        .await
+    {
         Ok(record) => (StatusCode::CREATED, Json(plan_summary(record))).into_response(),
         Err(_) => internal_database_response(),
     }
@@ -1634,6 +1646,7 @@ async fn create_admin_plan(
 async fn update_admin_plan(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
     Path(plan_id): Path<uuid::Uuid>,
     Json(request): Json<PlanRequest>,
 ) -> Response {
@@ -1657,7 +1670,7 @@ async fn update_admin_plan(
             .map(|items| Value::Array(items.into_iter().map(Value::String).collect())),
     };
     match database
-        .update_plan(state.config.tenant_id, plan_id, &update)
+        .update_plan(state.config.tenant_id, identity.user_id, plan_id, &update)
         .await
     {
         Ok(Some(record)) => Json(plan_summary(record)).into_response(),
@@ -1669,6 +1682,7 @@ async fn update_admin_plan(
 async fn delete_admin_plan(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
     Path(plan_id): Path<uuid::Uuid>,
 ) -> Response {
     if let Err(response) = require_auth(&state, &headers) {
@@ -1677,7 +1691,10 @@ async fn delete_admin_plan(
     let Some(database) = state.database.as_ref() else {
         return service_unavailable_response();
     };
-    match database.delete_plan(state.config.tenant_id, plan_id).await {
+    match database
+        .delete_plan(state.config.tenant_id, identity.user_id, plan_id)
+        .await
+    {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => not_found_response("套餐不存在"),
         Err(_) => internal_database_response(),
@@ -1709,6 +1726,7 @@ fn plan_unavailable_response() -> Response {
 async fn create_admin_node(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
     Json(request): Json<NodeRequest>,
 ) -> Response {
     if let Err(response) = require_auth(&state, &headers) {
@@ -1736,7 +1754,10 @@ async fn create_admin_node(
                 .collect(),
         ),
     };
-    match database.create_node(state.config.tenant_id, &input).await {
+    match database
+        .create_node(state.config.tenant_id, identity.user_id, &input)
+        .await
+    {
         Ok(record) => (StatusCode::CREATED, Json(node_summary_owned(record))).into_response(),
         Err(_) => internal_database_response(),
     }
@@ -1745,6 +1766,7 @@ async fn create_admin_node(
 async fn update_admin_node(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
     Path(node_id): Path<uuid::Uuid>,
     Json(request): Json<NodeRequest>,
 ) -> Response {
@@ -1767,7 +1789,7 @@ async fn update_admin_node(
             .map(|items| Value::Array(items.into_iter().map(Value::String).collect())),
     };
     match database
-        .update_node(state.config.tenant_id, node_id, &update)
+        .update_node(state.config.tenant_id, identity.user_id, node_id, &update)
         .await
     {
         Ok(Some(record)) => Json(node_summary_owned(record)).into_response(),
@@ -1779,6 +1801,7 @@ async fn update_admin_node(
 async fn delete_admin_node(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
     Path(node_id): Path<uuid::Uuid>,
 ) -> Response {
     if let Err(response) = require_auth(&state, &headers) {
@@ -1787,7 +1810,10 @@ async fn delete_admin_node(
     let Some(database) = state.database.as_ref() else {
         return service_unavailable_response();
     };
-    match database.delete_node(state.config.tenant_id, node_id).await {
+    match database
+        .delete_node(state.config.tenant_id, identity.user_id, node_id)
+        .await
+    {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => not_found_response("节点不存在"),
         Err(_) => internal_database_response(),
@@ -1797,6 +1823,7 @@ async fn delete_admin_node(
 async fn create_admin_subscription(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
     Json(request): Json<SubscriptionRequest>,
 ) -> Response {
     if let Err(response) = require_auth(&state, &headers) {
@@ -1819,7 +1846,7 @@ async fn create_admin_subscription(
         subscription_token: format!("cb_{}", uuid::Uuid::new_v4().simple()),
     };
     match database
-        .create_subscription(state.config.tenant_id, &input)
+        .create_subscription(state.config.tenant_id, identity.user_id, &input)
         .await
     {
         Ok(record) => (
@@ -1834,6 +1861,7 @@ async fn create_admin_subscription(
 async fn update_admin_subscription(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<uuid::Uuid>,
     Json(request): Json<SubscriptionRequest>,
 ) -> Response {
@@ -1849,7 +1877,7 @@ async fn update_admin_subscription(
         starts_at: request.starts_at,
     };
     match database
-        .update_subscription(state.config.tenant_id, id, &update)
+        .update_subscription(state.config.tenant_id, identity.user_id, id, &update)
         .await
     {
         Ok(Some(record)) => Json(subscription_summary_owned(record, false)).into_response(),
@@ -1861,6 +1889,7 @@ async fn update_admin_subscription(
 async fn delete_admin_subscription(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<uuid::Uuid>,
 ) -> Response {
     if let Err(response) = require_auth(&state, &headers) {
@@ -1870,7 +1899,7 @@ async fn delete_admin_subscription(
         return service_unavailable_response();
     };
     match database
-        .delete_subscription(state.config.tenant_id, id)
+        .delete_subscription(state.config.tenant_id, identity.user_id, id)
         .await
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),

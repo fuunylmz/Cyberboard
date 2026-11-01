@@ -158,6 +158,10 @@ pub struct AgentConfig {
     pub client_key_path: Option<String>,
     pub tls_server_name: Option<String>,
     pub identity_path: String,
+    pub trusted_key: Option<String>,
+    pub core_config_path: String,
+    pub core_binary: String,
+    pub health_grace_ms: u64,
     pub insecure: bool,
 }
 
@@ -178,6 +182,12 @@ impl AgentConfig {
             tls_server_name: optional_env("CYBERBOARD_AGENT_TLS_SERVER_NAME"),
             identity_path: optional_env("CYBERBOARD_AGENT_IDENTITY_PATH")
                 .unwrap_or_else(|| "/var/lib/cyberboard/agent-identity.json".to_owned()),
+            trusted_key: optional_env("CYBERBOARD_AGENT_TRUSTED_KEY"),
+            core_config_path: optional_env("CYBERBOARD_AGENT_CONFIG_PATH")
+                .unwrap_or_else(|| "/var/lib/cyberboard/sing-box.json".to_owned()),
+            core_binary: optional_env("CYBERBOARD_SING_BOX_BINARY")
+                .unwrap_or_else(|| "sing-box".to_owned()),
+            health_grace_ms: env_u64("CYBERBOARD_AGENT_HEALTH_GRACE_MS", 3000)?,
             insecure: env_bool("CYBERBOARD_AGENT_INSECURE", false)?,
         })
     }

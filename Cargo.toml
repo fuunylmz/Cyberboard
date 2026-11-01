@@ -32,7 +32,8 @@ sha2 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "json", "migrate"] }
 thiserror = "2.0"
-tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "signal", "time", "process", "io-util", "fs"] }
+libc = "0.2.190"
 tonic = { version = "0.12", features = ["transport", "tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

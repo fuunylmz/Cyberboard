@@ -1155,6 +1155,51 @@ mod reconciliation_tests {
     }
 
     #[tokio::test]
+    async fn malformed_envelope_is_reported_as_invalid_and_deduplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_id = uuid::Uuid::from_u128(88).to_string();
+        let desired = DesiredStateResponse {
+            generation: "4".into(),
+            signed_config: b"not-json".to_vec(),
+            content_hash: "declared-hash".into(),
+            generation_number: 4,
+            ..Default::default()
+        };
+        let mut transport = FakeTransport {
+            desired,
+            heartbeats: Vec::new(),
+            reports: Vec::new(),
+            fail_first_report: false,
+        };
+        let mut core = runtime::CoreSupervisor::new(
+            fake_core(dir.path()),
+            dir.path().join("config.json"),
+            Duration::from_millis(20),
+        )
+        .await;
+        core.initialize().await.unwrap();
+        let context = ReconcileContext {
+            node_id: &node_id,
+            agent_id: "agent",
+            public_key: "pub",
+            core_versions: &[],
+            trusted_key: None,
+        };
+        let mut state = ReconcileState::default();
+        reconcile_once(&mut transport, &mut core, &context, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(transport.reports.len(), 1);
+        assert_eq!(transport.reports[0].error_code, "invalid_envelope");
+        reconcile_once(&mut transport, &mut core, &context, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(transport.reports.len(), 1);
+        assert!(core.state().content_hash.is_empty());
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn reports_once_and_retries_delivery_with_applied_heartbeat() {
         let dir = tempfile::tempdir().unwrap();
         let node = uuid::Uuid::from_u128(44);

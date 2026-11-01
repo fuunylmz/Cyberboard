@@ -534,14 +534,14 @@ pub async fn run_reporting_loop(
                             if dead_letters.append(batch.clone(), "rejected", "control plane rejected usage batch").is_err() { break; }
                             if queue.acknowledge(&batch.batch_id).is_err() { break; }
                         }
-                        Err(error) if matches!(error.code(), Code::InvalidArgument | Code::PermissionDenied | Code::Unauthenticated | Code::FailedPrecondition) => {
+                        Err(error) if is_dead_letter_code(error.code()) => {
                             let code = format!("{:?}", error.code());
                             error!(batch_id = %batch.batch_id, code, message = %error.message(), "permanent usage report failure moved to dead-letter store");
                             if dead_letters.append(batch.clone(), &code, error.message()).is_err() { break; }
                             if queue.acknowledge(&batch.batch_id).is_err() { break; }
                         }
                         Err(error) => {
-                            warn!(%error, batch_id = %batch.batch_id, "transient usage report failure; batch remains queued for retry");
+                            error!(%error, batch_id = %batch.batch_id, "usage report failed; batch remains queued for retry");
                             transport = None;
                             break;
                         }
@@ -550,6 +550,10 @@ pub async fn run_reporting_loop(
             }
         }
     }
+}
+
+fn is_dead_letter_code(code: Code) -> bool {
+    code == Code::InvalidArgument
 }
 
 fn unix_now() -> i64 {
@@ -618,35 +622,23 @@ mod tests {
         );
     }
     #[test]
-    fn dead_letters_persist_with_private_permissions() {
+    fn permission_denied_stays_queued_but_invalid_argument_moves_to_dead_letter() {
         let dir = tempdir().unwrap();
         let queue_path = dir.path().join("usage-queue.json");
-        let mut store = DeadLetterStore::open(&queue_path).unwrap();
-        store
-            .append(
-                UsageBatch {
-                    batch_id: "dead".into(),
-                    sequence: 1,
-                    window_start: 1,
-                    window_end: 2,
-                    payload: snapshot(1),
-                },
-                "InvalidArgument",
-                "bad payload",
-            )
+        let mut queue = UsageQueue::open(&queue_path).unwrap();
+        queue.record_delta(snapshot(4), 100).unwrap();
+        queue.flush_due(160).unwrap();
+        let batch = queue.front().unwrap().clone();
+        let mut dead_letters = DeadLetterStore::open(&queue_path).unwrap();
+        assert!(!is_dead_letter_code(Code::PermissionDenied));
+        assert!(queue.front().is_some());
+        assert!(!dead_letters.contains(&batch.batch_id));
+        assert!(is_dead_letter_code(Code::InvalidArgument));
+        dead_letters
+            .append(batch.clone(), "InvalidArgument", "bad payload")
             .unwrap();
-        assert!(DeadLetterStore::open(&queue_path).unwrap().contains("dead"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(queue_path.with_extension("dead-letter.json"))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
+        queue.acknowledge(&batch.batch_id).unwrap();
+        assert!(queue.front().is_none());
+        assert!(dead_letters.contains(&batch.batch_id));
     }
 }

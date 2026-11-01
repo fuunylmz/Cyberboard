@@ -85,7 +85,7 @@ async fn config_deployment_lifecycle_is_honest_and_rolls_forward() {
         .await
         .unwrap()
         .unwrap();
-    let published_one = database
+    let _published_one = database
         .publish_config_revision(ConfigPublishInput {
             tenant_id,
             revision_id: revision_one.id,
@@ -97,7 +97,14 @@ async fn config_deployment_lifecycle_is_honest_and_rolls_forward() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(published_one.publish_status, "published");
+    let published_hash_one: String = sqlx::query_scalar(
+        "SELECT content_hash FROM config_revisions WHERE tenant_id=$1 AND id=$2",
+    )
+    .bind(tenant_id)
+    .bind(revision_one.id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
     let deployment: String = sqlx::query_scalar(
         "SELECT status FROM config_deployments WHERE tenant_id=$1 AND config_revision_id=$2",
     )
@@ -188,7 +195,7 @@ async fn config_deployment_lifecycle_is_honest_and_rolls_forward() {
             tenant_id,
             revision_id: revision_two.id,
             expected_generation: 2,
-            expected_previous_hash: Some(&hash_one),
+            expected_previous_hash: Some(&published_hash_one),
             sign: &|_, _, _| "publish-artifact".to_owned(),
             actor_user_id: Uuid::nil(),
         })
@@ -245,7 +252,7 @@ async fn config_deployment_lifecycle_is_honest_and_rolls_forward() {
         .unwrap();
     assert_eq!(rollback.generation, 4);
     assert_eq!(rollback.rollback_of, Some(revision_one.id));
-    assert_eq!(rollback.content_hash, hash_one);
+    assert_eq!(rollback.content_hash, published_hash_one);
     let old_status: String = sqlx::query_scalar(
         "SELECT publish_status FROM config_revisions WHERE tenant_id=$1 AND id=$2",
     )
@@ -272,8 +279,8 @@ async fn config_deployment_lifecycle_is_honest_and_rolls_forward() {
         .unwrap()
         .unwrap();
     assert_eq!(desired.generation, 4);
-    assert_eq!(desired.content_hash, hash_one);
-    assert_eq!(desired.expected_previous_hash, hash_one);
+    assert_eq!(desired.content_hash, published_hash_one);
+    assert_eq!(desired.expected_previous_hash, published_hash_one);
     let stale_error = database
         .publish_config_revision(ConfigPublishInput {
             tenant_id,

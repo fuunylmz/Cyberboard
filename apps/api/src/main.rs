@@ -2349,12 +2349,22 @@ fn applied_subscription_outbound(
             }
             _ => &credentials.password,
         };
+        let user_name = user_id.to_string();
         let has_user = users.iter().any(|user| match inbound_type {
-            "vless" | "vmess" => uuid_value_matches(&user["uuid"], credentials.uuid),
-            "trojan" => user["password"].as_str() == Some(credentials.password.as_str()),
-            "shadowsocks" => user["password"].as_str() == Some(expected_password.as_str()),
+            "vless" | "vmess" => {
+                user["name"].as_str() == Some(user_name.as_str())
+                    && uuid_value_matches(&user["uuid"], credentials.uuid)
+            }
+            "trojan" => {
+                user["name"].as_str() == Some(user_name.as_str())
+                    && user["password"].as_str() == Some(credentials.password.as_str())
+            }
+            "shadowsocks" => {
+                user["name"].as_str() == Some(user_name.as_str())
+                    && user["password"].as_str() == Some(expected_password.as_str())
+            }
             "mixed" => {
-                user["username"].as_str() == Some(user_id.to_string().as_str())
+                user["username"].as_str() == Some(user_name.as_str())
                     && user["password"].as_str() == Some(credentials.password.as_str())
             }
             _ => false,
@@ -3389,14 +3399,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         DEMO_ACCESS_TOKEN, DEMO_GENERATED_AT, DEMO_PORTAL_ACCESS_TOKEN,
-        create_order_error_response, router,
+        applied_subscription_outbound, create_order_error_response, router,
     };
     use axum::{
         body::{Body, to_bytes},
         http::{HeaderMap, Request, StatusCode, header},
     };
     use cyberboard_config::ApiConfig;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -3465,6 +3475,57 @@ mod tests {
         let first = serde_json::to_vec(&rendered).unwrap();
         let round_trip: Value = serde_json::from_slice(&first).unwrap();
         assert_eq!(serde_json::to_vec(&round_trip).unwrap(), first);
+    }
+
+    #[test]
+    fn subscription_outbound_uses_applied_protocol_and_own_credential() {
+        let user_id = Uuid::from_u128(3);
+        let credentials = cyberboard_database::ProxyCredentialsRecord {
+            user_id,
+            password: "own-password".into(),
+            uuid: Uuid::from_u128(4),
+            shadowsocks_2022_key_128: "own-ss-128".into(),
+            shadowsocks_2022_key_256: "own-ss-256".into(),
+        };
+        let node = cyberboard_database::NodeRecord {
+            id: Uuid::from_u128(5),
+            name: "node".into(),
+            region: "test".into(),
+            address: "127.0.0.1".into(),
+            status: "online".into(),
+            core: "sing-box".into(),
+            core_version: "1.14.4".into(),
+            agent_version: "test".into(),
+            current_config_revision: Some(Uuid::from_u128(6)),
+            desired_generation: Some(2),
+            applied_config_revision: Some(Uuid::from_u128(6)),
+            applied_generation: Some(2),
+            applied_at: Some("now".into()),
+            core_state: Some("running".into()),
+            last_heartbeat_at: None,
+            port: 443,
+            tags: json!([]),
+        };
+        let payload = json!({
+            "inbounds": [{
+                "type": "vless",
+                "transport": {"type": "ws", "path": "/ws"},
+                "tls": {"enabled": true, "server_name": "example.test", "certificate_path": "/secret/cert", "key_path": "/secret/key"},
+                "users": [
+                    {"name": user_id, "uuid": credentials.uuid},
+                    {"name": Uuid::from_u128(7), "uuid": Uuid::from_u128(8)}
+                ]
+            }]
+        });
+        let outbound =
+            applied_subscription_outbound(&node, &payload, user_id, &credentials).unwrap();
+        assert_eq!(outbound["type"], "vless");
+        assert_eq!(outbound["server_port"], 443);
+        assert_eq!(outbound["uuid"], json!(credentials.uuid));
+        assert_eq!(outbound["transport"]["path"], "/ws");
+        assert_eq!(outbound["tls"]["server_name"], "example.test");
+        assert!(outbound["tls"].get("certificate_path").is_none());
+        assert!(outbound.get("users").is_none());
     }
 
     #[tokio::test]

@@ -86,6 +86,7 @@ pub struct ApiConfig {
     pub demo_user_password: String,
     pub dev_mode: bool,
     pub tenant_id: Uuid,
+    pub config_envelope_ttl_secs: u64,
 }
 
 impl ApiConfig {
@@ -113,6 +114,8 @@ impl ApiConfig {
                 .map(|value| Uuid::parse_str(&value))
                 .transpose()?
                 .unwrap_or_else(|| Uuid::from_u128(1)),
+            config_envelope_ttl_secs: env_u64("CYBERBOARD_CONFIG_ENVELOPE_TTL_SECS", 300)?
+                .clamp(60, 3600),
         })
     }
 

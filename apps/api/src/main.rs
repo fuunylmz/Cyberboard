@@ -15,16 +15,15 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use cyberboard_config::ApiConfig;
-use cyberboard_config_compiler::{ConfigProfile, SignedConfigEnvelope, hex_hash};
+use cyberboard_config_compiler::{ConfigProfile, hex_hash};
 use cyberboard_database::hash_session_token;
 use cyberboard_database::{
-    ConfigRevisionRecord, ConfigTemplateInput, ConfigTemplateRecord, ConfigTemplateUpdate,
-    Database, NodeInput, NodeRecord, NodeUpdate, PlanInput, PlanRecord, PlanUpdate,
-    SubscriptionInput, SubscriptionRecord, SubscriptionUpdate, UserRecord,
+    ConfigPublishInput, ConfigRevisionRecord, ConfigRollbackInput, ConfigTemplateInput,
+    ConfigTemplateRecord, ConfigTemplateUpdate, Database, NodeInput, NodeRecord, NodeUpdate,
+    PlanInput, PlanRecord, PlanUpdate, SubscriptionInput, SubscriptionRecord, SubscriptionUpdate,
+    UserRecord,
 };
-use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -32,6 +31,7 @@ use tracing::info;
 use uuid::Uuid;
 
 mod agent_control;
+mod signing;
 
 const DEMO_ACCESS_TOKEN: &str = "cyberboard-dev-token";
 const DEMO_PORTAL_ACCESS_TOKEN: &str = "cyberboard-portal-dev-token";
@@ -47,6 +47,7 @@ struct AppState {
     demo_access_token: Arc<str>,
     demo_portal_access_token: Arc<str>,
     database: Option<Arc<Database>>,
+    config_signer: Option<Arc<signing::ConfigSigner>>,
     portal_sessions: Arc<RwLock<HashMap<String, PortalIdentity>>>,
 }
 
@@ -160,6 +161,7 @@ impl AppState {
             demo_access_token: Arc::from(DEMO_ACCESS_TOKEN),
             demo_portal_access_token: Arc::from(DEMO_PORTAL_ACCESS_TOKEN),
             database: None,
+            config_signer: None,
             portal_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -182,6 +184,7 @@ impl AppState {
             demo_access_token: Arc::from(token),
             demo_portal_access_token: Arc::from(DEMO_PORTAL_ACCESS_TOKEN),
             database: None,
+            config_signer: None,
             portal_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -353,6 +356,17 @@ fn service_unavailable_response() -> Response {
         Json(ApiErrorResponse {
             code: "database_unavailable",
             message: "数据库未配置或不可用",
+        }),
+    )
+        .into_response()
+}
+
+fn signing_key_unavailable_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiErrorResponse {
+            code: "signing_key_unavailable",
+            message: "配置签名密钥不可用",
         }),
     )
         .into_response()
@@ -2301,6 +2315,14 @@ fn invalid_input_response(message: &'static str) -> Response {
         .into_response()
 }
 
+fn config_conflict_response(code: &'static str, message: &'static str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(ApiErrorResponse { code, message }),
+    )
+        .into_response()
+}
+
 fn conflict_response(message: &'static str) -> Response {
     (
         StatusCode::CONFLICT,
@@ -2327,6 +2349,7 @@ struct ConfigTemplateRequest {
 struct ConfigRevisionAction {
     expected_generation: Option<i64>,
     expected_previous_hash: Option<String>,
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2340,26 +2363,9 @@ struct ConfigRevisionCreateRequest {
     payload: Value,
 }
 
-fn config_signing_key() -> Result<(SigningKey, String), Response> {
-    let encoded = std::env::var("CYBERBOARD_CONFIG_SIGNING_KEY")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| service_unavailable_response())?;
-    let bytes = BASE64
-        .decode(encoded)
-        .map_err(|_| service_unavailable_response())?;
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| service_unavailable_response())?;
-    let key_id = std::env::var("CYBERBOARD_CONFIG_SIGNING_KEY_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "config-key-1".to_owned());
-    Ok((SigningKey::from_bytes(&bytes), key_id))
-}
-
 async fn signed_envelope_for_revision(
     database: &Database,
+    signer: &signing::ConfigSigner,
     tenant_id: Uuid,
     revision_id: Uuid,
 ) -> Result<String, Response> {
@@ -2377,19 +2383,14 @@ async fn signed_envelope_for_revision(
             "配置版本内容 hash 与 payload 不一致",
         ));
     }
-    let (signing_key, key_id) = config_signing_key()?;
-    let issued_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let envelope = SignedConfigEnvelope::sign(
-        &signing_key,
-        key_id,
+    let envelope = signer.sign(
         revision.node_id,
         revision.generation.max(0) as u64,
-        issued_at,
-        issued_at + 300,
         payload,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
     );
     serde_json::to_string(&envelope).map_err(|_| internal_database_response())
 }
@@ -2399,7 +2400,7 @@ fn config_template_json(record: ConfigTemplateRecord) -> Value {
 }
 
 fn config_revision_json(record: ConfigRevisionRecord) -> Value {
-    json!({"id":record.id,"templateId":record.template_id,"nodeId":record.node_id,"nodeName":record.node_name,"generation":record.generation,"coreVersion":record.core_version,"contentHash":record.content_hash,"signatureStatus":record.signature_status,"validationStatus":record.validation_status,"publishStatus":record.publish_status,"failureReason":record.failure_reason,"createdAt":record.created_at})
+    json!({"id":record.id,"templateId":record.template_id,"nodeId":record.node_id,"nodeName":record.node_name,"generation":record.generation,"coreVersion":record.core_version,"contentHash":record.content_hash,"signatureStatus":record.signature_status,"validationStatus":record.validation_status,"publishStatus":record.publish_status,"failureReason":record.failure_reason,"createdAt":record.created_at,"deploymentStatus":record.deployment_status,"deploymentKind":record.deployment_kind,"deploymentErrorCode":record.deployment_error_code,"deploymentErrorMessage":record.deployment_error_message,"deploymentUpdatedAt":record.deployment_updated_at,"rollbackOf":record.rollback_of})
 }
 
 async fn list_config_templates(
@@ -2542,6 +2543,7 @@ async fn create_config_revision(
         Ok(config) => config,
         Err(_) => return invalid_input_response("配置模型未通过 sing-box 校验"),
     };
+    // Keep serde_json preserve_order disabled so object maps serialize deterministically.
     let payload = match serde_json::to_vec(&rendered) {
         Ok(payload) => payload,
         Err(_) => return internal_database_response(),
@@ -2570,68 +2572,104 @@ async fn create_config_revision(
 
 async fn publish_config_revision(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<uuid::Uuid>,
     Json(action): Json<ConfigRevisionAction>,
 ) -> Response {
-    if let Err(response) = require_auth(&state, &headers) {
-        return response;
-    }
+    let Some(signer) = state.config_signer.as_deref() else {
+        return signing_key_unavailable_response();
+    };
     let Some(db) = state.database.as_ref() else {
         return service_unavailable_response();
     };
     let Some(generation) = action.expected_generation else {
         return invalid_input_response("expectedGeneration不能为空");
     };
-    let signed_envelope = match signed_envelope_for_revision(db, state.config.tenant_id, id).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
+    let signed_envelope =
+        match signed_envelope_for_revision(db, signer, identity.tenant_id, id).await {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
     match db
-        .set_config_publish_status(
-            state.config.tenant_id,
-            id,
-            generation,
-            "published",
-            action.expected_previous_hash.as_deref(),
-            Some(&signed_envelope),
-        )
+        .publish_config_revision(ConfigPublishInput {
+            tenant_id: identity.tenant_id,
+            revision_id: id,
+            expected_generation: generation,
+            expected_previous_hash: action.expected_previous_hash.as_deref(),
+            signed_envelope: &signed_envelope,
+            actor_user_id: identity.user_id,
+        })
         .await
     {
         Ok(Some(record)) => Json(config_revision_json(record)).into_response(),
-        Ok(None) => conflict_response("配置版本 generation 冲突或不存在"),
+        Ok(None) => not_found_response("配置版本不存在"),
+        Err(cyberboard_database::DatabaseError::ConfigConflict("generation_mismatch")) => {
+            config_conflict_response("generation_mismatch", "配置版本 generation 与请求不一致")
+        }
+        Err(cyberboard_database::DatabaseError::ConfigConflict("already_published")) => {
+            config_conflict_response("already_published", "配置版本已发布")
+        }
+        Err(cyberboard_database::DatabaseError::ConfigConflict("stale_generation")) => {
+            config_conflict_response("stale_generation", "配置版本 generation 未超过当前期望版本")
+        }
+        Err(cyberboard_database::DatabaseError::ConfigConflict("previous_hash_mismatch")) => {
+            config_conflict_response("previous_hash_mismatch", "当前配置 hash 已变化")
+        }
+        Err(cyberboard_database::DatabaseError::ConfigConflict("not_validated")) => {
+            config_conflict_response("not_validated", "配置版本尚未验证")
+        }
         Err(_) => internal_database_response(),
     }
 }
 
 async fn rollback_config_revision(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<uuid::Uuid>,
     Json(action): Json<ConfigRevisionAction>,
 ) -> Response {
-    if let Err(response) = require_auth(&state, &headers) {
-        return response;
-    }
+    let Some(signer) = state.config_signer.as_deref() else {
+        return signing_key_unavailable_response();
+    };
     let Some(db) = state.database.as_ref() else {
         return service_unavailable_response();
     };
     let Some(generation) = action.expected_generation else {
         return invalid_input_response("expectedGeneration不能为空");
     };
+    let sign = |node_id, new_generation, payload| {
+        let issued_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        serde_json::to_string(&signer.sign(node_id, new_generation, payload, issued_at))
+            .unwrap_or_default()
+    };
     match db
-        .set_config_publish_status(
-            state.config.tenant_id,
-            id,
-            generation,
-            "rolled_back",
-            action.expected_previous_hash.as_deref(),
-            None,
-        )
+        .rollback_config_revision(ConfigRollbackInput {
+            tenant_id: identity.tenant_id,
+            revision_id: id,
+            expected_generation: generation,
+            actor_user_id: identity.user_id,
+            reason: action.reason.as_deref(),
+            sign: &sign,
+        })
         .await
     {
         Ok(Some(record)) => Json(config_revision_json(record)).into_response(),
-        Ok(None) => conflict_response("配置版本 generation 冲突或不存在"),
+        Ok(None) => not_found_response("配置版本不存在"),
+        Err(cyberboard_database::DatabaseError::NoRollbackTarget) => {
+            config_conflict_response("no_rollback_target", "没有可用的已应用回滚目标")
+        }
+        Err(cyberboard_database::DatabaseError::ConfigConflict("generation_mismatch")) => {
+            config_conflict_response("generation_mismatch", "配置版本 generation 与请求不一致")
+        }
+        Err(cyberboard_database::DatabaseError::ConfigConflict("not_current_desired")) => {
+            config_conflict_response("not_current_desired", "只能回滚节点当前期望版本")
+        }
+        Err(cyberboard_database::DatabaseError::ConfigConflict("not_published")) => {
+            config_conflict_response("not_published", "配置版本尚未发布")
+        }
         Err(_) => internal_database_response(),
     }
 }
@@ -2981,7 +3019,7 @@ async fn openapi() -> Json<Value> {
                 "SessionSummary": { "type":"object", "required":["id","role","issuedAt","expiresAt","revokedAt","active","current"], "properties":{"id":{"type":"string","format":"uuid"},"role":{"type":"string"},"issuedAt":{"type":"string","format":"date-time"},"expiresAt":{"type":"string","format":"date-time"},"revokedAt":{"type":["string","null"],"format":"date-time"},"active":{"type":"boolean"},"current":{"type":"boolean"}} },
                 "SessionList": { "type":"object", "required":["items","total","page","pageSize"], "properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/SessionSummary"}},"total":{"type":"integer"},"page":{"type":"integer"},"pageSize":{"type":"integer"}} },
                 "ConfigTemplateRequest": { "type":"object", "properties":{"name":{"type":"string"},"description":{"type":"string"},"coreType":{"type":"string","default":"sing-box"},"coreVersionRange":{"type":"string","default":"*"},"status":{"type":"string","enum":["draft","active","archived"]}} },
-                "ConfigRevisionAction": { "type":"object", "required":["expectedGeneration"], "properties":{"expectedGeneration":{"type":"integer","format":"int64"},"expectedPreviousHash":{"type":"string"}} },
+                "ConfigRevisionAction": { "type":"object", "required":["expectedGeneration"], "properties":{"expectedGeneration":{"type":"integer","format":"int64"},"expectedPreviousHash":{"type":"string"},"reason":{"type":"string"}} },
                 "ConfigRevisionCreateRequest": { "type":"object", "required":["templateId","nodeId","generation","coreVersion","payload"], "properties":{"templateId":{"type":"string","format":"uuid"},"nodeId":{"type":"string","format":"uuid"},"generation":{"type":"integer","format":"int64","minimum":1},"coreVersion":{"type":"string"},"payload":{"type":"object","description":"ConfigProfile JSON; server validates and renders canonical sing-box payload"}} }
             }
         }
@@ -3121,6 +3159,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     cyberboard_observability::init("cyberboard_api");
 
     let config = ApiConfig::from_env()?;
+    let config_signer =
+        signing::ConfigSigner::from_env(config.config_envelope_ttl_secs)?.map(Arc::new);
+    if config_signer.is_none() {
+        tracing::warn!(
+            "CYBERBOARD_CONFIG_SIGNING_KEY is unset; config publish and delivery are disabled"
+        );
+    }
     let address = config.socket_addr()?;
     let database = if let Some(database_url) = config.database_url.as_deref() {
         let database = Database::connect(database_url).await?;
@@ -3130,10 +3175,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let state = AppState::with_database(config, database);
+    let mut state = AppState::with_database(config, database);
+    state.config_signer = config_signer.clone();
     let grpc_address: std::net::SocketAddr = state.config.agent_grpc_addr.parse()?;
-    let grpc_service =
-        agent_control::AgentControlService::new(state.config.tenant_id, state.database.clone());
+    let grpc_service = agent_control::AgentControlService::new(
+        state.config.tenant_id,
+        state.database.clone(),
+        config_signer,
+    );
     let mut grpc_builder = tonic::transport::Server::builder();
     match (
         state.config.agent_grpc_server_cert.as_deref(),
@@ -3209,6 +3258,71 @@ mod tests {
     use uuid::Uuid;
 
     #[tokio::test]
+    async fn config_actions_report_signer_before_database_unavailability() {
+        for action in ["publish", "rollback"] {
+            let uri = format!(
+                "/api/v1/admin/config-revisions/{}/{}",
+                Uuid::from_u128(9),
+                action
+            );
+            let request = || {
+                Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {DEMO_ACCESS_TOKEN}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"expectedGeneration":1}"#))
+                    .unwrap()
+            };
+            let no_signer = router(test_state()).oneshot(request()).await.unwrap();
+            assert_eq!(no_signer.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(no_signer.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["code"], "signing_key_unavailable");
+
+            let mut state = test_state();
+            state.config_signer = Some(std::sync::Arc::new(
+                super::signing::ConfigSigner::from_seed([5; 32], "test".into(), 60),
+            ));
+            let no_database = router(state).oneshot(request()).await.unwrap();
+            assert_eq!(no_database.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body: Value = serde_json::from_slice(
+                &to_bytes(no_database.into_body(), usize::MAX).await.unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["code"], "database_unavailable");
+        }
+    }
+
+    #[test]
+    fn rendered_config_json_round_trip_is_byte_stable() {
+        use cyberboard_config_compiler::{ConfigProfile, Credential, Inbound, Route, Transport};
+        let profile = ConfigProfile {
+            schema_version: 1,
+            node_id: Uuid::from_u128(1),
+            generation: 3,
+            inbounds: vec![Inbound {
+                tag: "vless-in".into(),
+                listen: "0.0.0.0".into(),
+                listen_port: 443,
+                inbound_type: "vless".into(),
+                transport: Transport::Websocket { path: "/ws".into() },
+                tls: None,
+                credential: Credential::Uuid {
+                    uuid: Uuid::from_u128(2),
+                },
+            }],
+            outbounds: vec![],
+            route: Route::default(),
+        };
+        let rendered = profile.render_sing_box().unwrap();
+        let first = serde_json::to_vec(&rendered).unwrap();
+        let round_trip: Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(serde_json::to_vec(&round_trip).unwrap(), first);
+    }
+
+    #[tokio::test]
     async fn health_endpoint_is_available() {
         let state = test_state();
         let response = router(state)
@@ -3252,6 +3366,7 @@ mod tests {
                 demo_user_password: "password".to_owned(),
                 dev_mode: true,
                 tenant_id: uuid::Uuid::from_u128(1),
+                config_envelope_ttl_secs: 300,
             },
             DEMO_ACCESS_TOKEN,
         )

@@ -3535,6 +3535,9 @@ mod tests {
             applied_at: Some("now".into()),
             core_state: Some("running".into()),
             last_heartbeat_at: None,
+            agent_memory_bytes: None,
+            agent_cpu_percent: None,
+            traffic_bytes_24h: 0,
             port: 443,
             tags: json!([]),
         };
@@ -3586,6 +3589,9 @@ mod tests {
             applied_at: None,
             core_state: None,
             last_heartbeat_at: None,
+            agent_memory_bytes: None,
+            agent_cpu_percent: None,
+            traffic_bytes_24h: 0,
             port: 443,
             tags: json!([]),
         };

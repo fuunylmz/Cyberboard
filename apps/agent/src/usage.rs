@@ -23,7 +23,7 @@ use tonic::{
     Code, Request,
     transport::{Channel, Endpoint},
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::tonic_transport::TonicAgentTransport;
@@ -46,8 +46,6 @@ pub struct UserCounter {
     pub upload_bytes: u64,
 }
 
-/// Sources return bytes observed since their previous sample. A V2Ray
-/// QueryStats(reset=true) call provides exactly these deltas atomically.
 pub trait UsageCollector: Send {
     fn collect(&mut self) -> CollectorFuture<'_>;
 }
@@ -68,7 +66,6 @@ struct DeadLetter {
     message: String,
 }
 
-#[derive(Debug)]
 struct DeadLetterStore {
     path: PathBuf,
     entries: Vec<DeadLetter>,
@@ -79,7 +76,10 @@ impl DeadLetterStore {
         let path = queue_path.with_extension("dead-letter.json");
         let entries = if path.exists() {
             serde_json::from_slice(&fs::read(&path)?).map_err(|error| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("usage dead letter: {error}"))
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("usage dead letter: {error}"),
+                )
             })?
         } else {
             Vec::new()
@@ -88,13 +88,16 @@ impl DeadLetterStore {
     }
 
     fn contains(&self, batch_id: &str) -> bool {
-        self.entries.iter().any(|entry| entry.batch.batch_id == batch_id)
+        self.entries
+            .iter()
+            .any(|entry| entry.batch.batch_id == batch_id)
     }
 
     fn append(&mut self, batch: UsageBatch, code: &str, message: &str) -> io::Result<()> {
         if self.contains(&batch.batch_id) {
             return Ok(());
         }
+        let previous = self.entries.clone();
         self.entries.push(DeadLetter {
             batch,
             code: code.to_owned(),
@@ -102,12 +105,23 @@ impl DeadLetterStore {
         });
         if self.entries.len() > MAX_DEAD_LETTERS {
             self.entries.remove(0);
-            warn!(max_entries = MAX_DEAD_LETTERS, "dropping oldest usage dead letter after capacity was reached");
+            warn!(
+                max_entries = MAX_DEAD_LETTERS,
+                "dropping oldest usage dead letter after capacity was reached"
+            );
         }
-        let temp = self.path.with_extension("dead-letter-tmp");
+        if let Err(error) = self.persist() {
+            self.entries = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn persist(&self) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let temp = self.path.with_extension("dead-letter-tmp");
         let bytes = serde_json::to_vec_pretty(&self.entries)
             .map_err(|error| io::Error::other(format!("serialize usage dead letter: {error}")))?;
         let mut options = OpenOptions::new();
@@ -131,11 +145,11 @@ impl DeadLetterStore {
 #[derive(Debug)]
 pub struct UsageQueue {
     path: PathBuf,
-    disk: UsageQueueDisk,
+    disk: QueueDisk,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct UsageQueueDisk {
+struct QueueDisk {
     version: u32,
     batches: Vec<UsageBatch>,
     #[serde(default)]
@@ -150,8 +164,7 @@ impl UsageQueue {
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
         let disk = if path.exists() {
-            let bytes = fs::read(&path)?;
-            let disk: UsageQueueDisk = serde_json::from_slice(&bytes).map_err(|error| {
+            let disk: QueueDisk = serde_json::from_slice(&fs::read(&path)?).map_err(|error| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("usage queue: {error}"))
             })?;
             if disk.version != 1 {
@@ -162,16 +175,12 @@ impl UsageQueue {
             }
             disk
         } else {
-            UsageQueueDisk {
+            QueueDisk {
                 version: 1,
-                ..UsageQueueDisk::default()
+                ..QueueDisk::default()
             }
         };
         Ok(Self { path, disk })
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.disk.batches.is_empty()
     }
 
     pub fn front(&self) -> Option<&UsageBatch> {
@@ -179,8 +188,9 @@ impl UsageQueue {
     }
 
     /// Delta counters are accumulated into the current one-minute wall-clock
-    /// bucket and fsynced after every poll. If Agent or sing-box crashes, the
-    /// bounded loss is at most one poll interval plus bytes read before fsync.
+    /// bucket and fsynced after every poll. A sing-box or Agent crash can lose
+    /// at most one polling interval plus bytes read before the fsync completes.
+    /// There is no pre-reload hook, so SIGHUP can lose at most one poll interval.
     pub fn record_delta(&mut self, snapshot: UsageSnapshot, now: i64) -> io::Result<()> {
         let previous = self.disk.clone();
         let result = self.record_delta_inner(snapshot, now);
@@ -200,6 +210,9 @@ impl UsageQueue {
             self.disk.active_window_start = Some(bucket_start);
         }
         for (username, delta) in snapshot.counters {
+            if delta.download_bytes == 0 && delta.upload_bytes == 0 {
+                continue;
+            }
             let counter = self.disk.active_counters.entry(username).or_default();
             counter.download_bytes = counter
                 .download_bytes
@@ -214,12 +227,11 @@ impl UsageQueue {
     }
 
     pub fn flush_due(&mut self, now: i64) -> io::Result<()> {
-        let Some(active) = self.disk.active_window_start else {
-            return Ok(());
-        };
-        let current_bucket = now.div_euclid(USAGE_BUCKET_SECS) * USAGE_BUCKET_SECS;
-        if active < current_bucket {
-            self.flush_active(current_bucket)?;
+        if let Some(active) = self.disk.active_window_start {
+            let current_bucket = now.div_euclid(USAGE_BUCKET_SECS) * USAGE_BUCKET_SECS;
+            if active < current_bucket {
+                self.flush_active(current_bucket)?;
+            }
         }
         self.persist()
     }
@@ -302,12 +314,10 @@ impl UsageQueue {
     }
 }
 
-/// Reads only the already-applied sing-box config. The V2Ray API is plaintext
-/// and unauthenticated, so a non-loopback listen address is rejected as an
-/// exposed control-plane backdoor.
-fn v2ray_api_endpoint(config_path: &Path) -> io::Result<Option<String>> {
-    let bytes = fs::read(config_path)?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+/// The V2Ray API is plaintext and has no authentication. Reject non-loopback
+/// listeners because the API can expose user stats and control operations.
+fn v2ray_api_endpoint(path: &Path) -> io::Result<Option<String>> {
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("sing-box config: {error}"),
@@ -341,20 +351,20 @@ pub struct V2rayCollector {
 }
 
 impl V2rayCollector {
-    pub async fn connect(config_path: &Path) -> io::Result<Option<Self>> {
-        let Some(endpoint) = v2ray_api_endpoint(config_path)? else {
+    pub async fn connect(path: &Path) -> io::Result<Option<Self>> {
+        let Some(endpoint) = v2ray_api_endpoint(path)? else {
             return Ok(None);
         };
         Self::connect_endpoint(endpoint).await.map(Some)
     }
 
     async fn connect_endpoint(endpoint: String) -> io::Result<Self> {
-        let channel = Endpoint::from_shared(endpoint.clone())
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?
+        let channel = Endpoint::from_shared(endpoint)
+            .map_err(|error| io::Error::other(error.to_string()))?
             .connect_timeout(Duration::from_secs(2))
             .connect()
             .await
-            .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error.to_string()))?;
+            .map_err(|error| io::Error::other(error.to_string()))?;
         Ok(Self {
             client: StatsServiceClient::new(channel),
         })
@@ -424,7 +434,7 @@ pub async fn run_reporting_loop(
         .usage_queue_path
         .clone()
         .map(PathBuf::from)
-        .unwrap_or_else(|| default_queue_path(Path::new(&config.core_config_path)));
+        .unwrap_or_else(|| config_path.with_extension("usage-queue.json"));
     let mut queue = match UsageQueue::open(&queue_path) {
         Ok(queue) => queue,
         Err(error) => {
@@ -464,20 +474,25 @@ pub async fn run_reporting_loop(
     let mut reporter = interval(Duration::from_secs(config.usage_report_interval_secs));
     reporter.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut transport: Option<TonicAgentTransport> = None;
+
     loop {
         tokio::select! {
             _ = poller.tick() => {
                 if collector.is_none() && v2ray_api_supported {
                     match V2rayCollector::connect(&config_path).await {
-                        Ok(Some(value)) => { collector = Some(Box::new(value)); info!("V2Ray per-user traffic collector enabled"); }
-                        Ok(None) => {}
+                        Ok(Some(value)) => collector = Some(Box::new(value)),
+                        Ok(None) => {},
                         Err(error) => warn!(%error, "V2Ray API is unavailable or unsafe; traffic collection remains disabled"),
                     }
                 }
                 if collector.is_some() {
                     let result = collector.as_mut().expect("collector exists").collect().await;
                     match result {
-                        Ok(snapshot) => { if let Err(error) = queue.record_delta(snapshot, unix_now()) { warn!(%error, "usage delta could not be persisted"); } }
+                        Ok(snapshot) => {
+                            if let Err(error) = queue.record_delta(snapshot, unix_now()) {
+                                warn!(%error, "usage delta could not be persisted");
+                            }
+                        }
                         Err(error) => {
                             warn!(%error, "V2Ray traffic sample failed; no synthetic usage will be reported");
                             collector = None;
@@ -486,10 +501,12 @@ pub async fn run_reporting_loop(
                 }
             }
             _ = reporter.tick() => {
-                if let Err(error) = queue.flush_due(unix_now()) { warn!(%error, "usage bucket could not be persisted"); }
+                if let Err(error) = queue.flush_due(unix_now()) {
+                    warn!(%error, "usage bucket could not be persisted");
+                }
                 while let Some(batch) = queue.front().cloned() {
                     if dead_letters.contains(&batch.batch_id) {
-                        if let Err(error) = queue.acknowledge(&batch.batch_id) { warn!(%error, "dead-lettered usage batch could not be removed"); break; }
+                        if queue.acknowledge(&batch.batch_id).is_err() { break; }
                         continue;
                     }
                     if transport.is_none() {
@@ -499,24 +516,29 @@ pub async fn run_reporting_loop(
                         }
                     }
                     let request = ReportUsageRequest {
-                        agent_id: agent_id.clone(), node_id: node_id.clone(), batch_id: batch.batch_id.clone(),
-                        sequence: batch.sequence, window_start: batch.window_start, window_end: batch.window_end,
-                        usage_payload: to_proto_payload(&batch.payload).encode_to_vec(), agent_public_key: public_key.clone(),
+                        agent_id: agent_id.clone(),
+                        node_id: node_id.clone(),
+                        batch_id: batch.batch_id.clone(),
+                        sequence: batch.sequence,
+                        window_start: batch.window_start,
+                        window_end: batch.window_end,
+                        usage_payload: to_proto_payload(&batch.payload).encode_to_vec(),
+                        agent_public_key: public_key.clone(),
                     };
                     match transport.as_mut().expect("transport connected").report_usage(request).await {
                         Ok(true) => {
-                            if let Err(error) = queue.acknowledge(&batch.batch_id) { warn!(%error, "acknowledged usage batch could not be removed"); break; }
+                            if queue.acknowledge(&batch.batch_id).is_err() { break; }
                         }
                         Ok(false) => {
-                            warn!(batch_id = %batch.batch_id, "control plane rejected usage batch; moving it to dead-letter store");
-                            if let Err(error) = dead_letters.append(batch.clone(), "rejected", "control plane rejected usage batch") { warn!(%error, "usage dead-letter append failed"); break; }
-                            if let Err(error) = queue.acknowledge(&batch.batch_id) { warn!(%error, "rejected usage batch could not be removed"); break; }
+                            error!(batch_id = %batch.batch_id, "control plane rejected usage batch; moving it to dead-letter store");
+                            if dead_letters.append(batch.clone(), "rejected", "control plane rejected usage batch").is_err() { break; }
+                            if queue.acknowledge(&batch.batch_id).is_err() { break; }
                         }
                         Err(error) if matches!(error.code(), Code::InvalidArgument | Code::PermissionDenied | Code::Unauthenticated | Code::FailedPrecondition) => {
                             let code = format!("{:?}", error.code());
                             error!(batch_id = %batch.batch_id, code, message = %error.message(), "permanent usage report failure moved to dead-letter store");
-                            if let Err(store_error) = dead_letters.append(batch.clone(), &code, error.message()) { warn!(%store_error, "usage dead-letter append failed"); break; }
-                            if let Err(store_error) = queue.acknowledge(&batch.batch_id) { warn!(%store_error, "dead-lettered usage batch could not be removed"); break; }
+                            if dead_letters.append(batch.clone(), &code, error.message()).is_err() { break; }
+                            if queue.acknowledge(&batch.batch_id).is_err() { break; }
                         }
                         Err(error) => {
                             warn!(%error, batch_id = %batch.batch_id, "transient usage report failure; batch remains queued for retry");
@@ -530,9 +552,6 @@ pub async fn run_reporting_loop(
     }
 }
 
-fn default_queue_path(config_path: &Path) -> PathBuf {
-    config_path.with_extension("usage-queue.json")
-}
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -549,8 +568,8 @@ mod tests {
     struct TestCollector(VecDeque<UsageSnapshot>);
     impl UsageCollector for TestCollector {
         fn collect(&mut self) -> CollectorFuture<'_> {
-            let next = self.0.pop_front().expect("test snapshot available");
-            Box::pin(async move { Ok(next) })
+            let snapshot = self.0.pop_front().unwrap();
+            Box::pin(async move { Ok(snapshot) })
         }
     }
     fn snapshot(bytes: u64) -> UsageSnapshot {
@@ -564,14 +583,12 @@ mod tests {
             )]),
         }
     }
-
     #[tokio::test]
     async fn test_collector_returns_per_poll_deltas() {
         let mut collector = TestCollector(VecDeque::from([snapshot(40), snapshot(60)]));
         assert_eq!(collector.collect().await.unwrap(), snapshot(40));
         assert_eq!(collector.collect().await.unwrap(), snapshot(60));
     }
-
     #[test]
     fn queue_accumulates_poll_deltas_and_retries_after_restart() {
         let dir = tempdir().unwrap();
@@ -584,9 +601,8 @@ mod tests {
         let batch = retry.front().unwrap().clone();
         assert_eq!(batch.payload.counters["user-uuid"].download_bytes, 100);
         assert!(retry.acknowledge(&batch.batch_id).unwrap());
-        assert!(UsageQueue::open(&path).unwrap().is_empty());
+        assert!(UsageQueue::open(&path).unwrap().front().is_none());
     }
-
     #[test]
     fn non_loopback_v2ray_api_is_rejected() {
         let dir = tempdir().unwrap();
@@ -601,27 +617,36 @@ mod tests {
             io::ErrorKind::PermissionDenied
         );
     }
-
     #[test]
-    fn stat_names_map_to_user_directions() {
-        let mut counters = BTreeMap::new();
-        let names = [
-            ("user>>>abc>>>traffic>>>uplink", 4, true),
-            ("user>>>abc>>>traffic>>>downlink", 9, false),
-        ];
-        for (name, value, upload) in names {
-            let (_, rest) = name.split_once(">>>").unwrap();
-            let (username, direction) = rest.rsplit_once(">>>traffic>>>").unwrap();
-            let counter = counters
-                .entry(username.to_owned())
-                .or_insert_with(UserCounter::default);
-            if upload {
-                counter.upload_bytes = value;
-            } else if direction == "downlink" {
-                counter.download_bytes = value;
-            }
+    fn dead_letters_persist_with_private_permissions() {
+        let dir = tempdir().unwrap();
+        let queue_path = dir.path().join("usage-queue.json");
+        let mut store = DeadLetterStore::open(&queue_path).unwrap();
+        store
+            .append(
+                UsageBatch {
+                    batch_id: "dead".into(),
+                    sequence: 1,
+                    window_start: 1,
+                    window_end: 2,
+                    payload: snapshot(1),
+                },
+                "InvalidArgument",
+                "bad payload",
+            )
+            .unwrap();
+        assert!(DeadLetterStore::open(&queue_path).unwrap().contains("dead"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(queue_path.with_extension("dead-letter.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
         }
-        assert_eq!(counters["abc"].upload_bytes, 4);
-        assert_eq!(counters["abc"].download_bytes, 9);
     }
 }

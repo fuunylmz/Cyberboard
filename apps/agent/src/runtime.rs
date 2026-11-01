@@ -525,43 +525,94 @@ pub struct ProcessMetrics {
 
 #[cfg(target_os = "linux")]
 pub async fn process_metrics(pids: &[u32]) -> Option<ProcessMetrics> {
-    use std::{collections::HashMap, fs};
+    use std::{
+        collections::HashMap,
+        fs,
+        sync::{Mutex, OnceLock},
+    };
+
+    static LAST_CPU: OnceLock<Mutex<HashMap<u32, (u64, std::time::Instant)>>> = OnceLock::new();
 
     fn read_proc(pids: &[u32]) -> HashMap<u32, (u64, u64)> {
         let mut values = HashMap::new();
         for pid in pids.iter().copied().filter(|pid| *pid > 0) {
             let base = PathBuf::from(format!("/proc/{pid}"));
-            let Ok(stat) = fs::read_to_string(base.join("stat")) else { continue; };
-            let Some(close) = stat.rfind(')') else { continue; };
+            let Ok(stat) = fs::read_to_string(base.join("stat")) else {
+                continue;
+            };
+            let Some(close) = stat.rfind(')') else {
+                continue;
+            };
             let fields: Vec<_> = stat[close + 1..].split_whitespace().collect();
-            if fields.len() <= 12 { continue; }
-            let (Ok(user_ticks), Ok(system_ticks)) = (fields[11].parse::<u64>(), fields[12].parse::<u64>()) else { continue; };
-            let Ok(status) = fs::read_to_string(base.join("status")) else { continue; };
+            if fields.len() <= 12 {
+                continue;
+            }
+            let (Ok(user_ticks), Ok(system_ticks)) =
+                (fields[11].parse::<u64>(), fields[12].parse::<u64>())
+            else {
+                continue;
+            };
+            let Ok(status) = fs::read_to_string(base.join("status")) else {
+                continue;
+            };
             let rss_kib = status.lines().find_map(|line| {
-                line.strip_prefix("VmRSS:")?.split_whitespace().next()?.parse::<u64>().ok()
+                line.strip_prefix("VmRSS:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
             });
             if let Some(rss_kib) = rss_kib {
-                values.insert(pid, (rss_kib.saturating_mul(1024), user_ticks.saturating_add(system_ticks)));
+                values.insert(
+                    pid,
+                    (
+                        rss_kib.saturating_mul(1024),
+                        user_ticks.saturating_add(system_ticks),
+                    ),
+                );
             }
         }
         values
     }
 
-    let first = read_proc(pids);
-    if first.is_empty() { return None; }
-    let started = std::time::Instant::now();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let elapsed = started.elapsed().as_secs_f64();
-    let second = read_proc(pids);
-    let memory_bytes = second.values().map(|(rss, _)| *rss).sum();
+    let current = read_proc(pids);
+    if current.is_empty() {
+        return None;
+    }
+    let now = std::time::Instant::now();
+    let memory_bytes = current.values().map(|(rss, _)| *rss).sum();
     let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    let cpu_percent = if ticks_per_second > 0 && !second.is_empty() && second.keys().all(|pid| first.contains_key(pid)) {
-        let cpu_ticks = second.iter().map(|(pid, (_, ticks))| ticks.saturating_sub(first[pid].1)).sum::<u64>();
-        Some((cpu_ticks as f64 / ticks_per_second as f64 / elapsed * 100.0).max(0.0))
+    let mut last = LAST_CPU
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()?;
+    let cpu_percent = if ticks_per_second > 0 {
+        let mut sampled = false;
+        let mut total = 0.0_f64;
+        for (pid, (_, ticks)) in &current {
+            if let Some((previous_ticks, previous_at)) = last.get(pid) {
+                let elapsed = now.duration_since(*previous_at).as_secs_f64();
+                if elapsed > 0.0 {
+                    total += ticks.saturating_sub(*previous_ticks) as f64
+                        / ticks_per_second as f64
+                        / elapsed
+                        * 100.0;
+                    sampled = true;
+                }
+            }
+        }
+        sampled.then_some(total.max(0.0))
     } else {
         None
     };
-    Some(ProcessMetrics { memory_bytes: Some(memory_bytes), cpu_percent })
+    last.retain(|pid, _| pids.contains(pid));
+    for (pid, (_, ticks)) in current {
+        last.insert(pid, (ticks, now));
+    }
+    Some(ProcessMetrics {
+        memory_bytes: Some(memory_bytes),
+        cpu_percent,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -754,11 +805,9 @@ mod tests {
         supervisor.initialize().await.unwrap();
         let outcome = supervisor.apply(&payload, 1, &hash(&payload)).await;
         assert_eq!(
-            outcome.phase,
-            "applied",
+            outcome.phase, "applied",
             "apply failed: {}: {}",
-            outcome.error_code,
-            outcome.error_message
+            outcome.error_code, outcome.error_message
         );
         supervisor.shutdown().await;
 

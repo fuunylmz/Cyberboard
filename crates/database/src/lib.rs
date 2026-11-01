@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use cyberboard_storage::{
     EIGHTH_MIGRATION, ELEVENTH_MIGRATION, FIFTEENTH_MIGRATION, FIFTH_MIGRATION,
-    FOURTEENTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, NINTH_MIGRATION,
-    SECOND_MIGRATION, SEVENTH_MIGRATION, SIXTH_MIGRATION, TENTH_MIGRATION, THIRD_MIGRATION,
-    THIRTEENTH_MIGRATION, TWELFTH_MIGRATION,
+    FOURTEENTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, NINTH_MIGRATION, SECOND_MIGRATION,
+    SEVENTH_MIGRATION, SIXTH_MIGRATION, TENTH_MIGRATION, THIRD_MIGRATION, THIRTEENTH_MIGRATION,
+    TWELFTH_MIGRATION,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -2647,6 +2647,7 @@ impl Database {
             }
         }
 
+        let mut transaction = self.pool.begin().await?;
         let node_matches_agent: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM nodes WHERE tenant_id=$1 AND id=$2 AND agent_id=$3)",
         )
@@ -3010,9 +3011,7 @@ fn parse_usage_events(
         ));
     }
     if payload.counters.is_empty() {
-        return Err(DatabaseError::InvalidUsagePayload(
-            "at least one usage counter is required".to_owned(),
-        ));
+        return Ok(Vec::new());
     }
     payload
         .counters

@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${GOSUMDB:-}" == "off" ]]; then
+	echo "GOSUMDB=off is not allowed for this build" >&2
+	exit 1
+fi
+if [[ -n "${GONOSUMDB:-}" || -n "${GOPRIVATE:-}" || -n "${GOINSECURE:-}" ]]; then
+	echo "GONOSUMDB, GOPRIVATE, and GOINSECURE must be unset or empty for this build" >&2
+	exit 1
+fi
+export GOFLAGS="-mod=readonly"
+
 readonly VERSION="1.14.4"
 readonly TAG="v${VERSION}"
 readonly EXPECTED_COMMIT="c005f35300ce76427dc285481ec5695f5b179cd2"
-readonly DEFAULT_OUTPUT_DIR="/Users/fuunylmz/Cyberboard/.worktrees/bin"
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+readonly DEFAULT_OUTPUT_DIR="${REPO_ROOT}/target/sing-box"
 readonly OUTPUT_DIR="${SING_BOX_OUTPUT_DIR:-${DEFAULT_OUTPUT_DIR}}"
 readonly BUILD_ROOT="${SING_BOX_BUILD_TMP:-${TMPDIR:-/tmp}/sing-box-build}"
 readonly SOURCE_DIR="${SING_BOX_SOURCE_DIR:-${BUILD_ROOT}/source}"

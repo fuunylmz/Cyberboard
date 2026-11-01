@@ -8,16 +8,16 @@ Cyberboard 按独立进程调用 sing-box，不把 sing-box 代码链接进 Apac
 
 上游默认标签全部保留，唯一移除的是 `with_naive_outbound`：这是客户端出站功能，服务端不需要，而且会引入 cronet 原生库。额外添加 `with_v2ray_api`。未因目标平台移除其他标签；如将来有平台构建失败，应先记录具体平台、错误和无法替代的功能，再决定是否缩减。
 
-构建默认目标是本机 `darwin/arm64`、生产 `linux/amd64` 和 `linux/arm64`。脚本设 `CGO_ENABLED=0`，以避免交叉编译依赖目标平台 C 工具链、头文件和原生库；产物因此不包含依赖 CGO 的实现。当前目标均以 CGO 关闭成功构建。Go 模块校验保持启用，没有使用 `GOSUMDB=off`、`GONOSUMDB` 或 `-mod=mod` 绕过校验。Go 构建缓存和脚本自动获取的源码 checkout 都放在 `$TMPDIR/sing-box-build`，不会进入 Cyberboard 工作树。
+构建默认目标是本机 `darwin/arm64`、生产 `linux/amd64` 和 `linux/arm64`。脚本设 `CGO_ENABLED=0`，以避免交叉编译依赖目标平台 C 工具链、头文件和原生库；产物因此不包含依赖 CGO 的实现。当前目标均以 CGO 关闭成功构建。脚本拒绝 `GOSUMDB=off`，并拒绝非空的 `GONOSUMDB`、`GOPRIVATE` 或 `GOINSECURE`；同时强制 `GOFLAGS=-mod=readonly`，确保调用者环境不能关闭校验或修改模块文件。`GOPROXY` 保持调用者配置，以支持模块镜像。Go 构建缓存和脚本自动获取的源码 checkout 都放在 `$TMPDIR/sing-box-build`，不会进入 Cyberboard 工作树。
 
 ## 构建和校验
 
-需要 Bash、Git 和 Go。默认产物写入 `/Users/fuunylmz/Cyberboard/.worktrees/bin/`；可用 `SING_BOX_OUTPUT_DIR` 覆盖。可用 `SING_BOX_TARGETS="linux/amd64 linux/arm64"` 选择目标，用 `SING_BOX_SOURCE_DIR` 指定已 checkout 的上游源码（必须是未经修改的精确 tag），用 `SING_BOX_BUILD_TMP` 变更临时源码和缓存目录。
+需要 Bash、Git 和 Go。默认产物写入仓库根目录的 `target/sing-box/`（该目录已被 Git 忽略）；可用 `SING_BOX_OUTPUT_DIR` 覆盖。可用 `SING_BOX_TARGETS="linux/amd64 linux/arm64"` 选择目标，用 `SING_BOX_SOURCE_DIR` 指定已 checkout 的上游源码（必须是未经修改的精确 tag），用 `SING_BOX_BUILD_TMP` 变更临时源码和缓存目录。节点上的 Agent 可通过 `CYBERBOARD_SING_BOX_BINARY` 指向此二进制；未设置时，Agent 使用 PATH 中的 `sing-box`（见 [`crates/config/src/lib.rs`](../../crates/config/src/lib.rs)）。
 
 ```sh
 deploy/sing-box/build.sh
-/Users/fuunylmz/Cyberboard/.worktrees/bin/sing-box version
-shasum -a 256 /Users/fuunylmz/Cyberboard/.worktrees/bin/sing-box
+target/sing-box/sing-box version
+shasum -a 256 target/sing-box/sing-box
 ```
 
 版本命令应显示 `sing-box version 1.14.4`，且 Tags 包含 `with_v2ray_api`。脚本对每个构建产物打印 SHA-256。Linux 目标文件名分别为 `sing-box-linux-amd64` 和 `sing-box-linux-arm64`。跨平台产物只能在对应目标系统上执行验证。

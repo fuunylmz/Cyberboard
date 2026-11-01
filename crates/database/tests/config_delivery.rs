@@ -33,6 +33,7 @@ async fn config_deployment_lifecycle_is_honest_and_rolls_forward() {
     let node = database
         .create_node(
             tenant_id,
+            Uuid::nil(),
             &NodeInput {
                 name: format!("delivery-{}", Uuid::new_v4().simple()),
                 region: "test".into(),

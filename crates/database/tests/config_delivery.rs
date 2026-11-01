@@ -1,6 +1,6 @@
 use cyberboard_database::{
-    AgentApplyResultInput, ConfigPublishInput, ConfigRevisionCreateInput, ConfigRollbackInput,
-    ConfigTemplateInput, Database, NodeInput,
+    AgentApplyResultInput, ConfigPublishInput, ConfigRevisionCreateInput, ConfigRevisionListInput,
+    ConfigRollbackInput, ConfigTemplateInput, Database, NodeInput,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -135,6 +135,37 @@ async fn config_deployment_lifecycle_is_honest_and_rolls_forward() {
             .await
             .unwrap();
     assert_eq!(applied_generation, 1);
+
+    let listed_node = database
+        .list_nodes(tenant_id, 20, 0, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|record| record.id == node.id)
+        .unwrap();
+    assert_eq!(listed_node.current_config_revision, Some(revision_one.id));
+    assert_eq!(listed_node.desired_generation, Some(1));
+    assert_eq!(listed_node.applied_config_revision, Some(revision_one.id));
+    assert_eq!(listed_node.applied_generation, Some(1));
+    assert!(listed_node.applied_at.is_some());
+
+    let search = node.name[..8].to_ascii_uppercase();
+    let filtered = ConfigRevisionListInput {
+        tenant_id,
+        node_id: Some(node.id),
+        status: Some("published"),
+        search: Some(&search),
+        limit: 20,
+        offset: 0,
+    };
+    let filtered_revisions = database.list_config_revisions(filtered).await.unwrap();
+    let filtered_count = database.count_config_revisions(filtered).await.unwrap();
+    assert!(
+        filtered_revisions
+            .iter()
+            .any(|revision| revision.id == revision_one.id)
+    );
+    assert_eq!(filtered_count, filtered_revisions.len() as i64);
 
     let payload_two = json!({"inbounds":[{"tag":"two"}]});
     let hash_two = content_hash(&payload_two);

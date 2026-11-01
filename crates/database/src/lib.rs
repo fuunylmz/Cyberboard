@@ -888,9 +888,11 @@ impl Database {
         status: Option<&str>,
     ) -> DatabaseResult<Vec<NodeRecord>> {
         let rows = sqlx::query(
-            "SELECT id,name,region,address,status,core_type,core_version,agent_version,
-                    current_config_revision,last_heartbeat_at::text AS last_heartbeat_at,port,tags
-             FROM nodes WHERE tenant_id=$1 AND ($2::text IS NULL OR name ILIKE '%' || $2 || '%' OR address ILIKE '%' || $2 || '%') AND ($3::text IS NULL OR status=$3) ORDER BY created_at DESC,id LIMIT $4 OFFSET $5",
+            "SELECT n.id,n.name,n.region,n.address,n.status,n.core_type,n.core_version,n.agent_version,
+                    n.current_config_revision,(SELECT generation FROM config_revisions WHERE tenant_id=n.tenant_id AND id=n.current_config_revision) AS desired_generation,
+                    n.applied_config_revision,n.applied_generation,n.applied_at::text AS applied_at,n.agent_core_state,
+                    n.last_heartbeat_at::text AS last_heartbeat_at,n.port,n.tags
+             FROM nodes n WHERE n.tenant_id=$1 AND ($2::text IS NULL OR n.name ILIKE '%' || $2 || '%' OR n.address ILIKE '%' || $2 || '%') AND ($3::text IS NULL OR n.status=$3) ORDER BY n.created_at DESC,n.id LIMIT $4 OFFSET $5",
         )
         .bind(tenant_id).bind(search).bind(status).bind(limit).bind(offset)
         .fetch_all(&self.pool)
@@ -921,7 +923,8 @@ impl Database {
             "INSERT INTO nodes (tenant_id,name,region,address,port,core_type,core_version,agent_version,tags)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
              RETURNING id,name,region,address,status,core_type,core_version,agent_version,
-                       current_config_revision,last_heartbeat_at::text AS last_heartbeat_at,port,tags",
+                       current_config_revision,NULL::bigint AS desired_generation,applied_config_revision,applied_generation,applied_at::text AS applied_at,agent_core_state,
+                       last_heartbeat_at::text AS last_heartbeat_at,port,tags",
         )
         .bind(tenant_id)
         .bind(&node.name)
@@ -949,7 +952,9 @@ impl Database {
                     status=COALESCE($9,status),tags=COALESCE($10,tags),updated_at=now()
              WHERE tenant_id=$1 AND id=$2
              RETURNING id,name,region,address,status,core_type,core_version,agent_version,
-                       current_config_revision,last_heartbeat_at::text AS last_heartbeat_at,port,tags",
+                       current_config_revision,(SELECT generation FROM config_revisions WHERE tenant_id=nodes.tenant_id AND id=nodes.current_config_revision) AS desired_generation,
+                       applied_config_revision,applied_generation,applied_at::text AS applied_at,agent_core_state,
+                       last_heartbeat_at::text AS last_heartbeat_at,port,tags",
         )
         .bind(tenant_id).bind(node_id).bind(&node.name).bind(&node.region).bind(&node.address)
         .bind(node.port).bind(&node.core).bind(&node.core_version).bind(&node.status).bind(&node.tags)
@@ -1559,12 +1564,10 @@ impl Database {
 
     pub async fn list_config_revisions(
         &self,
-        tenant_id: Uuid,
-        limit: i64,
-        offset: i64,
+        input: ConfigRevisionListInput<'_>,
     ) -> DatabaseResult<Vec<ConfigRevisionRecord>> {
-        let rows = sqlx::query("SELECT r.id,COALESCE(r.template_id::text,'') AS template_id,r.node_id,n.name AS node_name,r.generation,r.core_version,r.content_hash,CASE WHEN r.signature='' THEN 'pending' ELSE 'valid' END AS signature_status,r.validation_status,r.publish_status,r.failure_reason,r.created_at::text AS created_at,d.status AS deployment_status,d.kind AS deployment_kind,d.error_code AS deployment_error_code,d.error_message AS deployment_error_message,d.updated_at::text AS deployment_updated_at,r.rollback_of FROM config_revisions r JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id LEFT JOIN LATERAL (SELECT status,kind,error_code,error_message,updated_at FROM config_deployments WHERE tenant_id=r.tenant_id AND config_revision_id=r.id ORDER BY created_at DESC,id DESC LIMIT 1) d ON TRUE WHERE r.tenant_id=$1 ORDER BY r.created_at DESC,r.id LIMIT $2 OFFSET $3")
-            .bind(tenant_id).bind(limit).bind(offset).fetch_all(&self.pool).await?;
+        let rows = sqlx::query("SELECT r.id,COALESCE(r.template_id::text,'') AS template_id,r.node_id,n.name AS node_name,r.generation,r.core_version,r.content_hash,CASE WHEN r.signature='' THEN 'pending' ELSE 'valid' END AS signature_status,r.validation_status,r.publish_status,r.failure_reason,r.created_at::text AS created_at,d.status AS deployment_status,d.kind AS deployment_kind,d.error_code AS deployment_error_code,d.error_message AS deployment_error_message,d.updated_at::text AS deployment_updated_at,r.rollback_of FROM config_revisions r JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id LEFT JOIN LATERAL (SELECT status,kind,error_code,error_message,updated_at FROM config_deployments WHERE tenant_id=r.tenant_id AND config_revision_id=r.id ORDER BY created_at DESC,id DESC LIMIT 1) d ON TRUE WHERE r.tenant_id=$1 AND ($2::uuid IS NULL OR r.node_id=$2) AND ($3::text IS NULL OR r.publish_status=$3) AND ($4::text IS NULL OR n.name ILIKE '%' || $4 || '%' OR r.content_hash ILIKE '%' || $4 || '%' OR r.core_version ILIKE '%' || $4 || '%') ORDER BY r.created_at DESC,r.id LIMIT $5 OFFSET $6")
+            .bind(input.tenant_id).bind(input.node_id).bind(input.status).bind(input.search).bind(input.limit).bind(input.offset).fetch_all(&self.pool).await?;
         Ok(rows
             .into_iter()
             .map(ConfigRevisionRecord::from_row)
@@ -1603,13 +1606,13 @@ impl Database {
         }))
     }
 
-    pub async fn count_config_revisions(&self, tenant_id: Uuid) -> DatabaseResult<i64> {
-        Ok(
-            sqlx::query_scalar("SELECT count(*) FROM config_revisions WHERE tenant_id=$1")
-                .bind(tenant_id)
-                .fetch_one(&self.pool)
-                .await?,
-        )
+    pub async fn count_config_revisions(
+        &self,
+        input: ConfigRevisionListInput<'_>,
+    ) -> DatabaseResult<i64> {
+        Ok(sqlx::query_scalar("SELECT count(*) FROM config_revisions r JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id WHERE r.tenant_id=$1 AND ($2::uuid IS NULL OR r.node_id=$2) AND ($3::text IS NULL OR r.publish_status=$3) AND ($4::text IS NULL OR n.name ILIKE '%' || $4 || '%' OR r.content_hash ILIKE '%' || $4 || '%' OR r.core_version ILIKE '%' || $4 || '%')")
+            .bind(input.tenant_id).bind(input.node_id).bind(input.status).bind(input.search)
+            .fetch_one(&self.pool).await?)
     }
 
     pub async fn publish_config_revision(
@@ -2574,6 +2577,11 @@ pub struct NodeRecord {
     pub core_version: String,
     pub agent_version: String,
     pub current_config_revision: Option<Uuid>,
+    pub desired_generation: Option<i64>,
+    pub applied_config_revision: Option<Uuid>,
+    pub applied_generation: Option<i64>,
+    pub applied_at: Option<String>,
+    pub core_state: Option<String>,
     pub last_heartbeat_at: Option<String>,
     pub port: i32,
     pub tags: serde_json::Value,
@@ -2591,6 +2599,11 @@ impl NodeRecord {
             core_version: row.get("core_version"),
             agent_version: row.get("agent_version"),
             current_config_revision: row.try_get("current_config_revision").ok(),
+            desired_generation: row.try_get("desired_generation").ok().flatten(),
+            applied_config_revision: row.try_get("applied_config_revision").ok().flatten(),
+            applied_generation: row.try_get("applied_generation").ok().flatten(),
+            applied_at: row.try_get("applied_at").ok().flatten(),
+            core_state: row.try_get("agent_core_state").ok().flatten(),
             last_heartbeat_at: row.try_get("last_heartbeat_at").ok(),
             port: row.get("port"),
             tags: row.get("tags"),
@@ -2775,6 +2788,16 @@ impl ConfigTemplateRecord {
         }
     }
 }
+#[derive(Clone, Copy, Debug)]
+pub struct ConfigRevisionListInput<'a> {
+    pub tenant_id: Uuid,
+    pub node_id: Option<Uuid>,
+    pub status: Option<&'a str>,
+    pub search: Option<&'a str>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ConfigRevisionRecord {
     pub id: Uuid,

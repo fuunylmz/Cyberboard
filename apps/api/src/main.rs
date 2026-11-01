@@ -19,9 +19,9 @@ use cyberboard_config::ApiConfig;
 use cyberboard_config_compiler::{ConfigProfile, hex_hash};
 use cyberboard_database::hash_session_token;
 use cyberboard_database::{
-    ConfigPublishInput, ConfigRevisionCreateInput, ConfigRevisionRecord, ConfigRollbackInput,
-    ConfigTemplateInput, ConfigTemplateRecord, ConfigTemplateUpdate, Database, NodeInput,
-    NodeRecord, NodeUpdate, PlanInput, PlanRecord, PlanUpdate, SubscriptionInput,
+    ConfigPublishInput, ConfigRevisionCreateInput, ConfigRevisionListInput, ConfigRevisionRecord,
+    ConfigRollbackInput, ConfigTemplateInput, ConfigTemplateRecord, ConfigTemplateUpdate, Database,
+    NodeInput, NodeRecord, NodeUpdate, PlanInput, PlanRecord, PlanUpdate, SubscriptionInput,
     SubscriptionRecord, SubscriptionUpdate, UserCredentials, UserRecord,
 };
 use serde::{Deserialize, Serialize};
@@ -312,6 +312,8 @@ struct PaginationQuery {
     page_size: Option<i64>,
     search: Option<String>,
     status: Option<String>,
+    #[serde(rename = "nodeId")]
+    node_id: Option<Uuid>,
 }
 
 impl PaginationQuery {
@@ -802,6 +804,11 @@ struct NodeSummaryOwnedResponse {
     core_version: String,
     agent_version: String,
     current_config_revision: Option<String>,
+    desired_generation: Option<i64>,
+    applied_config_revision: Option<String>,
+    applied_generation: Option<i64>,
+    applied_at: Option<String>,
+    core_state: Option<String>,
     latency_ms: Option<u64>,
     last_heartbeat_at: Option<String>,
 }
@@ -1448,6 +1455,13 @@ fn node_summary_owned(record: NodeRecord) -> NodeSummaryOwnedResponse {
         current_config_revision: record
             .current_config_revision
             .map(|value| value.to_string()),
+        desired_generation: record.desired_generation,
+        applied_config_revision: record
+            .applied_config_revision
+            .map(|value| value.to_string()),
+        applied_generation: record.applied_generation,
+        applied_at: record.applied_at,
+        core_state: record.core_state,
         latency_ms: None,
         last_heartbeat_at: record.last_heartbeat_at,
     }
@@ -2521,7 +2535,21 @@ async fn list_config_revisions(
     };
     let limit = pagination.bounded_limit();
     let offset = pagination.bounded_offset();
-    match (db.list_config_revisions(state.config.tenant_id,limit,offset).await,db.count_config_revisions(state.config.tenant_id).await) { (Ok(items),Ok(total))=>Json(json!({"items":items.into_iter().map(config_revision_json).collect::<Vec<_>>(),"total":total,"page":offset/limit+1,"pageSize":limit})).into_response(), _=>internal_database_response() }
+    let input = ConfigRevisionListInput {
+        tenant_id: state.config.tenant_id,
+        node_id: pagination.node_id,
+        status: pagination.status.as_deref(),
+        search: pagination.search.as_deref(),
+        limit,
+        offset,
+    };
+    match (
+        db.list_config_revisions(input).await,
+        db.count_config_revisions(input).await,
+    ) {
+        (Ok(items), Ok(total)) => Json(json!({"items":items.into_iter().map(config_revision_json).collect::<Vec<_>>(),"total":total,"page":offset/limit+1,"pageSize":limit})).into_response(),
+        _ => internal_database_response(),
+    }
 }
 
 async fn create_config_revision(
@@ -2848,7 +2876,7 @@ async fn openapi() -> Json<Value> {
             },
             "/api/v1/admin/config-templates": { "get": {"operationId":"listConfigTemplates","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Config templates"},"401":{"description":"Invalid token"},"503":{"description":"Database unavailable"},"500":{"description":"Database error"}}}, "post": {"operationId":"createConfigTemplate","security":[{"bearerAuth":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ConfigTemplateRequest"}}}},"responses":{"201":{"description":"Created template"},"400":{"description":"Invalid template"},"401":{"description":"Invalid token"},"503":{"description":"Database unavailable"},"500":{"description":"Database error"}}} },
             "/api/v1/admin/config-templates/{templateId}": { "patch":{"operationId":"updateConfigTemplate","security":[{"bearerAuth":[]}],"parameters":[{"name":"templateId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ConfigTemplateRequest"}}}},"responses":{"200":{"description":"Updated template"},"401":{"description":"Invalid token"},"404":{"description":"Template not found"},"503":{"description":"Database unavailable"},"500":{"description":"Database error"}}}, "delete":{"operationId":"deleteConfigTemplate","security":[{"bearerAuth":[]}],"parameters":[{"name":"templateId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"responses":{"204":{"description":"Template deleted"},"401":{"description":"Invalid token"},"404":{"description":"Template not found"},"503":{"description":"Database unavailable"},"500":{"description":"Database error"}}} },
-            "/api/v1/admin/config-revisions": { "get":{"operationId":"listConfigRevisions","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Config revisions"},"401":{"description":"Invalid token"},"503":{"description":"Database unavailable"},"500":{"description":"Database error"}}}, "post":{"operationId":"createConfigRevision","security":[{"bearerAuth":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ConfigRevisionCreateRequest"}}}},"responses":{"201":{"description":"Created config revision"},"400":{"description":"Invalid config profile"},"401":{"description":"Invalid token"},"404":{"description":"Template or node not found"},"409":{"description":"Generation already exists"},"503":{"description":"Database unavailable"}}} },
+            "/api/v1/admin/config-revisions": { "get":{"operationId":"listConfigRevisions","security":[{"bearerAuth":[]}],"parameters":[{"name":"page","in":"query","schema":{"type":"integer"}},{"name":"pageSize","in":"query","schema":{"type":"integer"}},{"name":"nodeId","in":"query","schema":{"type":"string","format":"uuid"}},{"name":"status","in":"query","schema":{"type":"string","enum":["draft","published","rolled_back"]}},{"name":"search","in":"query","schema":{"type":"string"}}],"responses":{"200":{"description":"Config revisions"},"401":{"description":"Invalid token"},"503":{"description":"Database unavailable"},"500":{"description":"Database error"}}}, "post":{"operationId":"createConfigRevision","security":[{"bearerAuth":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ConfigRevisionCreateRequest"}}}},"responses":{"201":{"description":"Created config revision"},"400":{"description":"Invalid config profile"},"401":{"description":"Invalid token"},"404":{"description":"Template or node not found"},"409":{"description":"Generation already exists"},"503":{"description":"Database unavailable"}}} },
             "/api/v1/admin/config-revisions/{revisionId}/publish": { "post":{"operationId":"publishConfigRevision","security":[{"bearerAuth":[]}],"parameters":[{"name":"revisionId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ConfigRevisionAction"}}}},"responses":{"200":{"description":"Published revision"},"400":{"description":"Missing expected generation"},"401":{"description":"Invalid token"},"409":{"description":"Generation conflict"},"503":{"description":"Database unavailable"},"500":{"description":"Database error"}}} },
             "/api/v1/admin/config-revisions/{revisionId}/rollback": { "post":{"operationId":"rollbackConfigRevision","security":[{"bearerAuth":[]}],"parameters":[{"name":"revisionId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ConfigRevisionAction"}}}},"responses":{"200":{"description":"Rolled back revision"},"400":{"description":"Missing expected generation"},"401":{"description":"Invalid token"},"409":{"description":"Generation conflict"},"503":{"description":"Database unavailable"},"500":{"description":"Database error"}}} },
             "/api/v1/admin/orders/{orderId}/mark-paid": { "post":{"operationId":"markAdminOrderPaid","security":[{"bearerAuth":[]}],"parameters":[{"name":"orderId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}},{"name":"Idempotency-Key","in":"header","required":false,"schema":{"type":"string"}}],"responses":{"200":{"description":"Order marked paid"},"401":{"description":"Invalid token"},"404":{"description":"Order not found"},"409":{"description":"Invalid order state"},"503":{"description":"Database unavailable"}}} },
@@ -2959,11 +2987,13 @@ async fn openapi() -> Json<Value> {
                 },
                 "NodeSummary": {
                     "type": "object",
-                    "required": ["id", "name", "region", "address", "status", "core", "coreVersion", "agentVersion", "currentConfigRevision", "latencyMs", "lastHeartbeatAt"],
+                    "required": ["id", "name", "region", "address", "status", "core", "coreVersion", "agentVersion", "currentConfigRevision", "desiredGeneration", "appliedConfigRevision", "appliedGeneration", "appliedAt", "coreState", "latencyMs", "lastHeartbeatAt"],
                     "properties": {
                         "id": { "type": "string" }, "name": { "type": "string" }, "region": { "type": "string" }, "address": { "type": "string" },
                         "status": { "type": "string", "enum": ["online", "offline", "maintenance", "error"] }, "core": { "type": "string" },
-                        "coreVersion": { "type": "string" }, "agentVersion": { "type": "string" }, "currentConfigRevision": { "type": ["string", "null"] },
+                        "coreVersion": { "type": "string" }, "agentVersion": { "type": "string" }, "currentConfigRevision": { "type": ["string", "null"], "description": "Desired config revision; not necessarily the revision currently running on the node." },
+                        "desiredGeneration": { "type": ["integer", "null"], "format": "int64" }, "appliedConfigRevision": { "type": ["string", "null"] }, "appliedGeneration": { "type": ["integer", "null"], "format": "int64" },
+                        "appliedAt": { "type": ["string", "null"], "format": "date-time" }, "coreState": { "type": ["string", "null"], "enum": ["not_configured", "starting", "running", "reloading", "stopped", "crashed", null] },
                         "latencyMs": { "type": ["integer", "null"], "format": "int64" }, "lastHeartbeatAt": { "type": ["string", "null"], "format": "date-time" }
                     }
                 },

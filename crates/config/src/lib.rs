@@ -189,6 +189,10 @@ pub struct AgentConfig {
     pub client_key_path: Option<String>,
     pub tls_server_name: Option<String>,
     pub identity_path: String,
+    pub trusted_key: Option<String>,
+    pub core_config_path: String,
+    pub core_binary: String,
+    pub health_grace_ms: u64,
     pub insecure: bool,
 }
 
@@ -209,6 +213,12 @@ impl AgentConfig {
             tls_server_name: optional_env("CYBERBOARD_AGENT_TLS_SERVER_NAME"),
             identity_path: optional_env("CYBERBOARD_AGENT_IDENTITY_PATH")
                 .unwrap_or_else(|| "/var/lib/cyberboard/agent-identity.json".to_owned()),
+            trusted_key: optional_env("CYBERBOARD_AGENT_TRUSTED_KEY"),
+            core_config_path: optional_env("CYBERBOARD_AGENT_CONFIG_PATH")
+                .unwrap_or_else(|| "/var/lib/cyberboard/sing-box.json".to_owned()),
+            core_binary: optional_env("CYBERBOARD_SING_BOX_BINARY")
+                .unwrap_or_else(|| "sing-box".to_owned()),
+            health_grace_ms: env_u64("CYBERBOARD_AGENT_HEALTH_GRACE_MS", 3000)?.clamp(500, 60_000),
             insecure: env_bool("CYBERBOARD_AGENT_INSECURE", false)?,
         })
     }
@@ -265,5 +275,76 @@ mod tests {
             )
             .is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod agent_config_tests {
+    use super::{AgentConfig, ConfigError};
+    use std::{env, sync::Mutex};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const NAMES: [&str; 4] = [
+        "CYBERBOARD_AGENT_TRUSTED_KEY",
+        "CYBERBOARD_AGENT_CONFIG_PATH",
+        "CYBERBOARD_SING_BOX_BINARY",
+        "CYBERBOARD_AGENT_HEALTH_GRACE_MS",
+    ];
+
+    fn with_agent_env(values: &[(&str, &str)]) -> Result<AgentConfig, ConfigError> {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old: Vec<_> = NAMES
+            .iter()
+            .map(|name| ((*name).to_owned(), env::var(name).ok()))
+            .collect();
+        unsafe {
+            for name in NAMES {
+                env::remove_var(name);
+            }
+            for (name, value) in values {
+                env::set_var(name, value);
+            }
+        }
+        let result = AgentConfig::from_env();
+        unsafe {
+            for (name, value) in old {
+                match value {
+                    Some(value) => env::set_var(name, value),
+                    None => env::remove_var(name),
+                }
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn agent_runtime_environment_defaults_and_overrides() {
+        let defaults = with_agent_env(&[]).unwrap();
+        assert_eq!(defaults.trusted_key, None);
+        assert_eq!(
+            defaults.core_config_path,
+            "/var/lib/cyberboard/sing-box.json"
+        );
+        assert_eq!(defaults.core_binary, "sing-box");
+        assert_eq!(defaults.health_grace_ms, 3000);
+        let overridden = with_agent_env(&[
+            ("CYBERBOARD_AGENT_TRUSTED_KEY", "a2V5"),
+            ("CYBERBOARD_AGENT_CONFIG_PATH", "/tmp/node.json"),
+            ("CYBERBOARD_SING_BOX_BINARY", "/opt/bin/sing-box"),
+            ("CYBERBOARD_AGENT_HEALTH_GRACE_MS", "100"),
+        ])
+        .unwrap();
+        assert_eq!(overridden.trusted_key.as_deref(), Some("a2V5"));
+        assert_eq!(overridden.core_config_path, "/tmp/node.json");
+        assert_eq!(overridden.core_binary, "/opt/bin/sing-box");
+        assert_eq!(overridden.health_grace_ms, 500);
+    }
+
+    #[test]
+    fn invalid_health_grace_is_rejected() {
+        assert!(matches!(
+            with_agent_env(&[("CYBERBOARD_AGENT_HEALTH_GRACE_MS", "bad")]),
+            Err(ConfigError::InvalidNumber { .. })
+        ));
     }
 }

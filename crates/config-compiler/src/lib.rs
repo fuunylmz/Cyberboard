@@ -28,6 +28,12 @@ pub enum CompileError {
     InvalidEnvelope,
     #[error("signature verification failed")]
     SignatureMismatch,
+    #[error("signed envelope content hash does not match payload")]
+    ContentHashMismatch,
+    #[error("envelope was issued too far in the future")]
+    EnvelopeNotYetValid,
+    #[error("envelope has expired")]
+    EnvelopeExpired,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -229,6 +235,33 @@ impl SignedConfigEnvelope {
         {
             return Err(CompileError::InvalidEnvelope);
         }
+        self.verify_signature(key)
+    }
+
+    pub fn verify_with_skew(
+        &self,
+        key: &VerifyingKey,
+        now: i64,
+        skew_secs: i64,
+    ) -> Result<(), CompileError> {
+        if hex_hash(&self.payload) != self.content_hash {
+            return Err(CompileError::ContentHashMismatch);
+        }
+        let signature =
+            Signature::from_slice(&self.signature).map_err(|_| CompileError::InvalidEnvelope)?;
+        key.verify(&self.canonical_bytes(), &signature)
+            .map_err(|_| CompileError::SignatureMismatch)?;
+        let skew = skew_secs.max(0);
+        if self.issued_at > now.saturating_add(skew) {
+            return Err(CompileError::EnvelopeNotYetValid);
+        }
+        if self.expires_at < self.issued_at || self.expires_at < now.saturating_sub(skew) {
+            return Err(CompileError::EnvelopeExpired);
+        }
+        Ok(())
+    }
+
+    fn verify_signature(&self, key: &VerifyingKey) -> Result<(), CompileError> {
         let signature =
             Signature::from_slice(&self.signature).map_err(|_| CompileError::InvalidEnvelope)?;
         key.verify(&self.canonical_bytes(), &signature)
@@ -269,6 +302,71 @@ mod tests {
             outbounds: vec![],
             route: Route::default(),
         }
+    }
+
+    #[test]
+    fn skew_tolerant_verification_checks_boundaries_and_failure_kinds() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let payload = b"{}".to_vec();
+        let key = signing_key.verifying_key();
+        let future = SignedConfigEnvelope::sign(
+            &signing_key,
+            "k",
+            Uuid::from_u128(1),
+            1,
+            130,
+            200,
+            payload.clone(),
+        );
+        assert!(future.verify_with_skew(&key, 100, 30).is_ok());
+        let too_future = SignedConfigEnvelope::sign(
+            &signing_key,
+            "k",
+            Uuid::from_u128(1),
+            1,
+            220,
+            300,
+            payload.clone(),
+        );
+        assert!(matches!(
+            too_future.verify_with_skew(&key, 100, 60),
+            Err(CompileError::EnvelopeNotYetValid)
+        ));
+        let expiring = SignedConfigEnvelope::sign(
+            &signing_key,
+            "k",
+            Uuid::from_u128(1),
+            1,
+            0,
+            70,
+            payload.clone(),
+        );
+        assert!(expiring.verify_with_skew(&key, 100, 30).is_ok());
+        let expired = SignedConfigEnvelope::sign(
+            &signing_key,
+            "k",
+            Uuid::from_u128(1),
+            1,
+            0,
+            0,
+            payload.clone(),
+        );
+        assert!(matches!(
+            expired.verify_with_skew(&key, 120, 60),
+            Err(CompileError::EnvelopeExpired)
+        ));
+        let mut bad_hash = future.clone();
+        bad_hash.content_hash = "wrong".into();
+        assert!(matches!(
+            bad_hash.verify_with_skew(&key, 100, 60),
+            Err(CompileError::ContentHashMismatch)
+        ));
+        let mut bad_signature = future;
+        bad_signature.signature[0] ^= 1;
+        assert!(matches!(
+            bad_signature.verify_with_skew(&key, 100, 60),
+            Err(CompileError::SignatureMismatch)
+        ));
     }
 
     #[test]

@@ -42,17 +42,23 @@ The API accepts `CYBERBOARD_BIND_ADDR`, `CYBERBOARD_API_PORT`,
 `CYBERBOARD_CONFIG_SIGNING_KEY`, and `CYBERBOARD_CONFIG_SIGNING_KEY_ID`,
 `CYBERBOARD_DATABASE_URL`, `CYBERBOARD_REDIS_URL`,
 `CYBERBOARD_DEMO_ADMIN_EMAIL`, `CYBERBOARD_DEMO_ADMIN_PASSWORD`,
-`CYBERBOARD_DEMO_USER_EMAIL`, and `CYBERBOARD_DEMO_USER_PASSWORD`. The admin
-credentials default to `admin@example.com`/`password`, and the portal user
-credentials default to `lin@example.com`/`password`, for local development
-only. In database mode, login creates a random server-side session with a
-hashed token, tenant, role, expiry, and revocation state. Static development
-tokens are available only in explicit `CYBERBOARD_DEV_MODE=1` memory mode.
-Set `CYBERBOARD_DEV_MODE=1`
-to enable the credential fallback when no database URL is configured; without
-that explicit flag, login requires a matching active database user. Set
-`CYBERBOARD_TENANT_ID` to select the tenant scope (the development default is
-UUID `00000000-0000-0000-0000-000000000001`).
+`CYBERBOARD_DEMO_USER_EMAIL`, `CYBERBOARD_DEMO_USER_PASSWORD`,
+`CYBERBOARD_BOOTSTRAP_ADMIN_EMAIL`, and
+`CYBERBOARD_BOOTSTRAP_ADMIN_PASSWORD`. The demo admin credentials default to
+`admin@example.com`/`password`, and the demo portal credentials default to
+`lin@example.com`/`password`; these credentials are for memory-mode development
+only. These optional bootstrap settings create the first database-mode
+administrator at API startup, immediately
+after the configured tenant is ensured. Set both together; the password must
+contain at least 12 characters. Bootstrap is idempotent: an existing tenant
+administrator is never changed, while a configured email that already belongs
+to a non-admin user stops startup rather than promoting that account. With
+neither setting present, startup logs an informational warning if the tenant has
+no administrator. In production, rotate the bootstrap password and remove both
+settings after the initial administrator has been created. Demo credentials and
+static development tokens work only in explicit `CYBERBOARD_DEV_MODE=1` memory
+mode; database mode always authenticates persisted users and issues persisted
+server-side sessions.
 
 When `CYBERBOARD_DATABASE_URL` is set, API startup connects to PostgreSQL,
 executes the embedded migrations `0001` through the current `0012` release, and ensures the
@@ -60,15 +66,20 @@ configured tenant exists. A failed connection or migration stops startup.
 Without a URL, `/readyz` reports `memory_mode`; it does not claim database
 health, and resource writes return a clear `database_unavailable` response.
 
-The read-only session and admin endpoints require
-`Authorization: Bearer cyberboard-dev-token` after a successful development
-login:
+In memory mode, successful development login returns the static token
+`cyberboard-dev-token`; only then can that value be sent to read-only session and
+admin endpoints. In database mode, send the `accessToken` returned by login
+instead:
 
 ```sh
 curl -s http://127.0.0.1:8080/api/v1/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"email":"admin@example.com","password":"password"}'
 ```
+
+The portal user's demo credentials are likewise memory-mode only. In database
+mode, portal login requires an active non-admin database user and returns a
+persisted session token.
 
 The user portal login uses its own credentials and token namespace:
 

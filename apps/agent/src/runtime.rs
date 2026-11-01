@@ -502,6 +502,175 @@ fn set_private(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+pub async fn binary_has_v2ray_api(binary: &Path) -> bool {
+    let output = timeout(
+        Duration::from_secs(3),
+        Command::new(binary)
+            .arg("version")
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    let Ok(Ok(output)) = output else {
+        return false;
+    };
+    output.status.success() && String::from_utf8_lossy(&output.stdout).contains("with_v2ray_api")
+}
+
+pub struct ProcessMetrics {
+    pub memory_bytes: Option<u64>,
+    pub cpu_percent: Option<f64>,
+}
+
+#[cfg(target_os = "linux")]
+pub async fn process_metrics(pids: &[u32]) -> Option<ProcessMetrics> {
+    use std::{
+        collections::HashMap,
+        fs,
+        sync::{Mutex, OnceLock},
+    };
+
+    static LAST_CPU: OnceLock<Mutex<HashMap<u32, (u64, std::time::Instant)>>> = OnceLock::new();
+
+    fn read_proc(pids: &[u32]) -> HashMap<u32, (u64, u64)> {
+        let mut values = HashMap::new();
+        for pid in pids.iter().copied().filter(|pid| *pid > 0) {
+            let base = PathBuf::from(format!("/proc/{pid}"));
+            let Ok(stat) = fs::read_to_string(base.join("stat")) else {
+                continue;
+            };
+            let Some(close) = stat.rfind(')') else {
+                continue;
+            };
+            let fields: Vec<_> = stat[close + 1..].split_whitespace().collect();
+            if fields.len() <= 12 {
+                continue;
+            }
+            let (Ok(user_ticks), Ok(system_ticks)) =
+                (fields[11].parse::<u64>(), fields[12].parse::<u64>())
+            else {
+                continue;
+            };
+            let Ok(status) = fs::read_to_string(base.join("status")) else {
+                continue;
+            };
+            let rss_kib = status.lines().find_map(|line| {
+                line.strip_prefix("VmRSS:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            });
+            if let Some(rss_kib) = rss_kib {
+                values.insert(
+                    pid,
+                    (
+                        rss_kib.saturating_mul(1024),
+                        user_ticks.saturating_add(system_ticks),
+                    ),
+                );
+            }
+        }
+        values
+    }
+
+    let current = read_proc(pids);
+    if current.is_empty() {
+        return None;
+    }
+    let now = std::time::Instant::now();
+    let memory_bytes = current.values().map(|(rss, _)| *rss).sum();
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let mut last = LAST_CPU
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()?;
+    let cpu_percent = if ticks_per_second > 0 {
+        let mut sampled = false;
+        let mut total = 0.0_f64;
+        for (pid, (_, ticks)) in &current {
+            if let Some((previous_ticks, previous_at)) = last.get(pid) {
+                let elapsed = now.duration_since(*previous_at).as_secs_f64();
+                if elapsed > 0.0 {
+                    total += ticks.saturating_sub(*previous_ticks) as f64
+                        / ticks_per_second as f64
+                        / elapsed
+                        * 100.0;
+                    sampled = true;
+                }
+            }
+        }
+        sampled.then_some(total.max(0.0))
+    } else {
+        None
+    };
+    last.retain(|pid, _| pids.contains(pid));
+    for (pid, (_, ticks)) in current {
+        last.insert(pid, (ticks, now));
+    }
+    Some(ProcessMetrics {
+        memory_bytes: Some(memory_bytes),
+        cpu_percent,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn process_metrics(pids: &[u32]) -> Option<ProcessMetrics> {
+    let pid_list = pids
+        .iter()
+        .copied()
+        .filter(|pid| *pid > 0)
+        .map(|pid| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    if pid_list.is_empty() {
+        return None;
+    }
+    let output = timeout(
+        Duration::from_secs(2),
+        Command::new("ps")
+            .args(["-o", "rss=", "-o", "%cpu=", "-p", &pid_list])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut memory_kib = 0_u64;
+    let mut cpu_percent = 0.0_f64;
+    let mut found = false;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(memory), Some(cpu)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let (Ok(memory), Ok(cpu)) = (memory.parse::<u64>(), cpu.parse::<f64>()) else {
+            continue;
+        };
+        if !cpu.is_finite() || cpu < 0.0 {
+            continue;
+        }
+        memory_kib = memory_kib.saturating_add(memory);
+        cpu_percent += cpu;
+        found = true;
+    }
+    found.then_some(ProcessMetrics {
+        memory_bytes: Some(memory_kib.saturating_mul(1024)),
+        cpu_percent: Some(cpu_percent),
+    })
+}
+
+impl CoreSupervisor {
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.as_ref().and_then(|child| child.id())
+    }
+}
+
 pub fn disk_free_bytes(path: &Path) -> u64 {
     #[cfg(unix)]
     {
@@ -618,26 +787,27 @@ mod tests {
                 return;
             }
         };
-        let listener = match std::net::TcpListener::bind(("127.0.0.1", 18149)) {
-            Ok(listener) => listener,
-            Err(error) => {
-                eprintln!(
-                    "skipping real sing-box restart test: 127.0.0.1:18149 unavailable: {error}"
-                );
-                return;
-            }
-        };
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
         drop(listener);
 
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("sing-box.json");
-        let payload = br#"{"log":{"level":"error"},"inbounds":[{"type":"socks","tag":"local-socks","listen":"127.0.0.1","listen_port":18149}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}"#;
+        let payload = serde_json::json!({
+            "log": {"level": "error"},
+            "inbounds": [{"type": "socks", "tag": "local-socks", "listen": "127.0.0.1", "listen_port": port}],
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "route": {"final": "direct"}
+        });
+        let payload = serde_json::to_vec(&payload).unwrap();
         let mut supervisor =
             CoreSupervisor::new(&binary, &config, Duration::from_millis(500)).await;
         supervisor.initialize().await.unwrap();
+        let outcome = supervisor.apply(&payload, 1, &hash(&payload)).await;
         assert_eq!(
-            supervisor.apply(payload, 1, &hash(payload)).await.phase,
-            "applied"
+            outcome.phase, "applied",
+            "apply failed: {}: {}",
+            outcome.error_code, outcome.error_message
         );
         supervisor.shutdown().await;
 

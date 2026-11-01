@@ -391,6 +391,7 @@ dependencies = [
  "cyberboard-domain",
  "cyberboard-observability",
  "ed25519-dalek",
+ "prost 0.13.5",
  "serde",
  "serde_json",
  "sqlx",
@@ -434,6 +435,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

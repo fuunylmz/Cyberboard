@@ -193,6 +193,9 @@ pub struct AgentConfig {
     pub core_config_path: String,
     pub core_binary: String,
     pub health_grace_ms: u64,
+    pub usage_report_interval_secs: u64,
+    pub usage_poll_interval_secs: u64,
+    pub usage_queue_path: Option<String>,
     pub insecure: bool,
 }
 
@@ -219,6 +222,11 @@ impl AgentConfig {
             core_binary: optional_env("CYBERBOARD_SING_BOX_BINARY")
                 .unwrap_or_else(|| "sing-box".to_owned()),
             health_grace_ms: env_u64("CYBERBOARD_AGENT_HEALTH_GRACE_MS", 3000)?.clamp(500, 60_000),
+            usage_report_interval_secs: env_u64("CYBERBOARD_AGENT_USAGE_INTERVAL_SECS", 60)?
+                .clamp(5, 3600),
+            usage_poll_interval_secs: env_u64("CYBERBOARD_AGENT_USAGE_POLL_INTERVAL_SECS", 10)?
+                .clamp(1, 300),
+            usage_queue_path: optional_env("CYBERBOARD_AGENT_USAGE_QUEUE_PATH"),
             insecure: env_bool("CYBERBOARD_AGENT_INSECURE", false)?,
         })
     }

@@ -7,9 +7,10 @@
 use std::time::Duration;
 
 use cyberboard_storage::{
-    EIGHTH_MIGRATION, ELEVENTH_MIGRATION, FIFTH_MIGRATION, FOURTEENTH_MIGRATION, FOURTH_MIGRATION,
-    INITIAL_MIGRATION, NINTH_MIGRATION, SECOND_MIGRATION, SEVENTH_MIGRATION, SIXTH_MIGRATION,
-    TENTH_MIGRATION, THIRD_MIGRATION, THIRTEENTH_MIGRATION, TWELFTH_MIGRATION,
+    EIGHTH_MIGRATION, ELEVENTH_MIGRATION, FIFTEENTH_MIGRATION, FIFTH_MIGRATION,
+    FOURTEENTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION, NINTH_MIGRATION, SECOND_MIGRATION,
+    SEVENTH_MIGRATION, SIXTH_MIGRATION, TENTH_MIGRATION, THIRD_MIGRATION, THIRTEENTH_MIGRATION,
+    TWELFTH_MIGRATION,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -515,7 +516,6 @@ impl Database {
                 .execute(&mut *transaction)
                 .await?;
         }
-
         let fourteenth: Option<String> =
             sqlx::query_scalar("SELECT version FROM cyberboard_schema_migrations WHERE version=$1")
                 .bind("0014_user_proxy_credentials")
@@ -527,6 +527,20 @@ impl Database {
                 .await?;
             sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
                 .bind("0014_user_proxy_credentials")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        let fifteenth: Option<String> =
+            sqlx::query_scalar("SELECT version FROM cyberboard_schema_migrations WHERE version=$1")
+                .bind("0015_usage_reporting")
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if fifteenth.is_none() {
+            sqlx::raw_sql(FIFTEENTH_MIGRATION)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
+                .bind("0015_usage_reporting")
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -1114,7 +1128,7 @@ impl Database {
             "SELECT n.id,n.name,n.region,n.address,n.status,n.core_type,n.core_version,n.agent_version,
                     n.current_config_revision,(SELECT generation FROM config_revisions WHERE tenant_id=n.tenant_id AND id=n.current_config_revision) AS desired_generation,
                     n.applied_config_revision,n.applied_generation,n.applied_at::text AS applied_at,n.agent_core_state,
-                    n.last_heartbeat_at::text AS last_heartbeat_at,n.port,n.tags
+                    n.last_heartbeat_at::text AS last_heartbeat_at,n.agent_memory_bytes,n.agent_cpu_percent,COALESCE((SELECT sum(e.download_bytes+e.upload_bytes)::bigint FROM usage_events e WHERE e.tenant_id=n.tenant_id AND e.node_id=n.id AND e.received_at >= now()-interval '24 hours'),0)::bigint AS traffic_bytes_24h,n.port,n.tags
              FROM nodes n WHERE n.tenant_id=$1 AND ($2::text IS NULL OR n.name ILIKE '%' || $2 || '%' OR n.address ILIKE '%' || $2 || '%') AND ($3::text IS NULL OR n.status=$3) ORDER BY n.created_at DESC,n.id LIMIT $4 OFFSET $5",
         )
         .bind(tenant_id).bind(search).bind(status).bind(limit).bind(offset)
@@ -1149,7 +1163,7 @@ impl Database {
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
              RETURNING id,name,region,address,status,core_type,core_version,agent_version,
                        current_config_revision,NULL::bigint AS desired_generation,applied_config_revision,applied_generation,applied_at::text AS applied_at,agent_core_state,
-                       last_heartbeat_at::text AS last_heartbeat_at,port,tags",
+                       last_heartbeat_at::text AS last_heartbeat_at,agent_memory_bytes,agent_cpu_percent,port,tags",
         )
         .bind(tenant_id)
         .bind(&node.name)
@@ -1204,7 +1218,7 @@ impl Database {
              RETURNING id,name,region,address,status,core_type,core_version,agent_version,
                        current_config_revision,(SELECT generation FROM config_revisions WHERE tenant_id=nodes.tenant_id AND id=nodes.current_config_revision) AS desired_generation,
                        applied_config_revision,applied_generation,applied_at::text AS applied_at,agent_core_state,
-                       last_heartbeat_at::text AS last_heartbeat_at,port,tags",
+                       last_heartbeat_at::text AS last_heartbeat_at,agent_memory_bytes,agent_cpu_percent,port,tags",
         )
         .bind(tenant_id).bind(node_id).bind(&node.name).bind(&node.region).bind(&node.address)
         .bind(node.port).bind(&node.core).bind(&node.core_version).bind(&node.status).bind(&node.tags)
@@ -1859,9 +1873,14 @@ impl Database {
         tenant_id: Uuid,
         user_id: Uuid,
     ) -> DatabaseResult<UsageRecord> {
-        let row = sqlx::query("SELECT COALESCE(sum(download_bytes+upload_bytes),0)::bigint AS used_bytes,min(window_start)::text AS period_start,max(window_end)::text AS period_end FROM usage_events WHERE tenant_id=$1 AND user_id=$2").bind(tenant_id).bind(user_id).fetch_one(&self.pool).await?;
+        let row = sqlx::query("SELECT COALESCE(sum(download_bytes+upload_bytes),0)::bigint AS used_bytes,COALESCE(sum(download_bytes+upload_bytes) FILTER (WHERE received_at >= current_date),0)::bigint AS today_bytes,min(window_start)::text AS period_start,max(window_end)::text AS period_end FROM usage_events WHERE tenant_id=$1 AND user_id=$2")
+            .bind(tenant_id)
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(UsageRecord {
             used_bytes: row.get("used_bytes"),
+            today_bytes: row.get("today_bytes"),
             period_start: row.try_get("period_start").ok(),
             period_end: row.try_get("period_end").ok(),
         })
@@ -2518,7 +2537,7 @@ impl Database {
         .bind(&heartbeat.platform)
         .bind(&heartbeat.architecture)
         .bind(&heartbeat.core_state)
-        .bind(heartbeat.memory_bytes as i64)
+        .bind(heartbeat.memory_bytes.map(|value| value as i64))
         .bind(heartbeat.disk_free_bytes as i64)
         .bind(heartbeat.cpu_percent)
         .execute(&self.pool)
@@ -2599,7 +2618,10 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn ingest_agent_usage(&self, input: AgentUsageInput<'_>) -> DatabaseResult<bool> {
+    pub async fn ingest_agent_usage(
+        &self,
+        input: AgentUsageInput<'_>,
+    ) -> DatabaseResult<UsageIngestOutcome> {
         let AgentUsageInput {
             tenant_id,
             agent_id,
@@ -2626,11 +2648,23 @@ impl Database {
         }
 
         let mut transaction = self.pool.begin().await?;
+        let node_matches_agent: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE tenant_id=$1 AND id=$2 AND agent_id=$3)",
+        )
+        .bind(tenant_id)
+        .bind(node_id)
+        .bind(agent_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !node_matches_agent {
+            transaction.rollback().await?;
+            tracing::warn!(tenant_id = %tenant_id, node_id = %node_id, agent_id, "usage report rejected because agent is not bound to node");
+            return Ok(UsageIngestOutcome::NodeMismatch);
+        }
         let receipt = sqlx::query(
             "INSERT INTO agent_usage_receipts
                 (tenant_id,node_id,agent_id,batch_id,sequence,window_start,window_end,usage_payload)
-             SELECT $1,$2,$3,$4,$5,to_timestamp($6),to_timestamp($7),$8
-             WHERE EXISTS (SELECT 1 FROM nodes WHERE tenant_id=$1 AND id=$2 AND agent_id=$3)
+             VALUES ($1,$2,$3,$4,$5,to_timestamp($6),to_timestamp($7),$8)
              ON CONFLICT (tenant_id,agent_id,batch_id) DO NOTHING",
         )
         .bind(tenant_id)
@@ -2645,55 +2679,88 @@ impl Database {
         .await?;
         if receipt.rows_affected() == 0 {
             transaction.commit().await?;
-            return Ok(false);
+            return Ok(UsageIngestOutcome::Duplicate);
         }
 
         for event in events {
+            let Some(user_id) = event.user_id else {
+                tracing::warn!(username = %event.username, node_id = %node_id, "usage counter username is not a UUID; skipping");
+                continue;
+            };
+            let subscription_id = sqlx::query_scalar::<_, Uuid>(
+                "SELECT s.id
+                 FROM users u
+                 JOIN subscriptions s ON s.tenant_id=u.tenant_id AND s.user_id=u.id
+                 JOIN subscription_nodes sn ON sn.tenant_id=s.tenant_id
+                   AND sn.subscription_id=s.id AND sn.node_id=$3
+                 WHERE u.tenant_id=$1 AND u.id=$2 AND u.status NOT IN ('deleted','banned')
+                   AND s.status <> 'revoked'
+                   AND (s.starts_at IS NULL OR s.starts_at <= to_timestamp($4))
+                   AND s.expires_at >= to_timestamp($5)
+                 ORDER BY s.created_at DESC,s.id LIMIT 1",
+            )
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(node_id)
+            .bind(event.window_start)
+            .bind(event.window_end)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            let Some(subscription_id) = subscription_id else {
+                tracing::warn!(username = %event.username, node_id = %node_id, "usage counter references an unknown user or an unassigned subscription; skipping");
+                continue;
+            };
             let inserted = sqlx::query(
                 "INSERT INTO usage_events
                     (tenant_id,event_key,user_id,subscription_id,node_id,
                      window_start,window_end,download_bytes,upload_bytes,source_sequence)
-                 SELECT $1,$2,s.user_id,s.id,$3,to_timestamp($4),to_timestamp($5),$6,$7,$8
-                 FROM subscriptions s
-                 JOIN subscription_nodes sn
-                   ON sn.tenant_id=s.tenant_id AND sn.subscription_id=s.id
-                  AND sn.node_id=$3
-                 WHERE s.tenant_id=$1 AND s.id=$9 AND s.user_id=$10
-                   AND s.status <> 'revoked'
+                 VALUES ($1,$2,$3,$4,$5,to_timestamp($6),to_timestamp($7),$8,$9,$10)
                  ON CONFLICT (tenant_id,event_key) DO NOTHING",
             )
             .bind(tenant_id)
             .bind(&event.event_key)
+            .bind(user_id)
+            .bind(subscription_id)
             .bind(node_id)
             .bind(event.window_start)
             .bind(event.window_end)
             .bind(event.download_bytes)
             .bind(event.upload_bytes)
             .bind(sequence)
-            .bind(event.subscription_id)
-            .bind(event.user_id)
             .execute(&mut *transaction)
             .await?;
             if inserted.rows_affected() == 0 {
-                let already_recorded: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM usage_events
-                         WHERE tenant_id=$1 AND event_key=$2
-                     )",
-                )
-                .bind(tenant_id)
-                .bind(&event.event_key)
-                .fetch_one(&mut *transaction)
-                .await?;
-                if !already_recorded {
-                    return Err(DatabaseError::InvalidUsagePayload(
-                        "subscription is not assigned to this node or user".to_owned(),
-                    ));
-                }
+                continue;
             }
+            sqlx::query(
+                "UPDATE subscriptions SET traffic_used_bytes=traffic_used_bytes+$3,updated_at=now()
+                 WHERE tenant_id=$1 AND id=$2",
+            )
+            .bind(tenant_id)
+            .bind(subscription_id)
+            .bind(event.download_bytes + event.upload_bytes)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT INTO usage_buckets
+                    (tenant_id,user_id,bucket_start,bucket_end,download_bytes,upload_bytes,event_count,first_received_at,last_received_at)
+                 VALUES ($1,$2,date_trunc('hour',to_timestamp($3)),date_trunc('hour',to_timestamp($3))+interval '1 hour',$4,$5,1,now(),now())
+                 ON CONFLICT (tenant_id,user_id,bucket_start) DO UPDATE SET
+                    download_bytes=usage_buckets.download_bytes+EXCLUDED.download_bytes,
+                    upload_bytes=usage_buckets.upload_bytes+EXCLUDED.upload_bytes,
+                    event_count=usage_buckets.event_count+1,
+                    last_received_at=now()",
+            )
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(event.window_start)
+            .bind(event.download_bytes)
+            .bind(event.upload_bytes)
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
-        Ok(true)
+        Ok(UsageIngestOutcome::Inserted)
     }
 
     pub async fn active_agent_release(
@@ -2746,30 +2813,33 @@ impl Database {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UsageIngestOutcome {
+    Inserted,
+    Duplicate,
+    NodeMismatch,
+}
+
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UsageEventPayload {
-    #[serde(alias = "event_key")]
-    event_key: Option<String>,
-    #[serde(alias = "user_id")]
-    user_id: Uuid,
-    #[serde(alias = "subscription_id")]
-    subscription_id: Uuid,
-    #[serde(default, alias = "window_start")]
-    window_start: Option<i64>,
-    #[serde(default, alias = "window_end")]
-    window_end: Option<i64>,
-    #[serde(alias = "download_bytes")]
-    download_bytes: i64,
-    #[serde(alias = "upload_bytes")]
-    upload_bytes: i64,
+#[serde(deny_unknown_fields)]
+struct UsageCountersPayload {
+    version: u32,
+    counters: Vec<UsageCounterPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UsageCounterPayload {
+    username: String,
+    download_bytes: u64,
+    upload_bytes: u64,
 }
 
 #[derive(Debug)]
 struct ParsedUsageEvent {
     event_key: String,
-    user_id: Uuid,
-    subscription_id: Uuid,
+    username: String,
+    user_id: Option<Uuid>,
     window_start: i64,
     window_end: i64,
     download_bytes: i64,
@@ -2925,53 +2995,58 @@ fn parse_usage_events(
     payload: &serde_json::Value,
     default_window_start: i64,
     default_window_end: i64,
-    agent_id: &str,
+    _agent_id: &str,
     batch_id: &str,
 ) -> DatabaseResult<Vec<ParsedUsageEvent>> {
-    let raw_events: Vec<UsageEventPayload> = match payload.get("events") {
-        Some(events) => serde_json::from_value(events.clone())
-            .map_err(|error| DatabaseError::InvalidUsagePayload(format!("events: {error}")))?,
-        None => vec![
-            serde_json::from_value(payload.clone())
-                .map_err(|error| DatabaseError::InvalidUsagePayload(format!("event: {error}")))?,
-        ],
-    };
-    if raw_events.is_empty() {
+    if default_window_end <= default_window_start {
         return Err(DatabaseError::InvalidUsagePayload(
-            "at least one usage event is required".to_owned(),
+            "usage window must end after it starts".to_owned(),
         ));
     }
-    raw_events
+    let payload: UsageCountersPayload = serde_json::from_value(payload.clone())
+        .map_err(|error| DatabaseError::InvalidUsagePayload(format!("counters: {error}")))?;
+    if payload.version != 1 {
+        return Err(DatabaseError::InvalidUsagePayload(
+            "unsupported usage payload version".to_owned(),
+        ));
+    }
+    if payload.counters.is_empty() {
+        return Ok(Vec::new());
+    }
+    payload
+        .counters
         .into_iter()
-        .enumerate()
-        .map(|(index, event)| {
-            let window_start = event.window_start.unwrap_or(default_window_start);
-            let window_end = event.window_end.unwrap_or(default_window_end);
-            if window_end <= window_start {
+        .map(|counter| {
+            if counter.username.trim().is_empty() || counter.username.len() > 128 {
                 return Err(DatabaseError::InvalidUsagePayload(
-                    "usage window must end after it starts".to_owned(),
+                    "username is invalid".to_owned(),
                 ));
             }
-            if event.download_bytes < 0 || event.upload_bytes < 0 {
-                return Err(DatabaseError::InvalidUsagePayload(
-                    "byte counters cannot be negative".to_owned(),
-                ));
+            if counter.download_bytes == 0 && counter.upload_bytes == 0 {
+                return Ok(None);
             }
-            let event_key = event
-                .event_key
-                .filter(|key| !key.trim().is_empty())
-                .unwrap_or_else(|| format!("{agent_id}:{batch_id}:{index}"));
-            Ok(ParsedUsageEvent {
-                event_key,
-                user_id: event.user_id,
-                subscription_id: event.subscription_id,
-                window_start,
-                window_end,
-                download_bytes: event.download_bytes,
-                upload_bytes: event.upload_bytes,
-            })
+            let download_bytes = i64::try_from(counter.download_bytes).map_err(|_| {
+                DatabaseError::InvalidUsagePayload(
+                    "download counter exceeds supported range".to_owned(),
+                )
+            })?;
+            let upload_bytes = i64::try_from(counter.upload_bytes).map_err(|_| {
+                DatabaseError::InvalidUsagePayload(
+                    "upload counter exceeds supported range".to_owned(),
+                )
+            })?;
+            Ok(Some(ParsedUsageEvent {
+                event_key: format!("{batch_id}:{}", counter.username),
+                user_id: Uuid::parse_str(&counter.username).ok(),
+                username: counter.username,
+                window_start: default_window_start,
+                window_end: default_window_end,
+                download_bytes,
+                upload_bytes,
+            }))
         })
-        .collect()
+        .collect::<DatabaseResult<Vec<_>>>()
+        .map(|events| events.into_iter().flatten().collect())
 }
 
 #[derive(Clone, Debug)]
@@ -3125,9 +3200,9 @@ pub struct AgentHeartbeatInput {
     pub platform: String,
     pub architecture: String,
     pub core_state: String,
-    pub memory_bytes: u64,
+    pub memory_bytes: Option<u64>,
     pub disk_free_bytes: u64,
-    pub cpu_percent: f64,
+    pub cpu_percent: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -3248,6 +3323,9 @@ pub struct NodeRecord {
     pub applied_at: Option<String>,
     pub core_state: Option<String>,
     pub last_heartbeat_at: Option<String>,
+    pub agent_memory_bytes: Option<i64>,
+    pub agent_cpu_percent: Option<f64>,
+    pub traffic_bytes_24h: i64,
     pub port: i32,
     pub tags: serde_json::Value,
 }
@@ -3270,6 +3348,9 @@ impl NodeRecord {
             applied_at: row.try_get("applied_at").ok().flatten(),
             core_state: row.try_get("agent_core_state").ok().flatten(),
             last_heartbeat_at: row.try_get("last_heartbeat_at").ok(),
+            agent_memory_bytes: row.try_get("agent_memory_bytes").ok(),
+            agent_cpu_percent: row.try_get("agent_cpu_percent").ok(),
+            traffic_bytes_24h: row.try_get("traffic_bytes_24h").unwrap_or(0),
             port: row.get("port"),
             tags: row.get("tags"),
         }
@@ -3416,6 +3497,7 @@ impl DeviceRecord {
 #[derive(Clone, Debug)]
 pub struct UsageRecord {
     pub used_bytes: i64,
+    pub today_bytes: i64,
     pub period_start: Option<String>,
     pub period_end: Option<String>,
 }
@@ -3577,15 +3659,16 @@ mod tests {
     }
 
     #[test]
-    fn usage_payload_supports_single_and_batched_events() {
+    fn usage_payload_supports_versioned_user_counters() {
         let user_id = Uuid::from_u128(1);
-        let subscription_id = Uuid::from_u128(2);
-        let single = parse_usage_events(
+        let parsed = parse_usage_events(
             &json!({
-                "userId": user_id,
-                "subscriptionId": subscription_id,
-                "downloadBytes": 12,
-                "uploadBytes": 3
+                "version": 1,
+                "counters": [{
+                    "username": user_id.to_string(),
+                    "download_bytes": 12,
+                    "upload_bytes": 3
+                }]
             }),
             100,
             200,
@@ -3593,41 +3676,31 @@ mod tests {
             "batch-1",
         )
         .unwrap();
-        assert_eq!(single.len(), 1);
-        assert_eq!(single[0].event_key, "agent-1:batch-1:0");
-        let batched = parse_usage_events(
-            &json!({"events": [{
-                "event_key": "event-1",
-                "user_id": user_id,
-                "subscription_id": subscription_id,
-                "download_bytes": 5,
-                "upload_bytes": 1
-            }]}),
-            100,
-            200,
-            "agent-1",
-            "batch-2",
-        )
-        .unwrap();
-        assert_eq!(batched[0].event_key, "event-1");
-        assert_eq!(batched[0].download_bytes, 5);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].event_key, format!("batch-1:{user_id}"));
+        assert_eq!(parsed[0].download_bytes, 12);
+        assert_eq!(parsed[0].upload_bytes, 3);
     }
 
     #[test]
-    fn usage_payload_rejects_negative_counters() {
-        let error = parse_usage_events(
-            &json!({
-                "userId": Uuid::from_u128(1),
-                "subscriptionId": Uuid::from_u128(2),
-                "downloadBytes": -1,
-                "uploadBytes": 0
-            }),
+    fn usage_payload_rejects_invalid_version_and_overflow() {
+        let invalid = parse_usage_events(
+            &json!({"version": 2, "counters": []}),
             100,
             200,
             "agent-1",
             "batch-1",
         )
         .unwrap_err();
-        assert!(matches!(error, DatabaseError::InvalidUsagePayload(_)));
+        assert!(matches!(invalid, DatabaseError::InvalidUsagePayload(_)));
+        let overflow = parse_usage_events(
+            &json!({"version": 1, "counters": [{"username": "user", "download_bytes": 18446744073709551615_u64, "upload_bytes": 0}]}),
+            100,
+            200,
+            "agent-1",
+            "batch-1",
+        )
+        .unwrap_err();
+        assert!(matches!(overflow, DatabaseError::InvalidUsagePayload(_)));
     }
 }

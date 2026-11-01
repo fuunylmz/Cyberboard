@@ -16,6 +16,7 @@ cyberboard-domain.workspace = true
 cyberboard-observability.workspace = true
 cyberboard-agent-protocol.workspace = true
 ed25519-dalek.workspace = true
+prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

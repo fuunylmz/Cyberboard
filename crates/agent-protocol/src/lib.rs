@@ -12,6 +12,10 @@ pub mod generated {
     tonic::include_proto!("cyberboard.agent.v1");
 }
 
+pub mod v2rayapi {
+    tonic::include_proto!("v2ray.core.app.stats.command");
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PROTOCOL_PACKAGE, PROTOCOL_SCHEMA, PROTOCOL_VERSION};

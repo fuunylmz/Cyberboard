@@ -24,6 +24,16 @@ pub enum CompileError {
     UnsupportedInbound(String),
     #[error("TLS requires certificate and key paths")]
     IncompleteTls,
+    #[error("inbound listen port conflicts with the V2Ray API")]
+    V2rayApiPortConflict,
+    #[error("template must not define experimental.v2ray_api")]
+    TemplateOwnsV2rayApi,
+    #[error("experimental must be an object")]
+    InvalidExperimental,
+    #[error("inbound credential fields are invalid for protocol {0}")]
+    InvalidInboundCredential(String),
+    #[error("outbound credential fields are invalid for protocol {0}")]
+    InvalidOutboundCredential(String),
     #[error("invalid signed envelope")]
     InvalidEnvelope,
     #[error("signature verification failed")]
@@ -36,6 +46,10 @@ pub enum CompileError {
     EnvelopeExpired,
 }
 
+/// The agent-side usage collector connects to this loopback-only V2Ray API.
+pub const V2RAY_API_LISTEN: &str = "127.0.0.1:10085";
+const V2RAY_API_PORT: u16 = 10085;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConfigProfile {
     pub schema_version: u32,
@@ -44,6 +58,8 @@ pub struct ConfigProfile {
     pub inbounds: Vec<Inbound>,
     pub outbounds: Vec<Outbound>,
     pub route: Route,
+    #[serde(default)]
+    pub experimental: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -53,6 +69,8 @@ pub struct Inbound {
     pub listen_port: u16,
     #[serde(rename = "type")]
     pub inbound_type: String,
+    #[serde(default)]
+    pub method: Option<String>,
     pub transport: Transport,
     pub tls: Option<TlsConfig>,
     pub credential: Credential,
@@ -73,10 +91,22 @@ pub struct TlsConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InboundUser {
+    pub name: String,
+    #[serde(default)]
+    pub uuid: Option<Uuid>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub alter_id: Option<u16>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Credential {
     None,
     Password { username: String, password: String },
     Uuid { uuid: Uuid },
+    Users { users: Vec<InboundUser> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -96,6 +126,14 @@ impl ConfigProfile {
         if self.inbounds.is_empty() {
             return Err(CompileError::EmptyInbounds);
         }
+        if let Some(experimental) = &self.experimental {
+            let Some(experimental) = experimental.as_object() else {
+                return Err(CompileError::InvalidExperimental);
+            };
+            if experimental.contains_key("v2ray_api") {
+                return Err(CompileError::TemplateOwnsV2rayApi);
+            }
+        }
         for inbound in &self.inbounds {
             if inbound.tag.trim().is_empty() {
                 return Err(CompileError::EmptyTag);
@@ -103,26 +141,37 @@ impl ConfigProfile {
             if inbound.listen_port == 0 {
                 return Err(CompileError::InvalidPort);
             }
+            if inbound.listen_port == V2RAY_API_PORT {
+                return Err(CompileError::V2rayApiPortConflict);
+            }
             if !matches!(
                 inbound.inbound_type.as_str(),
-                "vless" | "vmess" | "trojan" | "mixed"
+                "vless" | "vmess" | "trojan" | "shadowsocks" | "mixed"
             ) {
                 return Err(CompileError::UnsupportedInbound(
                     inbound.inbound_type.clone(),
                 ));
             }
+            validate_inbound_credential(inbound)?;
             if let Some(tls) = &inbound.tls {
                 if tls.enabled && (tls.certificate_path.is_none() || tls.key_path.is_none()) {
                     return Err(CompileError::IncompleteTls);
                 }
             }
         }
+        for outbound in &self.outbounds {
+            validate_outbound_type(&outbound.outbound_type)?;
+        }
         Ok(())
     }
 
     pub fn render_sing_box(&self) -> Result<Value, CompileError> {
         self.validate()?;
-        let inbounds = self.inbounds.iter().map(render_inbound).collect::<Vec<_>>();
+        let inbounds = self
+            .inbounds
+            .iter()
+            .map(render_inbound)
+            .collect::<Result<Vec<_>, _>>()?;
         let outbounds = if self.outbounds.is_empty() {
             vec![json!({"type": "direct", "tag": "direct"})]
         } else {
@@ -131,22 +180,106 @@ impl ConfigProfile {
                 .map(|item| json!({"type": item.outbound_type, "tag": item.tag}))
                 .collect()
         };
-        Ok(json!({
+        let mut rendered = json!({
             "log": {"level": "info"},
             "inbounds": inbounds,
             "outbounds": outbounds,
             "route": {"final": self.route.final_tag.clone().unwrap_or_else(|| "direct".to_owned())}
-        }))
+        });
+        if let Some(experimental) = &self.experimental {
+            rendered["experimental"] = experimental.clone();
+        } else {
+            rendered["experimental"] = json!({});
+        }
+        let stats_users = rendered["inbounds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|inbound| {
+                inbound["users"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|user| user["name"].as_str().or_else(|| user["username"].as_str()))
+                    .map(str::to_owned)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        rendered["experimental"]["v2ray_api"] = json!({
+            "listen": V2RAY_API_LISTEN,
+            "stats": {"enabled": true, "users": stats_users.into_iter().collect::<Vec<_>>()}
+        });
+        Ok(rendered)
     }
 }
 
-fn render_inbound(inbound: &Inbound) -> Value {
+fn validate_outbound_type(outbound_type: &str) -> Result<(), CompileError> {
+    if matches!(
+        outbound_type,
+        "direct" | "block" | "dns" | "socks" | "http" | "shadowsocks" | "vless" | "vmess" | "trojan"
+    ) {
+        Ok(())
+    } else {
+        Err(CompileError::UnsupportedInbound(outbound_type.to_owned()))
+    }
+}
+
+fn validate_inbound_credential(inbound: &Inbound) -> Result<(), CompileError> {
+    match (&inbound.inbound_type[..], &inbound.credential) {
+        (_, Credential::None) => Ok(()),
+        ("vless", Credential::Uuid { .. }) => Ok(()),
+        ("vmess", Credential::Uuid { .. }) => Ok(()),
+        ("trojan", Credential::Password { username, password })
+            if !username.trim().is_empty() && !password.is_empty() => Ok(()),
+        ("shadowsocks", Credential::Password { username, password })
+            if !username.trim().is_empty()
+                && !password.is_empty()
+                && inbound.method.as_deref().is_some_and(|method| !method.is_empty()) => Ok(()),
+        ("mixed", Credential::Password { username, password })
+            if !username.is_empty() && !password.is_empty() => Ok(()),
+        (protocol, Credential::Users { users }) => {
+            if users.is_empty() {
+                return Ok(());
+            }
+            let valid = users.iter().all(|user| match protocol {
+                "vless" => !user.name.trim().is_empty()
+                    && user.uuid.is_some()
+                    && user.password.is_none()
+                    && user.alter_id.is_none(),
+                "vmess" => !user.name.trim().is_empty()
+                    && user.uuid.is_some()
+                    && user.password.is_none(),
+                "trojan" | "shadowsocks" => {
+                    !user.name.trim().is_empty()
+                        && user.password.as_deref().is_some_and(|password| !password.is_empty())
+                        && user.uuid.is_none()
+                }
+                "mixed" => {
+                    !user.name.trim().is_empty()
+                        && user.password.as_deref().is_some_and(|password| !password.is_empty())
+                        && user.uuid.is_none()
+                }
+                _ => false,
+            });
+            if valid {
+                Ok(())
+            } else {
+                Err(CompileError::InvalidInboundCredential(protocol.to_owned()))
+            }
+        }
+        (protocol, _) => Err(CompileError::InvalidInboundCredential(protocol.to_owned())),
+    }
+}
+
+fn render_inbound(inbound: &Inbound) -> Result<Value, CompileError> {
     let mut value = json!({
         "type": inbound.inbound_type,
         "tag": inbound.tag,
         "listen": inbound.listen,
         "listen_port": inbound.listen_port,
     });
+    if let Some(method) = &inbound.method {
+        value["method"] = json!(method);
+    }
     match &inbound.transport {
         Transport::Tcp => {}
         Transport::Websocket { path } => value["transport"] = json!({"type": "ws", "path": path}),
@@ -163,12 +296,35 @@ fn render_inbound(inbound: &Inbound) -> Value {
     }
     match &inbound.credential {
         Credential::None => {}
-        Credential::Password { username, password } => {
-            value["users"] = json!([{"username": username, "password": password}])
+        Credential::Password { username, password } => match inbound.inbound_type.as_str() {
+            "trojan" => value["users"] = json!([{"name": username, "password": password}]),
+            "shadowsocks" => {
+                value["password"] = json!(password);
+                value["users"] = json!([{"name": username, "password": password}]);
+            }
+            "mixed" => value["users"] = json!([{"username": username, "password": password}]),
+            protocol => {
+                return Err(CompileError::InvalidInboundCredential(protocol.to_owned()))
+            }
+        },
+        Credential::Uuid { uuid } => match inbound.inbound_type.as_str() {
+            "vless" => value["users"] = json!([{"uuid": uuid}]),
+            "vmess" => value["users"] = json!([{"uuid": uuid, "alterId": 0}]),
+            protocol => {
+                return Err(CompileError::InvalidInboundCredential(protocol.to_owned()))
+            }
+        },
+        Credential::Users { users } => {
+            value["users"] = match inbound.inbound_type.as_str() {
+                "vless" => json!(users.iter().map(|user| json!({"name": user.name, "uuid": user.uuid})).collect::<Vec<_>>()),
+                "vmess" => json!(users.iter().map(|user| json!({"name": user.name, "uuid": user.uuid, "alterId": user.alter_id.unwrap_or(0)})).collect::<Vec<_>>()),
+                "trojan" | "shadowsocks" => json!(users.iter().map(|user| json!({"name": user.name, "password": user.password})).collect::<Vec<_>>()),
+                "mixed" => json!(users.iter().map(|user| json!({"username": user.name, "password": user.password})).collect::<Vec<_>>()),
+                protocol => return Err(CompileError::InvalidInboundCredential(protocol.to_owned())),
+            };
         }
-        Credential::Uuid { uuid } => value["users"] = json!([{"uuid": uuid}]),
     }
-    value
+    Ok(value)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -291,6 +447,7 @@ mod tests {
                 listen: "0.0.0.0".to_owned(),
                 listen_port: 443,
                 inbound_type: "vless".to_owned(),
+                method: None,
                 transport: Transport::Websocket {
                     path: "/ws".to_owned(),
                 },
@@ -301,6 +458,7 @@ mod tests {
             }],
             outbounds: vec![],
             route: Route::default(),
+            experimental: None,
         }
     }
 

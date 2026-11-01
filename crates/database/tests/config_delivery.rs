@@ -90,7 +90,7 @@ async fn config_deployment_lifecycle_is_honest_and_rolls_forward() {
             revision_id: revision_one.id,
             expected_generation: 1,
             expected_previous_hash: None,
-            signed_envelope: "publish-artifact",
+            sign: &|_, _, _| "publish-artifact".to_owned(),
             actor_user_id: Uuid::nil(),
         })
         .await
@@ -188,7 +188,7 @@ async fn config_deployment_lifecycle_is_honest_and_rolls_forward() {
             revision_id: revision_two.id,
             expected_generation: 2,
             expected_previous_hash: Some(&hash_one),
-            signed_envelope: "publish-artifact",
+            sign: &|_, _, _| "publish-artifact".to_owned(),
             actor_user_id: Uuid::nil(),
         })
         .await
@@ -279,7 +279,7 @@ async fn config_deployment_lifecycle_is_honest_and_rolls_forward() {
             revision_id: draft_three.id,
             expected_generation: 3,
             expected_previous_hash: Some(&hash_one),
-            signed_envelope: "publish-artifact",
+            sign: &|_, _, _| "publish-artifact".to_owned(),
             actor_user_id: Uuid::nil(),
         })
         .await

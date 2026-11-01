@@ -38,6 +38,9 @@ pub const TWELFTH_MIGRATION: &str =
 pub const THIRTEENTH_MIGRATION_NAME: &str = "0013_config_deployment_lifecycle.sql";
 pub const THIRTEENTH_MIGRATION: &str =
     include_str!("../../../deploy/migrations/0013_config_deployment_lifecycle.sql");
+pub const FOURTEENTH_MIGRATION_NAME: &str = "0014_user_proxy_credentials.sql";
+pub const FOURTEENTH_MIGRATION: &str =
+    include_str!("../../../deploy/migrations/0014_user_proxy_credentials.sql");
 
 #[cfg(test)]
 mod tests {
@@ -48,6 +51,7 @@ mod tests {
         SEVENTH_MIGRATION, SEVENTH_MIGRATION_NAME, SIXTH_MIGRATION, TENTH_MIGRATION,
         TENTH_MIGRATION_NAME, THIRD_MIGRATION, THIRD_MIGRATION_NAME, THIRTEENTH_MIGRATION,
         THIRTEENTH_MIGRATION_NAME, TWELFTH_MIGRATION, TWELFTH_MIGRATION_NAME,
+        FOURTEENTH_MIGRATION, FOURTEENTH_MIGRATION_NAME,
     };
 
     #[test]
@@ -152,6 +156,17 @@ mod tests {
             "retry_count",
         ] {
             assert!(THIRTEENTH_MIGRATION.contains(field));
+        }
+        assert_eq!(
+            FOURTEENTH_MIGRATION_NAME,
+            "0014_user_proxy_credentials.sql"
+        );
+        for field in [
+            "user_proxy_credentials",
+            "shadowsocks_2022_key_128",
+            "shadowsocks_2022_key_256",
+        ] {
+            assert!(FOURTEENTH_MIGRATION.contains(field));
         }
     }
 }

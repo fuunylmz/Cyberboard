@@ -3,7 +3,7 @@ pub struct ConfigPublishInput<'a> {
     pub revision_id: Uuid,
     pub expected_generation: i64,
     pub expected_previous_hash: Option<&'a str>,
-    pub signed_envelope: &'a str,
+    pub sign: &'a (dyn Fn(Uuid, u64, Vec<u8>) -> String + Send + Sync),
     pub actor_user_id: Uuid,
 }
 

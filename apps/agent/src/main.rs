@@ -1,5 +1,4 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
     time::{Duration, Instant},
@@ -17,8 +16,11 @@ use rand_core::OsRng;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{info, warn};
 
+use state::ReconcileState;
+
 mod identity;
 mod runtime;
+mod state;
 mod tonic_transport;
 mod usage;
 
@@ -106,31 +108,6 @@ struct ReconcileContext<'a> {
     trusted_key: Option<&'a VerifyingKey>,
 }
 
-#[derive(Default)]
-struct ReconcileState {
-    pending: HashMap<(u64, String, String), ReportApplyResultRequest>,
-    pending_order: VecDeque<(u64, String, String)>,
-    reported_rejections: HashSet<(u64, String, String)>,
-    terminal: HashSet<(u64, String)>,
-}
-
-impl ReconcileState {
-    fn queue(&mut self, report: ReportApplyResultRequest, key: (u64, String, String)) {
-        const MAX_PENDING: usize = 64;
-        if !self.pending.contains_key(&key) {
-            if self.pending.len() == MAX_PENDING {
-                if let Some(oldest) = self.pending_order.pop_front() {
-                    if let Some(dropped) = self.pending.remove(&oldest) {
-                        warn!(generation = %dropped.generation, phase = %dropped.phase, "dropping oldest apply report after pending queue reached capacity");
-                    }
-                }
-            }
-            self.pending_order.push_back(key.clone());
-        }
-        self.pending.insert(key, report);
-    }
-}
-
 fn core_version_list(line: Option<String>) -> Vec<String> {
     line.and_then(|line| {
         line.strip_prefix("sing-box version ")
@@ -190,10 +167,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         None => None,
     };
-    let mut core = runtime::CoreSupervisor::new(
+    let durable_state = state::StateStore::load(
+        std::path::PathBuf::from(&config.core_config_path).with_extension("state"),
+    );
+    let mut core = runtime::CoreSupervisor::new_with_state_store(
         &config.core_binary,
         &config.core_config_path,
         Duration::from_millis(config.health_grace_ms),
+        durable_state.clone(),
     )
     .await;
     core.initialize().await?;
@@ -259,7 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut supervisor_ticker = interval(Duration::from_secs(2));
     supervisor_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut reconcile_state = ReconcileState::default();
+    let mut reconcile_state = ReconcileState::new(durable_state);
     let mut restart = RestartBackoff::new(Instant::now());
     if core.core_state() != "running" {
         restart.healthy_since = None;
@@ -428,19 +409,9 @@ async fn reconcile_once<T: AgentTransport>(
                 .await;
         }
     }
-    for key in reports.pending.keys().cloned().collect::<Vec<_>>() {
-        if let Some(report) = reports.pending.get(&key).cloned() {
-            if client.report_apply(report.clone()).await.is_ok() {
-                reports.pending.remove(&key);
-                reports
-                    .pending_order
-                    .retain(|pending_key| pending_key != &key);
-                if report.phase == "rejected" {
-                    reports.reported_rejections.insert(key);
-                } else {
-                    reports.terminal.insert((key.0, key.1));
-                }
-            }
+    for (result, report) in reports.pending() {
+        if client.report_apply(report).await.is_ok() {
+            reports.confirm(&result);
         }
     }
     if !desired_hint.is_empty() && desired_hint == state.generation.to_string() {
@@ -476,11 +447,11 @@ async fn reconcile_once<T: AgentTransport>(
                 },
                 "invalid_envelope".to_owned(),
             );
-            if !reports.reported_rejections.contains(&key) && !reports.pending.contains_key(&key) {
+            if !reports.has_report(key.0, &key.1, &key.2) {
                 let report = ReportApplyResultRequest {
                     agent_id: (*agent_id).into(),
                     node_id: (*node_id).into(),
-                    generation: response.generation,
+                    generation: generation.to_string(),
                     previous_hash: state.content_hash.clone(),
                     applied_hash: state.content_hash.clone(),
                     phase: "rejected".into(),
@@ -492,18 +463,15 @@ async fn reconcile_once<T: AgentTransport>(
                     compare_and_swap_ok: true,
                     agent_public_key: (*public_key).into(),
                 };
-                if client.report_apply(report.clone()).await.is_ok() {
-                    reports.reported_rejections.insert(key);
-                } else {
-                    reports.queue(report, key);
-                }
+                let confirmed = client.report_apply(report.clone()).await.is_ok();
+                reports.record(&report, &key.1, confirmed);
             }
             return Ok(());
         }
     };
     let hash = hex_hash(&envelope.payload);
     let pair = (envelope.generation, hash.clone());
-    if reports.terminal.contains(&pair) {
+    if reports.has_terminal(pair.0, &pair.1) {
         return Ok(());
     }
     let rejection = validate_envelope(&envelope, &response, node_id, trusted_key, unix_now());
@@ -542,9 +510,17 @@ async fn reconcile_once<T: AgentTransport>(
                 "expected previous hash differs; applying advisory mismatch"
             );
         }
-        let result = core
-            .apply(&envelope.payload, envelope.generation, &hash)
-            .await;
+        let result = if let Some(error_code) = core.is_known_failure(envelope.generation, &hash) {
+            runtime::ApplyOutcome {
+                phase: "failed",
+                error_code,
+                error_message: "desired configuration previously failed and was not retried".into(),
+                state: state.clone(),
+            }
+        } else {
+            core.apply(&envelope.payload, envelope.generation, &hash)
+                .await
+        };
         (
             result.phase,
             result.error_code,
@@ -553,6 +529,9 @@ async fn reconcile_once<T: AgentTransport>(
             cas,
         )
     };
+    if phase == "rejected" && reports.has_report(envelope.generation, &hash, &error_code) {
+        return Ok(());
+    }
     let report = ReportApplyResultRequest {
         agent_id: agent_id.into(),
         node_id: node_id.into(),
@@ -569,25 +548,8 @@ async fn reconcile_once<T: AgentTransport>(
         agent_public_key: public_key.into(),
     };
     let pair = (envelope.generation, hash);
-    let report_key = (
-        envelope.generation,
-        pair.1.clone(),
-        report.error_code.clone(),
-    );
-    if phase == "rejected" {
-        if reports.reported_rejections.contains(&report_key)
-            || reports.pending.contains_key(&report_key)
-        {
-            return Ok(());
-        }
-    } else {
-        reports.terminal.insert(pair);
-    }
-    if client.report_apply(report.clone()).await.is_err() {
-        reports.queue(report, report_key);
-    } else if phase == "rejected" {
-        reports.reported_rejections.insert(report_key);
-    }
+    let confirmed = client.report_apply(report.clone()).await.is_ok();
+    reports.record(&report, &pair.1, confirmed);
     Ok(())
 }
 
@@ -673,34 +635,6 @@ fn validate_release_manifest(
 mod restart_backoff_tests {
     use super::RestartBackoff;
     use std::time::{Duration, Instant};
-
-    #[test]
-    fn pending_report_queue_is_bounded_and_evicts_oldest() {
-        let mut state = super::ReconcileState::default();
-        for generation in 0..65 {
-            let report = cyberboard_agent_protocol::generated::ReportApplyResultRequest {
-                generation: generation.to_string(),
-                applied_hash: format!("hash-{generation}"),
-                phase: "failed".into(),
-                ..Default::default()
-            };
-            state.queue(
-                report,
-                (generation, format!("hash-{generation}"), String::new()),
-            );
-        }
-        assert_eq!(state.pending.len(), 64);
-        assert!(
-            !state
-                .pending
-                .contains_key(&(0, "hash-0".into(), String::new()))
-        );
-        assert!(
-            state
-                .pending
-                .contains_key(&(64, "hash-64".into(), String::new()))
-        );
-    }
 
     #[test]
     fn formats_sing_box_version_for_heartbeat() {
@@ -798,7 +732,7 @@ mod reconciliation_tests {
 
     fn fake_core(dir: &std::path::Path) -> std::path::PathBuf {
         let path = dir.join("fake-core");
-        fs::write(&path, "#!/bin/sh\ncase \"$1\" in\ncheck) exit 0 ;;\nrun) trap ':' HUP; while :; do sleep 0.02; done ;;\nesac\n").unwrap();
+        fs::write(&path, "#!/bin/sh\ncase \"$1\" in\ncheck) echo check >> \"$0.checks\"; grep -q fail_check \"$3\" && exit 1; exit 0 ;;\nrun) trap ':' HUP; while :; do sleep 0.02; done ;;\nesac\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
@@ -998,6 +932,114 @@ mod reconciliation_tests {
             expected_previous_hash: expected_previous_hash.into(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn known_failed_config_is_skipped_after_restart_but_newer_generation_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = uuid::Uuid::from_u128(77);
+        let signing = SigningKey::generate(&mut OsRng);
+        let key = signing.verifying_key();
+        let now = unix_now();
+        let config = dir.path().join("config.json");
+        let binary = fake_core(dir.path());
+        let durable = state::StateStore::load(config.with_extension("state"));
+        let mut core = runtime::CoreSupervisor::new_with_state_store(
+            &binary,
+            &config,
+            Duration::from_millis(20),
+            durable.clone(),
+        )
+        .await;
+        core.initialize().await.unwrap();
+        let first = SignedConfigEnvelope::sign(
+            &signing,
+            "test",
+            node,
+            1,
+            now - 1,
+            now + 300,
+            b"generation-one".to_vec(),
+        );
+        assert_eq!(
+            core.apply(&first.payload, 1, &first.content_hash)
+                .await
+                .phase,
+            "applied"
+        );
+        let failed = SignedConfigEnvelope::sign(
+            &signing,
+            "test",
+            node,
+            2,
+            now - 1,
+            now + 300,
+            b"fail_check_generation_two".to_vec(),
+        );
+        let mut transport = FakeTransport {
+            desired: desired_response(&failed, ""),
+            heartbeats: Vec::new(),
+            reports: Vec::new(),
+            fail_first_report: false,
+        };
+        let node_id = node.to_string();
+        let context = ReconcileContext {
+            node_id: &node_id,
+            agent_id: "agent",
+            public_key: "pub",
+            core_versions: &[],
+            trusted_key: Some(&key),
+        };
+        let mut reports = ReconcileState::new(durable);
+        reconcile_once(&mut transport, &mut core, &context, &mut reports)
+            .await
+            .unwrap();
+        assert_eq!(transport.reports.last().unwrap().phase, "failed");
+        let checks = std::path::PathBuf::from(format!("{}.checks", binary.display()));
+        let count_after_failure = fs::read_to_string(&checks).unwrap().lines().count();
+        core.shutdown().await;
+
+        let durable = state::StateStore::load(config.with_extension("state"));
+        let mut restarted = runtime::CoreSupervisor::new_with_state_store(
+            &binary,
+            &config,
+            Duration::from_millis(20),
+            durable.clone(),
+        )
+        .await;
+        restarted.initialize().await.unwrap();
+        let mut reports = ReconcileState::new(durable);
+        transport.reports.clear();
+        transport.desired = desired_response(&failed, "");
+        reconcile_once(&mut transport, &mut restarted, &context, &mut reports)
+            .await
+            .unwrap();
+        assert!(transport.reports.is_empty());
+        assert_eq!(
+            fs::read_to_string(&checks).unwrap().lines().count(),
+            count_after_failure
+        );
+
+        let newer = SignedConfigEnvelope::sign(
+            &signing,
+            "test",
+            node,
+            3,
+            now - 1,
+            now + 300,
+            b"generation-three".to_vec(),
+        );
+        transport.desired = desired_response(&newer, "");
+        reconcile_once(&mut transport, &mut restarted, &context, &mut reports)
+            .await
+            .unwrap();
+        assert_eq!(transport.reports.last().unwrap().phase, "applied");
+        assert_eq!(
+            fs::read_to_string(&checks).unwrap().lines().count(),
+            count_after_failure + 1
+        );
+        assert_eq!(restarted.state().generation, 3);
+        restarted.shutdown().await;
     }
 
     #[tokio::test]
@@ -1281,7 +1323,7 @@ mod reconciliation_tests {
         assert_eq!(transport.heartbeats[1].current_config_revision, "1");
         assert_eq!(transport.reports.len(), 2);
         assert_eq!(transport.reports[1].retry_count, 0);
-        assert!(state.pending.is_empty());
+        assert!(state.pending().is_empty());
         core.shutdown().await;
     }
 }

@@ -26,6 +26,7 @@ use cyberboard_database::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sqlx::Row;
 use tokio::net::TcpListener;
 use tracing::info;
 use uuid::Uuid;
@@ -314,6 +315,36 @@ struct PaginationQuery {
     status: Option<String>,
     #[serde(rename = "nodeId")]
     node_id: Option<Uuid>,
+}
+
+#[derive(Deserialize, Default)]
+struct UsageQuery {
+    user_id: Option<Uuid>,
+    node_id: Option<Uuid>,
+    start_time: Option<String>,
+    end_time: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    page: Option<i64>,
+    #[serde(rename = "pageSize")]
+    page_size: Option<i64>,
+}
+
+impl UsageQuery {
+    fn bounded_limit(&self) -> i64 {
+        self.page_size.or(self.limit).unwrap_or(50).clamp(1, 100)
+    }
+
+    fn bounded_offset(&self) -> i64 {
+        self.offset
+            .unwrap_or_else(|| {
+                self.page
+                    .unwrap_or(1)
+                    .saturating_sub(1)
+                    .saturating_mul(self.bounded_limit())
+            })
+            .max(0)
+    }
 }
 
 impl PaginationQuery {
@@ -2322,6 +2353,77 @@ async fn revoke_me_device(
     }
 }
 
+async fn admin_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<UsageQuery>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return service_unavailable_response();
+    };
+    let limit = query.bounded_limit();
+    let offset = query.bounded_offset();
+    let rows = match sqlx::query(
+        "WITH grouped AS (
+             SELECT e.user_id,e.node_id,u.email AS username,
+                    min(e.window_start)::text AS period_start,
+                    max(e.window_end)::text AS period_end,
+                    sum(e.download_bytes)::bigint AS download_bytes,
+                    sum(e.upload_bytes)::bigint AS upload_bytes,
+                    sum(e.download_bytes+e.upload_bytes)::bigint AS total_bytes,
+                    count(*)::bigint AS event_count
+             FROM usage_events e
+             JOIN users u ON u.tenant_id=e.tenant_id AND u.id=e.user_id
+             WHERE e.tenant_id=$1 AND e.user_id IS NOT NULL
+               AND ($2::uuid IS NULL OR e.user_id=$2)
+               AND ($3::uuid IS NULL OR e.node_id=$3)
+               AND ($4::text IS NULL OR e.window_start >= $4::text::timestamptz)
+               AND ($5::text IS NULL OR e.window_start < $5::text::timestamptz)
+             GROUP BY e.user_id,e.node_id,u.email
+         )
+         SELECT user_id,node_id,username,period_start,period_end,
+                download_bytes,upload_bytes,total_bytes,event_count,count(*) OVER() AS total
+         FROM grouped ORDER BY period_start DESC,user_id,node_id LIMIT $6 OFFSET $7",
+    )
+    .bind(state.config.tenant_id)
+    .bind(query.user_id)
+    .bind(query.node_id)
+    .bind(query.start_time.as_deref())
+    .bind(query.end_time.as_deref())
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(database.pool())
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return internal_database_response(),
+    };
+    let total = rows
+        .first()
+        .map(|row| row.get::<i64, _>("total"))
+        .unwrap_or(0);
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "userId": row.get::<Uuid, _>("user_id"),
+                "username": row.get::<String, _>("username"),
+                "nodeId": row.try_get::<Option<Uuid>, _>("node_id").ok().flatten(),
+                "totalBytes": row.get::<i64, _>("total_bytes"),
+                "downloadBytes": row.get::<i64, _>("download_bytes"),
+                "uploadBytes": row.get::<i64, _>("upload_bytes"),
+                "periodStart": row.get::<String, _>("period_start"),
+                "periodEnd": row.get::<String, _>("period_end"),
+                "eventCount": row.get::<i64, _>("event_count"),
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({"items":items,"total":total,"page":offset / limit + 1,"pageSize":limit,"limit":limit,"offset":offset})).into_response()
+}
+
 async fn me_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2334,7 +2436,37 @@ async fn me_usage(
         return Json(json!({"usedBytes": 0, "quotaBytes": 0, "todayBytes": 0, "projectedBytes": 0, "periodStart": "", "periodEnd": "", "daily": []})).into_response();
     };
     let user_id = identity.user_id;
-    match database.usage_summary(state.config.tenant_id, user_id).await { Ok(usage) => Json(json!({"usedBytes":usage.used_bytes,"quotaBytes":0,"todayBytes":0,"projectedBytes":usage.used_bytes,"periodStart":usage.period_start.unwrap_or_default(),"periodEnd":usage.period_end.unwrap_or_default(),"daily":[]})).into_response(), Err(_) => internal_database_response() }
+    let usage = match database
+        .usage_summary(state.config.tenant_id, user_id)
+        .await
+    {
+        Ok(usage) => usage,
+        Err(_) => return internal_database_response(),
+    };
+    let daily = match sqlx::query(
+        "SELECT date_trunc('day',bucket_start)::date::text AS day,
+                sum(upload_bytes+download_bytes)::bigint AS bytes
+         FROM usage_buckets WHERE tenant_id=$1 AND user_id=$2
+           AND bucket_start >= now() - interval '30 days'
+         GROUP BY date_trunc('day',bucket_start) ORDER BY day DESC",
+    )
+    .bind(state.config.tenant_id)
+    .bind(user_id)
+    .fetch_all(database.pool())
+    .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| {
+                json!({
+                    "date": row.get::<String, _>("day"),
+                    "bytes": row.get::<i64, _>("bytes"),
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(_) => return internal_database_response(),
+    };
+    Json(json!({"usedBytes":usage.used_bytes,"quotaBytes":0,"todayBytes":usage.today_bytes,"projectedBytes":usage.used_bytes,"periodStart":usage.period_start.unwrap_or_default(),"periodEnd":usage.period_end.unwrap_or_default(),"daily":daily})).into_response()
 }
 
 fn uuid_value_matches(value: &Value, expected: Uuid) -> bool {
@@ -3009,7 +3141,8 @@ async fn openapi() -> Json<Value> {
             "/api/v1/me/sessions": { "get": { "operationId":"listMySessions", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"User session metadata","content":{"application/json":{"schema":{"$ref":"#/components/schemas/SessionList"}}}},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} } },
             "/api/v1/me/sessions/{sessionId}": { "delete": { "operationId":"revokeMySession", "security":[{"portalBearerAuth":[]}], "parameters":[{"name":"sessionId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}], "responses":{"204":{"description":"Session revoked"},"401":{"description":"Invalid portal token"},"404":{"description":"Session not found or already revoked"},"503":{"description":"Database unavailable"}} } },
             "/api/v1/me/password": { "patch": { "operationId":"changeMyPassword", "security":[{"portalBearerAuth":[]}], "requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ChangePasswordRequest"}}}}, "responses":{"204":{"description":"Password changed"},"400":{"description":"Invalid password"},"401":{"description":"Current password is invalid"},"503":{"description":"Database unavailable"}} } },
-            "/api/v1/me/usage": { "get": { "operationId":"getMyUsage", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped usage"},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} } },
+            "/api/v1/me/usage": { "get": { "operationId":"getMyUsage", "security":[{"portalBearerAuth":[]}], "responses":{"200":{"description":"Tenant/user scoped totals and 30-day daily usage series"},"401":{"description":"Invalid portal token"},"500":{"description":"Database error"}} } },
+            "/api/v1/admin/usage": { "get": { "operationId":"listAdminUsage", "security":[{"bearerAuth":[]}], "parameters":[{"name":"user_id","in":"query","schema":{"type":"string","format":"uuid"}},{"name":"node_id","in":"query","schema":{"type":"string","format":"uuid"}},{"name":"start_time","in":"query","schema":{"type":"string","format":"date-time"}},{"name":"end_time","in":"query","schema":{"type":"string","format":"date-time"}},{"name":"page","in":"query","schema":{"type":"integer","minimum":1}},{"name":"pageSize","in":"query","schema":{"type":"integer","minimum":1,"maximum":100}},{"name":"limit","in":"query","schema":{"type":"integer","minimum":1,"maximum":100}},{"name":"offset","in":"query","schema":{"type":"integer","minimum":0}}], "responses":{"200":{"description":"Tenant-scoped user/node usage aggregates"},"401":{"description":"Invalid token"},"500":{"description":"Database error"},"503":{"description":"Database unavailable"}} } },
             "/subscribe/{token}": {
                 "get": { "operationId": "getSubscriptionConfig", "parameters": [{"name":"token","in":"path","required":true,"schema":{"type":"string"}}], "responses": { "200": { "description": "Sing-box compatible JSON configuration" }, "404": { "description": "Subscription missing or expired" }, "503": { "description": "Database unavailable" } } }
             },
@@ -3257,6 +3390,7 @@ fn router(state: AppState) -> Router {
 
     let admin = Router::new()
         .route("/api/v1/admin/dashboard", get(admin_dashboard))
+        .route("/api/v1/admin/usage", get(admin_usage))
         .route(
             "/api/v1/admin/nodes",
             get(admin_nodes).post(create_admin_node),
@@ -3430,7 +3564,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEMO_ACCESS_TOKEN, DEMO_GENERATED_AT, DEMO_PORTAL_ACCESS_TOKEN,
+        DEMO_ACCESS_TOKEN, DEMO_GENERATED_AT, DEMO_PORTAL_ACCESS_TOKEN, UsageQuery,
         applied_subscription_outbound, create_order_error_response, router,
     };
     use axum::{
@@ -3441,6 +3575,26 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt;
     use uuid::Uuid;
+
+    #[test]
+    fn usage_query_bounds_page_size_and_offset() {
+        let defaults = UsageQuery::default();
+        assert_eq!(defaults.bounded_limit(), 50);
+        assert_eq!(defaults.bounded_offset(), 0);
+        let bounded = UsageQuery {
+            limit: Some(999),
+            offset: Some(-4),
+            ..UsageQuery::default()
+        };
+        assert_eq!(bounded.bounded_limit(), 100);
+        assert_eq!(bounded.bounded_offset(), 0);
+        let page = UsageQuery {
+            page: Some(3),
+            page_size: Some(25),
+            ..UsageQuery::default()
+        };
+        assert_eq!(page.bounded_offset(), 50);
+    }
 
     #[tokio::test]
     async fn config_actions_report_signer_before_database_unavailability() {

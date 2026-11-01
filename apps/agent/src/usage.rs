@@ -641,4 +641,36 @@ mod tests {
         assert!(queue.front().is_none());
         assert!(dead_letters.contains(&batch.batch_id));
     }
+    #[test]
+    fn dead_letters_persist_with_private_permissions() {
+        let dir = tempdir().unwrap();
+        let queue_path = dir.path().join("usage-queue.json");
+        let mut store = DeadLetterStore::open(&queue_path).unwrap();
+        store
+            .append(
+                UsageBatch {
+                    batch_id: "dead".into(),
+                    sequence: 1,
+                    window_start: 1,
+                    window_end: 2,
+                    payload: snapshot(1),
+                },
+                "InvalidArgument",
+                "bad payload",
+            )
+            .unwrap();
+        assert!(DeadLetterStore::open(&queue_path).unwrap().contains("dead"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(queue_path.with_extension("dead-letter.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
 }

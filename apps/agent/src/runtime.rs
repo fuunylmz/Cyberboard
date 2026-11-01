@@ -39,6 +39,7 @@ pub struct CoreSupervisor {
     state: AppliedState,
     durable: StateStore,
     core_state: &'static str,
+    sync_parent_directory: fn(&Path) -> io::Result<()>,
 }
 
 impl CoreSupervisor {
@@ -67,6 +68,7 @@ impl CoreSupervisor {
             state: AppliedState::default(),
             durable,
             core_state: "not_configured",
+            sync_parent_directory,
         }
     }
 
@@ -123,6 +125,11 @@ impl CoreSupervisor {
             self.durable.set_current(self.state.clone(), None, None);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_directory_sync_for_test(&mut self, sync: fn(&Path) -> io::Result<()>) {
+        self.sync_parent_directory = sync;
     }
 
     pub fn is_known_failure(&self, generation: u64, content_hash: &str) -> Option<String> {
@@ -229,9 +236,32 @@ impl CoreSupervisor {
             return fail("core_check_failed", "core config check failed", old_state);
         }
         let previous = self.previous_path();
-        if self.state.generation > 0 && self.config.exists() {
+        let had_old_config = self.state.generation > 0 && self.config.exists();
+        let old_previous_backup = if had_old_config && previous.exists() {
+            let snapshot = unique_sibling(&previous, "backup-snapshot");
+            if let Err(error) = copy_private_sync(&previous, &snapshot) {
+                let _ = fs::remove_file(&temp);
+                return fail("install_failed", &error.to_string(), old_state);
+            }
+            Some(snapshot)
+        } else {
+            None
+        };
+        if had_old_config {
             if let Err(error) = copy_private_sync(&self.config, &previous) {
                 let _ = fs::remove_file(&temp);
+                if let Err(restore_error) =
+                    restore_previous_backup(&previous, old_previous_backup.as_deref())
+                {
+                    warn!(%error, %restore_error, path = %previous.display(), "could not restore previous backup after staging failure");
+                    return fail(
+                        "install_rollback_failed",
+                        &format!(
+                            "backup staging failed: {error}; backup restoration failed: {restore_error}"
+                        ),
+                        old_state,
+                    );
+                }
                 return fail("install_failed", &error.to_string(), old_state);
             }
         } else if previous.exists() {
@@ -242,11 +272,48 @@ impl CoreSupervisor {
         }
         if let Err(error) = fs::rename(&temp, &self.config) {
             let _ = fs::remove_file(&temp);
+            if let Err(restore_error) =
+                restore_previous_backup(&previous, old_previous_backup.as_deref())
+            {
+                warn!(%error, %restore_error, path = %previous.display(), "could not restore previous backup after config rename failure");
+                return fail(
+                    "install_rollback_failed",
+                    &format!(
+                        "config rename failed: {error}; backup restoration failed: {restore_error}"
+                    ),
+                    old_state,
+                );
+            }
             return fail("install_failed", &error.to_string(), old_state);
         }
         if let Some(parent) = self.config.parent() {
-            if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
-                return fail("install_failed", &error.to_string(), old_state);
+            if let Err(error) = (self.sync_parent_directory)(parent) {
+                match restore_after_failed_install(
+                    &self.config,
+                    &previous,
+                    had_old_config,
+                    old_previous_backup.as_deref(),
+                ) {
+                    Ok(()) => {
+                        warn!(%error, config = %self.config.display(), "config directory sync failed; old config and rollback backup restored");
+                        return fail("install_failed", &error.to_string(), old_state);
+                    }
+                    Err(restore_error) => {
+                        warn!(%error, %restore_error, config = %self.config.display(), "config directory sync failed and rollback restoration was incomplete");
+                        return fail(
+                            "install_rollback_failed",
+                            &format!(
+                                "directory sync failed: {error}; rollback restoration failed: {restore_error}"
+                            ),
+                            old_state,
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(snapshot) = old_previous_backup.as_ref() {
+            if let Err(error) = fs::remove_file(snapshot) {
+                warn!(%error, path = %snapshot.display(), "could not remove previous backup snapshot after install");
             }
         }
         if self.child.is_some() {
@@ -445,6 +512,68 @@ fn file_hash(path: &Path) -> io::Result<String> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect())
+}
+
+fn restore_previous_backup(previous: &Path, snapshot: Option<&Path>) -> io::Result<()> {
+    if let Some(snapshot) = snapshot {
+        fs::rename(snapshot, previous)?;
+    } else if previous.exists() {
+        fs::remove_file(previous)?;
+    }
+    if let Some(parent) = previous.parent() {
+        sync_parent_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn restore_after_failed_install(
+    config: &Path,
+    previous: &Path,
+    had_old_config: bool,
+    old_previous_backup: Option<&Path>,
+) -> io::Result<()> {
+    let mut errors = Vec::new();
+    if had_old_config {
+        let restore_tmp = unique_sibling(config, "restore");
+        match copy_private_sync(previous, &restore_tmp)
+            .and_then(|()| fs::rename(&restore_tmp, config))
+        {
+            Ok(()) => {}
+            Err(error) => {
+                let _ = fs::remove_file(&restore_tmp);
+                errors.push(format!("active config restore: {error}"));
+            }
+        }
+    } else if config.exists() {
+        if let Err(error) = fs::remove_file(config) {
+            errors.push(format!("new config cleanup: {error}"));
+        }
+    }
+
+    if let Some(snapshot) = old_previous_backup {
+        if let Err(error) = fs::rename(snapshot, previous) {
+            errors.push(format!("previous backup restore: {error}"));
+        }
+    } else if previous.exists() {
+        if let Err(error) = fs::remove_file(previous) {
+            errors.push(format!("new previous backup cleanup: {error}"));
+        }
+    }
+
+    if let Some(parent) = config.parent() {
+        if let Err(error) = sync_parent_directory(parent) {
+            errors.push(format!("restored directory sync: {error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(errors.join("; ")))
+    }
+}
+
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
 }
 
 fn ensure_parent(path: &Path) -> io::Result<()> {
@@ -724,6 +853,102 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    fn fail_directory_sync(_: &std::path::Path) -> std::io::Result<()> {
+        Err(std::io::Error::other("injected directory sync failure"))
+    }
+
+    #[tokio::test]
+    async fn directory_sync_failure_restores_config_backup_and_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("sing-box.json");
+        let mut supervisor =
+            CoreSupervisor::new(fake_core(dir.path()), &config, Duration::from_millis(20)).await;
+        supervisor.initialize().await.unwrap();
+        let first = b"{\"generation\":1}";
+        let second = b"{\"generation\":2}";
+        let third = b"{\"generation\":3}";
+        assert_eq!(
+            supervisor.apply(first, 1, &hash(first)).await.phase,
+            "applied"
+        );
+        assert_eq!(
+            supervisor.apply(second, 2, &hash(second)).await.phase,
+            "applied"
+        );
+        let previous = supervisor.previous_path();
+        assert_eq!(fs::read(&previous).unwrap(), first);
+        let persisted_before = supervisor.durable.snapshot();
+        assert_eq!(persisted_before.current.generation, 2);
+        assert_eq!(
+            persisted_before
+                .previous_successful
+                .as_ref()
+                .unwrap()
+                .generation,
+            1
+        );
+        let hup = config.with_extension("json.hup");
+        wait_for(&hup).await;
+        let hup_count = fs::read_to_string(&hup).unwrap().lines().count();
+
+        supervisor.set_directory_sync_for_test(fail_directory_sync);
+        let outcome = supervisor.apply(third, 3, &hash(third)).await;
+        assert_eq!(outcome.phase, "failed");
+        assert_eq!(outcome.error_code, "install_failed");
+        assert!(
+            outcome
+                .error_message
+                .contains("injected directory sync failure")
+        );
+        assert_eq!(fs::read(&config).unwrap(), second);
+        assert_eq!(fs::read(&previous).unwrap(), first);
+        assert_eq!(fs::read_to_string(&hup).unwrap().lines().count(), hup_count);
+        assert_eq!(supervisor.state().generation, 2);
+        let persisted_after = supervisor.durable.snapshot();
+        assert_eq!(persisted_after.current.generation, 2);
+        assert_eq!(persisted_after.current.content_hash, hash(second));
+        assert_eq!(
+            persisted_after
+                .previous_successful
+                .as_ref()
+                .unwrap()
+                .generation,
+            1
+        );
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn first_generation_directory_sync_failure_removes_new_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("sing-box.json");
+        let mut supervisor =
+            CoreSupervisor::new(fake_core(dir.path()), &config, Duration::from_millis(20)).await;
+        supervisor.initialize().await.unwrap();
+        let previous = supervisor.previous_path();
+        fs::write(&previous, b"stale backup").unwrap();
+        supervisor.set_directory_sync_for_test(fail_directory_sync);
+
+        let payload = b"{\"generation\":1}";
+        let outcome = supervisor.apply(payload, 1, &hash(payload)).await;
+        assert_eq!(outcome.phase, "failed");
+        assert_eq!(outcome.error_code, "install_failed");
+        assert!(
+            outcome
+                .error_message
+                .contains("injected directory sync failure")
+        );
+        assert!(!config.exists());
+        assert!(!previous.exists());
+        assert_eq!(supervisor.state(), &AppliedState::default());
+        assert_eq!(supervisor.core_state(), "not_configured");
+        let persisted = supervisor.durable.snapshot();
+        assert_eq!(persisted.current, AppliedState::default());
+        assert!(persisted.previous_successful_config.is_none());
+        assert!(persisted.previous_successful.is_none());
+        supervisor.shutdown().await;
     }
 
     #[tokio::test]

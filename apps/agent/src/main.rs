@@ -504,15 +504,17 @@ async fn reconcile_once<T: AgentTransport>(
         )
     } else if envelope.generation == state.generation {
         return Ok(());
+    } else if response.expected_previous_hash != state.content_hash
+        && (state.generation != 0 || !state.content_hash.is_empty())
+    {
+        (
+            "rejected",
+            "previous_hash_mismatch".into(),
+            "expected previous hash differs from local applied state".into(),
+            state.content_hash.clone(),
+            false,
+        )
     } else {
-        let cas = response.expected_previous_hash.is_empty()
-            || response.expected_previous_hash == state.content_hash;
-        if !cas {
-            warn!(
-                generation = envelope.generation,
-                "expected previous hash differs; applying advisory mismatch"
-            );
-        }
         let result = if let Some(error_code) = core.is_known_failure(envelope.generation, &hash) {
             runtime::ApplyOutcome {
                 phase: "failed",
@@ -529,7 +531,7 @@ async fn reconcile_once<T: AgentTransport>(
             result.error_code,
             result.error_message,
             result.state.content_hash,
-            cas,
+            response.expected_previous_hash == state.content_hash,
         )
     };
     if phase == "rejected" && reports.has_report(envelope.generation, &hash, &error_code) {
@@ -980,7 +982,7 @@ mod reconciliation_tests {
             b"fail_check_generation_two".to_vec(),
         );
         let mut transport = FakeTransport {
-            desired: desired_response(&failed, ""),
+            desired: desired_response(&failed, &first.content_hash),
             heartbeats: Vec::new(),
             reports: Vec::new(),
             fail_first_report: false,
@@ -1013,7 +1015,7 @@ mod reconciliation_tests {
         restarted.initialize().await.unwrap();
         let mut reports = ReconcileState::new(durable);
         transport.reports.clear();
-        transport.desired = desired_response(&failed, "");
+        transport.desired = desired_response(&failed, &first.content_hash);
         reconcile_once(&mut transport, &mut restarted, &context, &mut reports)
             .await
             .unwrap();
@@ -1032,7 +1034,7 @@ mod reconciliation_tests {
             now + 300,
             b"generation-three".to_vec(),
         );
-        transport.desired = desired_response(&newer, "");
+        transport.desired = desired_response(&newer, &first.content_hash);
         reconcile_once(&mut transport, &mut restarted, &context, &mut reports)
             .await
             .unwrap();
@@ -1152,12 +1154,30 @@ mod reconciliation_tests {
             now + 300,
             second_payload.clone(),
         );
-        transport.desired = desired_response(&second, "some-other-previous-hash");
+        transport.desired = desired_response(&second, "");
+        reconcile_once(&mut transport, &mut core, &context, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            transport.reports.last().unwrap().error_code,
+            "previous_hash_mismatch"
+        );
+        assert_eq!(transport.reports.last().unwrap().phase, "rejected");
+        assert!(!transport.reports.last().unwrap().compare_and_swap_ok);
+        assert_eq!(core.state().generation, 1);
+        let rejected_report_count = transport.reports.len();
+        reconcile_once(&mut transport, &mut core, &context, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(transport.reports.len(), rejected_report_count);
+
+        transport.desired = desired_response(&second, &core.state().content_hash);
         reconcile_once(&mut transport, &mut core, &context, &mut state)
             .await
             .unwrap();
         assert_eq!(transport.reports.last().unwrap().phase, "applied");
-        assert!(!transport.reports.last().unwrap().compare_and_swap_ok);
+        assert!(transport.reports.last().unwrap().compare_and_swap_ok);
+        assert_eq!(core.state().generation, 2);
 
         let third_payload = b"generation-three".to_vec();
         let mut invalid = SignedConfigEnvelope::sign(
@@ -1211,13 +1231,55 @@ mod reconciliation_tests {
             now + 300,
             third_payload.clone(),
         );
-        transport.desired = desired_response(&corrected, "");
+        transport.desired = desired_response(&corrected, &core.state().content_hash);
         reconcile_once(&mut transport, &mut core, &context, &mut state)
             .await
             .unwrap();
         assert_eq!(transport.reports.len(), report_count + 2);
         assert_eq!(transport.reports.last().unwrap().phase, "applied");
         assert_eq!(core.state().generation, 3);
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn signed_desired_snapshot_recovers_empty_local_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = uuid::Uuid::from_u128(56);
+        let signing = SigningKey::generate(&mut OsRng);
+        let key = signing.verifying_key();
+        let now = unix_now();
+        let payload = b"full-resync-generation-four".to_vec();
+        let envelope =
+            SignedConfigEnvelope::sign(&signing, "test", node, 4, now - 1, now + 300, payload);
+        let mut transport = FakeTransport {
+            desired: desired_response(&envelope, "previously-applied-hash"),
+            heartbeats: Vec::new(),
+            reports: Vec::new(),
+            fail_first_report: false,
+        };
+        let mut core = runtime::CoreSupervisor::new(
+            fake_core(dir.path()),
+            dir.path().join("config.json"),
+            Duration::from_millis(20),
+        )
+        .await;
+        core.initialize().await.unwrap();
+        let node_id = node.to_string();
+        let context = ReconcileContext {
+            node_id: &node_id,
+            agent_id: "agent",
+            public_key: "pub",
+            core_versions: &[],
+            trusted_key: Some(&key),
+        };
+        let mut reports = ReconcileState::default();
+        reconcile_once(&mut transport, &mut core, &context, &mut reports)
+            .await
+            .unwrap();
+        assert_eq!(core.state().generation, 4);
+        assert_eq!(core.state().content_hash, envelope.content_hash);
+        assert_eq!(transport.reports.last().unwrap().phase, "applied");
+        assert!(!transport.reports.last().unwrap().compare_and_swap_ok);
         core.shutdown().await;
     }
 

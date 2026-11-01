@@ -2611,7 +2611,7 @@ impl Database {
         let result = sqlx::query("UPDATE config_deployments d SET status=$5,error_code=NULLIF($6,''),error_message=NULLIF($7,''),previous_hash=NULLIF($8,''),applied_hash=NULLIF($9,''),retry_count=$10,reported_at=now(),updated_at=now(),applied_generation=CASE WHEN $5='applied' THEN $4 ELSE d.applied_generation END FROM config_revisions r JOIN nodes n ON n.tenant_id=r.tenant_id AND n.id=r.node_id WHERE d.tenant_id=$1 AND d.node_id=$2 AND n.agent_id=$3 AND r.id=d.config_revision_id AND r.generation=$4 AND d.id=(SELECT d2.id FROM config_deployments d2 WHERE d2.tenant_id=d.tenant_id AND d2.node_id=d.node_id AND d2.config_revision_id=d.config_revision_id ORDER BY d2.created_at DESC,d2.id DESC LIMIT 1)")
             .bind(input.tenant_id).bind(input.node_id).bind(input.agent_id).bind(input.generation).bind(status).bind(input.error_code).bind(message).bind(input.previous_hash).bind(input.applied_hash).bind(input.retry_count).execute(&mut *tx).await?;
         if result.rows_affected() == 1 && status == "applied" {
-            sqlx::query("UPDATE nodes SET applied_config_revision=r.id,applied_generation=$3,applied_at=now(),updated_at=now() FROM config_revisions r WHERE nodes.tenant_id=$1 AND nodes.id=$2 AND r.tenant_id=$1 AND r.node_id=$2 AND r.generation=$3")
+            sqlx::query("UPDATE nodes SET applied_config_revision=r.id,applied_generation=$3,applied_at=now(),updated_at=now() FROM config_revisions r WHERE nodes.tenant_id=$1 AND nodes.id=$2 AND r.tenant_id=$1 AND r.node_id=$2 AND r.generation=$3 AND (nodes.applied_generation IS NULL OR nodes.applied_generation <= r.generation)")
                 .bind(input.tenant_id).bind(input.node_id).bind(input.generation).execute(&mut *tx).await?;
         }
         tx.commit().await?;

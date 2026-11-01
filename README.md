@@ -61,7 +61,7 @@ mode; database mode always authenticates persisted users and issues persisted
 server-side sessions.
 
 When `CYBERBOARD_DATABASE_URL` is set, API startup connects to PostgreSQL,
-executes the embedded migrations `0001` through the current `0013` release, and ensures the
+executes the embedded migrations `0001` through the current `0015` release, and ensures the
 configured tenant exists. A failed connection or migration stops startup. Migrations are
 serialized with a transaction-scoped advisory lock.
 Without a URL, `/readyz` reports `memory_mode`; it does not claim database

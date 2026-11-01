@@ -2,7 +2,8 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
+    time::{Duration, Instant},
 };
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier, password_hash::PasswordHasher};
@@ -51,6 +52,154 @@ struct AppState {
     database: Option<Arc<Database>>,
     config_signer: Option<Arc<signing::ConfigSigner>>,
     portal_sessions: Arc<RwLock<HashMap<String, PortalIdentity>>>,
+    subscription_limiter: Arc<SubscriptionLimiter>,
+}
+
+const SUBSCRIPTION_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+// Per 60-second window, this process allows 10 requests per token and 600 total.
+// Token state is capped at 10,000 keys; overflow keys share one bucket.
+const SUBSCRIPTION_LIMIT_REQUESTS_PER_TOKEN: u32 = 10;
+const SUBSCRIPTION_LIMIT_REQUESTS_GLOBAL: u32 = 600;
+const SUBSCRIPTION_LIMIT_KEYS: usize = 10_000;
+const SUBSCRIPTION_OVERFLOW_KEY: &str = "!saturated!";
+
+// Multi-instance deployments need a shared limiter backend for global enforcement.
+struct SubscriptionLimiter {
+    buckets: Mutex<HashMap<String, SubscriptionBucket>>,
+    global_requests: Mutex<Option<SubscriptionBucket>>,
+    limited_audit_window_started: Mutex<Option<Instant>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SubscriptionLimitDecision {
+    allowed: bool,
+    should_audit_limited: bool,
+}
+
+struct SubscriptionBucket {
+    window_started: Instant,
+    requests: u32,
+}
+
+impl SubscriptionLimiter {
+    fn new() -> Self {
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+            global_requests: Mutex::new(None),
+            limited_audit_window_started: Mutex::new(None),
+        }
+    }
+
+    fn allow_global(&self, now: Instant) -> bool {
+        let Ok(mut global) = self.global_requests.lock() else {
+            return false;
+        };
+        let bucket = global.get_or_insert(SubscriptionBucket {
+            window_started: now,
+            requests: 0,
+        });
+        if now.duration_since(bucket.window_started) >= SUBSCRIPTION_LIMIT_WINDOW {
+            bucket.window_started = now;
+            bucket.requests = 0;
+        }
+        if bucket.requests >= SUBSCRIPTION_LIMIT_REQUESTS_GLOBAL {
+            return false;
+        }
+        bucket.requests += 1;
+        true
+    }
+
+    fn limited_audit_permit(&self, now: Instant) -> bool {
+        let Ok(mut window_started) = self.limited_audit_window_started.lock() else {
+            return false;
+        };
+        match *window_started {
+            Some(started) if now.duration_since(started) < SUBSCRIPTION_LIMIT_WINDOW => false,
+            _ => {
+                *window_started = Some(now);
+                true
+            }
+        }
+    }
+
+    fn allow(&self, token_hash: &str, now: Instant) -> SubscriptionLimitDecision {
+        if !self.allow_global(now) {
+            return SubscriptionLimitDecision {
+                allowed: false,
+                should_audit_limited: self.limited_audit_permit(now),
+            };
+        }
+        let Ok(mut buckets) = self.buckets.lock() else {
+            return SubscriptionLimitDecision {
+                allowed: false,
+                should_audit_limited: self.limited_audit_permit(now),
+            };
+        };
+        if let Some(bucket) = buckets.get_mut(token_hash) {
+            if now.duration_since(bucket.window_started) >= SUBSCRIPTION_LIMIT_WINDOW {
+                bucket.window_started = now;
+                bucket.requests = 0;
+            }
+            if bucket.requests >= SUBSCRIPTION_LIMIT_REQUESTS_PER_TOKEN {
+                return SubscriptionLimitDecision {
+                    allowed: false,
+                    should_audit_limited: self.limited_audit_permit(now),
+                };
+            }
+            bucket.requests += 1;
+            return SubscriptionLimitDecision {
+                allowed: true,
+                should_audit_limited: false,
+            };
+        }
+
+        buckets.retain(|_, bucket| {
+            now.duration_since(bucket.window_started) < SUBSCRIPTION_LIMIT_WINDOW
+        });
+        if buckets.len() >= SUBSCRIPTION_LIMIT_KEYS {
+            if !buckets.contains_key(SUBSCRIPTION_OVERFLOW_KEY) {
+                if let Some(oldest_key) = buckets
+                    .iter()
+                    .min_by_key(|(_, bucket)| bucket.window_started)
+                    .map(|(key, _)| key.clone())
+                {
+                    buckets.remove(&oldest_key);
+                }
+            }
+            let overflow = buckets
+                .entry(SUBSCRIPTION_OVERFLOW_KEY.to_owned())
+                .or_insert(SubscriptionBucket {
+                    window_started: now,
+                    requests: 0,
+                });
+            if now.duration_since(overflow.window_started) >= SUBSCRIPTION_LIMIT_WINDOW {
+                overflow.window_started = now;
+                overflow.requests = 0;
+            }
+            if overflow.requests >= SUBSCRIPTION_LIMIT_REQUESTS_PER_TOKEN {
+                return SubscriptionLimitDecision {
+                    allowed: false,
+                    should_audit_limited: self.limited_audit_permit(now),
+                };
+            }
+            overflow.requests += 1;
+            return SubscriptionLimitDecision {
+                allowed: true,
+                should_audit_limited: false,
+            };
+        }
+        buckets.insert(
+            token_hash.to_owned(),
+            SubscriptionBucket {
+                window_started: now,
+                requests: 1,
+            },
+        );
+        SubscriptionLimitDecision {
+            allowed: true,
+            should_audit_limited: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -162,6 +311,7 @@ impl AppState {
             database: None,
             config_signer: None,
             portal_sessions: Arc::new(RwLock::new(HashMap::new())),
+            subscription_limiter: Arc::new(SubscriptionLimiter::new()),
         }
     }
 
@@ -185,6 +335,7 @@ impl AppState {
             database: None,
             config_signer: None,
             portal_sessions: Arc::new(RwLock::new(HashMap::new())),
+            subscription_limiter: Arc::new(SubscriptionLimiter::new()),
         }
     }
 
@@ -2585,9 +2736,76 @@ fn applied_subscription_outbound(
     None
 }
 
+fn parse_subscription_token(token: &str) -> Option<String> {
+    let token_body = token.strip_prefix("cb_")?;
+    if !matches!(token_body.len(), 32 | 64)
+        || !token_body.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(hex_hash(token.as_bytes()))
+}
+
+async fn audit_subscription_access(
+    database: &Database,
+    tenant_id: Uuid,
+    token_hash: &str,
+    outcome: &'static str,
+) {
+    let _ = sqlx::query(
+        "INSERT INTO audit_logs(tenant_id,action,resource_type,details)
+         VALUES($1,$2,'subscription_token',jsonb_build_object('tokenHash',$3,'outcome',$4))",
+    )
+    .bind(tenant_id)
+    .bind(format!("subscription.access.{outcome}"))
+    .bind(token_hash)
+    .bind(outcome)
+    .execute(database.pool())
+    .await;
+}
+
+fn secure_subscription_response(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
 async fn public_subscription(State(state): State<AppState>, Path(token): Path<String>) -> Response {
+    let token_hash = hex_hash(token.as_bytes());
+    let decision = state
+        .subscription_limiter
+        .allow(&token_hash, Instant::now());
+    if !decision.allowed {
+        if decision.should_audit_limited {
+            if let (Some(database), Some(parsed_hash)) =
+                (state.database.as_ref(), parse_subscription_token(&token))
+            {
+                audit_subscription_access(
+                    database,
+                    state.config.tenant_id,
+                    &parsed_hash,
+                    "rate_limited",
+                )
+                .await;
+            }
+        }
+        return secure_subscription_response(
+            (StatusCode::TOO_MANY_REQUESTS, "订阅请求过于频繁").into_response(),
+        );
+    }
     let Some(database) = state.database.as_ref() else {
-        return service_unavailable_response();
+        return secure_subscription_response(service_unavailable_response());
+    };
+    let Some(parsed_hash) = parse_subscription_token(&token) else {
+        return secure_subscription_response(not_found_response(
+            "订阅不存在、已过期或没有可用节点",
+        ));
     };
     match database
         .subscription_node_configs_for_token(state.config.tenant_id, &token)
@@ -2607,26 +2825,30 @@ async fn public_subscription(State(state): State<AppState>, Path(token): Path<St
                 })
                 .collect();
             if outbounds.is_empty() {
-                return not_found_response("订阅不存在、已过期或没有可用节点");
+                audit_subscription_access(
+                    database,
+                    state.config.tenant_id,
+                    &parsed_hash,
+                    "not_found",
+                )
+                .await;
+                return secure_subscription_response(not_found_response(
+                    "订阅不存在、已过期或没有可用节点",
+                ));
             }
-            let mut response = Json(json!({
-                "version": 1,
-                "experimental": false,
-                "outbounds": outbounds,
-                "route": {"final": "direct"}
-            }))
-            .into_response();
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                axum::http::HeaderValue::from_static("no-store"),
-            );
-            response.headers_mut().insert(
-                header::REFERRER_POLICY,
-                axum::http::HeaderValue::from_static("no-referrer"),
-            );
-            response
+            audit_subscription_access(database, state.config.tenant_id, &parsed_hash, "success")
+                .await;
+            secure_subscription_response(
+                Json(json!({
+                    "version": 1,
+                    "experimental": false,
+                    "outbounds": outbounds,
+                    "route": {"final": "direct"}
+                }))
+                .into_response(),
+            )
         }
-        Err(_) => internal_database_response(),
+        Err(_) => secure_subscription_response(internal_database_response()),
     }
 }
 
@@ -3564,17 +3786,134 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEMO_ACCESS_TOKEN, DEMO_GENERATED_AT, DEMO_PORTAL_ACCESS_TOKEN, UsageQuery,
-        applied_subscription_outbound, create_order_error_response, router,
+        DEMO_ACCESS_TOKEN, DEMO_GENERATED_AT, DEMO_PORTAL_ACCESS_TOKEN,
+        SUBSCRIPTION_LIMIT_REQUESTS_PER_TOKEN, SubscriptionLimiter, UsageQuery,
+        applied_subscription_outbound, create_order_error_response, hex_hash,
+        parse_subscription_token, router,
     };
     use axum::{
         body::{Body, to_bytes},
         http::{HeaderMap, Request, StatusCode, header},
     };
     use cyberboard_config::ApiConfig;
+    use cyberboard_database::{
+        AgentApplyResultInput, ConfigPublishInput, ConfigRevisionCreateInput, ConfigTemplateInput,
+        NodeInput, PlanInput, SubscriptionInput,
+    };
     use serde_json::{Value, json};
     use tower::ServiceExt;
     use uuid::Uuid;
+
+    #[test]
+    fn subscription_token_parser_accepts_legacy_and_current_tokens_only() {
+        let legacy = format!("cb_{}", "a".repeat(32));
+        let current = format!("cb_{}", "b".repeat(64));
+        let parsed = parse_subscription_token(&current).unwrap();
+        assert_eq!(parsed, hex_hash(current.as_bytes()));
+        assert!(parse_subscription_token(&legacy).is_some());
+        assert!(parse_subscription_token("cb_short").is_none());
+        assert!(parse_subscription_token(&format!("cb_{}", "z".repeat(64))).is_none());
+        assert!(parse_subscription_token(&format!("cb_{}", "a".repeat(65))).is_none());
+    }
+
+    #[test]
+    fn subscription_limiter_enforces_fixed_window_and_resets() {
+        let limiter = SubscriptionLimiter::new();
+        let now = std::time::Instant::now();
+        let token_hash = hex_hash(b"test-token");
+        for _ in 0..SUBSCRIPTION_LIMIT_REQUESTS_PER_TOKEN {
+            assert!(limiter.allow(&token_hash, now).allowed);
+        }
+        let limited = limiter.allow(&token_hash, now);
+        assert!(!limited.allowed);
+        assert!(limited.should_audit_limited);
+        assert!(
+            limiter
+                .allow(&token_hash, now + std::time::Duration::from_secs(60))
+                .allowed
+        );
+        assert_eq!(limiter.buckets.lock().unwrap().len(), 1);
+        assert_ne!(token_hash, "test-token");
+    }
+
+    #[test]
+    fn subscription_limited_audit_permit_is_globally_sampled_per_window() {
+        let limiter = SubscriptionLimiter::new();
+        let now = std::time::Instant::now();
+        let token_a = hex_hash(b"token-a");
+        let token_b = hex_hash(b"token-b");
+
+        for _ in 0..SUBSCRIPTION_LIMIT_REQUESTS_PER_TOKEN {
+            assert!(limiter.allow(&token_a, now).allowed);
+            assert!(limiter.allow(&token_b, now).allowed);
+        }
+        assert!(limiter.allow(&token_a, now).should_audit_limited);
+        for _ in 0..100 {
+            assert!(!limiter.allow(&token_a, now).should_audit_limited);
+            assert!(!limiter.allow(&token_b, now).should_audit_limited);
+        }
+
+        let next_window = now + std::time::Duration::from_secs(60);
+        for _ in 0..SUBSCRIPTION_LIMIT_REQUESTS_PER_TOKEN {
+            assert!(limiter.allow(&token_a, next_window).allowed);
+        }
+        assert!(limiter.allow(&token_a, next_window).should_audit_limited);
+        assert!(!limiter.allow(&token_b, next_window).should_audit_limited);
+    }
+
+    #[test]
+    fn subscription_limiter_enforces_process_wide_cap_across_tokens() {
+        let limiter = SubscriptionLimiter::new();
+        let now = std::time::Instant::now();
+        for index in 0..super::SUBSCRIPTION_LIMIT_REQUESTS_GLOBAL {
+            let token_hash = hex_hash(index.to_string().as_bytes());
+            assert!(limiter.allow(&token_hash, now).allowed);
+        }
+        let blocked = limiter.allow(&hex_hash(b"different-random-token"), now);
+        assert!(!blocked.allowed);
+        assert!(blocked.should_audit_limited);
+        for index in 0..100 {
+            let token_hash = hex_hash(format!("additional-{index}").as_bytes());
+            let blocked = limiter.allow(&token_hash, now);
+            assert!(!blocked.allowed);
+            assert!(!blocked.should_audit_limited);
+        }
+
+        let next_window = now + std::time::Duration::from_secs(60);
+        assert!(
+            limiter
+                .allow(&hex_hash(b"after-global-reset"), next_window)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn subscription_limiter_bounds_key_storage() {
+        let limiter = SubscriptionLimiter::new();
+        let now = std::time::Instant::now();
+        {
+            let mut buckets = limiter.buckets.lock().unwrap();
+            for index in 0..super::SUBSCRIPTION_LIMIT_KEYS {
+                buckets.insert(
+                    format!("seed-{index}"),
+                    super::SubscriptionBucket {
+                        window_started: now,
+                        requests: 0,
+                    },
+                );
+            }
+        }
+        let decision = limiter.allow(&hex_hash(b"new-token-at-capacity"), now);
+        assert!(decision.allowed);
+        assert_eq!(
+            limiter.buckets.lock().unwrap().len(),
+            super::SUBSCRIPTION_LIMIT_KEYS
+        );
+        for _ in 1..SUBSCRIPTION_LIMIT_REQUESTS_PER_TOKEN {
+            assert!(limiter.allow(&hex_hash(b"another-new-token"), now).allowed);
+        }
+        assert!(!limiter.allow(&hex_hash(b"another-new-token"), now).allowed);
+    }
 
     #[test]
     fn usage_query_bounds_page_size_and_offset() {
@@ -3634,6 +3973,299 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn subscription_route_secures_unavailable_and_rate_limited_responses() {
+        let app = router(test_state());
+        let uri = format!("/subscribe/cb_{}", "c".repeat(64));
+        for _ in 0..SUBSCRIPTION_LIMIT_REQUESTS_PER_TOKEN {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+        }
+        let limited = app
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(limited.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(limited.headers()[header::REFERRER_POLICY], "no-referrer");
+    }
+
+    #[tokio::test]
+    async fn public_subscription_route_serves_applied_user_config_and_rejects_revoked_subscription()
+    {
+        let Some(database_url) = std::env::var("CYBERBOARD_DATABASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!("skipped public subscription route test: CYBERBOARD_DATABASE_URL is not set");
+            return;
+        };
+        let database = cyberboard_database::Database::connect(&database_url)
+            .await
+            .expect("connect postgres");
+        database.migrate().await.expect("apply migrations");
+        let tenant_id = Uuid::new_v4();
+        database.ensure_tenant(tenant_id).await.unwrap();
+        let actor_id = database
+            .bootstrap_admin(
+                tenant_id,
+                &format!("route-admin-{}@example.com", Uuid::new_v4()),
+                "hash",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let user = database
+            .create_user(
+                tenant_id,
+                actor_id,
+                &format!("route-user-{}@example.com", Uuid::new_v4()),
+                "hash",
+                "Route User",
+            )
+            .await
+            .unwrap();
+        let plan = database
+            .create_plan(
+                tenant_id,
+                actor_id,
+                &PlanInput {
+                    name: format!("route-plan-{}", Uuid::new_v4().simple()),
+                    description: String::new(),
+                    price_cents: 0,
+                    currency: "USD".into(),
+                    duration_days: 30,
+                    quota_bytes: 1_000,
+                    device_limit: 1,
+                    status: "active".into(),
+                    node_group_ids: json!([]),
+                },
+            )
+            .await
+            .unwrap();
+        let token = format!("cb_{}", Uuid::new_v4().simple());
+        let subscription = database
+            .create_subscription(
+                tenant_id,
+                actor_id,
+                &SubscriptionInput {
+                    user_id: user.id,
+                    plan_id: plan.id,
+                    starts_at: None,
+                    expires_at: None,
+                    subscription_token: token.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let credentials = database
+            .ensure_user_proxy_credentials(tenant_id, user.id)
+            .await
+            .unwrap();
+        let node = database
+            .create_node(
+                tenant_id,
+                actor_id,
+                &NodeInput {
+                    name: format!("route-node-{}", Uuid::new_v4().simple()),
+                    region: "test".into(),
+                    address: "127.0.0.1".into(),
+                    port: 443,
+                    core: "sing-box".into(),
+                    core_version: "1.0".into(),
+                    agent_version: "test".into(),
+                    tags: json!([]),
+                },
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO subscription_nodes(tenant_id,subscription_id,node_id) VALUES($1,$2,$3)",
+        )
+        .bind(tenant_id)
+        .bind(subscription.id)
+        .bind(node.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let template = database
+            .create_config_template(
+                tenant_id,
+                &ConfigTemplateInput {
+                    name: format!("route-template-{}", Uuid::new_v4().simple()),
+                    description: String::new(),
+                    core_type: "sing-box".into(),
+                    core_version_range: "*".into(),
+                    status: "active".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let agent_id = format!("route-agent-{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "UPDATE nodes SET agent_id=$3,agent_public_key=$4 WHERE tenant_id=$1 AND id=$2",
+        )
+        .bind(tenant_id)
+        .bind(node.id)
+        .bind(&agent_id)
+        .bind("test-public-key")
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let payload = json!({
+            "inbounds": [{"type": "vless", "tag": "route", "users": []}],
+            "outbounds": [{"type": "direct", "tag": "direct"}]
+        });
+        let revision = database
+            .create_config_revision(ConfigRevisionCreateInput {
+                tenant_id,
+                template_id: template.id,
+                node_id: node.id,
+                generation: 1,
+                core_version: "1.0",
+                content_hash: "draft-hash",
+                payload: &payload,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        database
+            .publish_config_revision(ConfigPublishInput {
+                tenant_id,
+                revision_id: revision.id,
+                expected_generation: 1,
+                expected_previous_hash: None,
+                sign: &|_, _, _| "test-signature".to_owned(),
+                actor_user_id: actor_id,
+            })
+            .await
+            .unwrap();
+        let published_payload: Value =
+            sqlx::query_scalar("SELECT payload FROM config_revisions WHERE tenant_id=$1 AND id=$2")
+                .bind(tenant_id)
+                .bind(revision.id)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        let published_hash: String = sqlx::query_scalar(
+            "SELECT content_hash FROM config_revisions WHERE tenant_id=$1 AND id=$2",
+        )
+        .bind(tenant_id)
+        .bind(revision.id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            published_payload["inbounds"][0]["users"][0]["name"],
+            user.id.to_string()
+        );
+        assert_eq!(
+            published_payload["inbounds"][0]["users"][0]["uuid"],
+            json!(credentials.uuid)
+        );
+        assert!(
+            database
+                .record_agent_apply_result(AgentApplyResultInput {
+                    tenant_id,
+                    agent_id: &agent_id,
+                    node_id: node.id,
+                    generation: 1,
+                    phase: "applied",
+                    error_code: "",
+                    error_message: "",
+                    previous_hash: "",
+                    applied_hash: &published_hash,
+                    retry_count: 0,
+                })
+                .await
+                .unwrap()
+        );
+
+        let database = std::sync::Arc::new(database);
+        let state = super::AppState::with_database(
+            ApiConfig {
+                bind_addr: "127.0.0.1".into(),
+                port: 0,
+                agent_grpc_addr: "127.0.0.1:0".into(),
+                agent_grpc_server_cert: None,
+                agent_grpc_server_key: None,
+                agent_grpc_client_ca: None,
+                database_url: Some(database_url),
+                redis_url: None,
+                demo_admin_email: "admin@example.com".into(),
+                demo_admin_password: "password".into(),
+                demo_user_email: "user@example.com".into(),
+                demo_user_password: "password".into(),
+                bootstrap_admin: None,
+                dev_mode: true,
+                tenant_id,
+                config_envelope_ttl_secs: 300,
+            },
+            Some(database.clone()),
+        );
+        let app = router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/subscribe/{token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["outbounds"][0]["type"], "vless");
+        assert_eq!(body["outbounds"][0]["uuid"], json!(credentials.uuid));
+        assert_eq!(body["outbounds"][0]["server"], "127.0.0.1");
+        let success_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_logs WHERE tenant_id=$1 AND action='subscription.access.success'",
+        )
+        .bind(tenant_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(success_count, 1);
+
+        sqlx::query("UPDATE subscriptions SET status='revoked' WHERE tenant_id=$1 AND id=$2")
+            .bind(tenant_id)
+            .bind(subscription.id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/subscribe/{token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+        let not_found_details: Value = sqlx::query_scalar(
+            "SELECT details FROM audit_logs WHERE tenant_id=$1 AND action='subscription.access.not_found'",
+        )
+        .bind(tenant_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(not_found_details["outcome"], "not_found");
+        assert_ne!(not_found_details["tokenHash"], token);
+    }
     #[test]
     fn rendered_config_json_round_trip_is_byte_stable() {
         use cyberboard_config_compiler::{ConfigProfile, Credential, Inbound, Route, Transport};

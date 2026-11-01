@@ -1,5 +1,7 @@
 # Cyberboard M1 任务分配计划
 
+> 历史初始计划（2026-11-02）。任务拆分可供参考，但负责人、完成情况和进度估算不是实时状态；请以 [DEVELOPMENT_TRACKING.md](DEVELOPMENT_TRACKING.md) 和 [PROJECT_STATUS.md](PROJECT_STATUS.md) 为准。
+
 **创建时间**: 2026-11-02  
 **项目主管**: AI Agent (Master)  
 **子智能体模型**: gpt-6.1-sol  

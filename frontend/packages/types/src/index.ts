@@ -7,6 +7,10 @@ export interface LoginCredentials { email: string; password: string }
 export interface LoginResponse { user: SessionUser; accessToken: string; tokenType: 'Bearer'; expiresIn: number; refreshToken?: string | null }
 export interface UserSummary { id: string; email: string; displayName: string; status: UserStatus; plan: string; usedBytes: number; quotaBytes: number; expiresAt: string; lastSeenAt: string | null }
 export interface PageQuery { page?: number; pageSize?: number; search?: string; status?: string }
+export interface UsageQuery { userId?: string; nodeId?: string; startTime?: string | Date; endTime?: string | Date; page?: number; pageSize?: number; limit?: number; offset?: number }
+export interface UsageRow { userId: string; username: string; nodeId: string | null; totalBytes: number; downloadBytes: number; uploadBytes: number; periodStart: string; periodEnd: string; eventCount: number }
+export type UsageAggregate = UsageRow
+export interface UsageResponse { items: UsageRow[]; total: number; page: number; pageSize: number; limit: number; offset: number }
 export interface PaginatedResponse<T> { items: T[]; total: number; page: number; pageSize: number }
 export type ListResponse<T> = PaginatedResponse<T> | T[]
 export interface UserCreateInput { email: string; displayName: string; password: string; status?: UserStatus; planId?: string }

@@ -3437,6 +3437,7 @@ mod tests {
                 bootstrap_admin: None,
                 dev_mode: true,
                 tenant_id,
+                config_envelope_ttl_secs: 300,
             },
             Some(std::sync::Arc::new(database)),
         );

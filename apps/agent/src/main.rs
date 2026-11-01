@@ -735,7 +735,7 @@ mod reconciliation_tests {
 
     fn fake_core(dir: &std::path::Path) -> std::path::PathBuf {
         let path = dir.join("fake-core");
-        fs::write(&path, "#!/bin/sh\ncase \"$1\" in\ncheck) echo check >> \"$0.checks\"; grep -q fail_check \"$3\" && exit 1; exit 0 ;;\nrun) trap ':' HUP; while :; do sleep 0.02; done ;;\nesac\n").unwrap();
+        fs::write(&path, "#!/bin/sh\ncase \"$1\" in\ncheck) echo check >> \"$0.checks\"; grep -q fail_check \"$3\" && exit 1; exit 0 ;;\nrun) trap ':' USR1; while :; do sleep 0.02; done ;;\nesac\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
     }

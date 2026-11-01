@@ -1,8 +1,8 @@
-//! Supervision boundary for the local sing-box process.
-//!
-//! Liveness after the grace period is the health signal; sing-box keeps its old
-//! instance when a SIGHUP reload fails internally, so the pre-install `check` is
-//! what catches invalid configs.
+//! Liveness after the grace period is the health signal; configuration is
+//! validated before installation because sing-box does not report reload errors
+//! to the parent process.
+
+pub mod singbox;
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -397,7 +397,7 @@ impl CoreSupervisor {
                 self.core_state = "reloading";
                 // SAFETY: pid is the live child process id owned by this supervisor.
                 unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGHUP);
+                    libc::kill(pid as libc::pid_t, libc::SIGUSR1);
                 }
                 self.core_state = "running";
                 return;
@@ -415,7 +415,7 @@ impl CoreSupervisor {
                     libc::kill(pid as libc::pid_t, libc::SIGTERM);
                 }
             }
-            if timeout(Duration::from_secs(10), child.wait())
+            if timeout(Duration::from_secs(30), child.wait())
                 .await
                 .is_err()
             {
@@ -711,7 +711,7 @@ mod tests {
 
     fn fake_core(dir: &std::path::Path) -> std::path::PathBuf {
         let path = dir.join("fake-sing-box");
-        fs::write(&path, "#!/bin/sh\ncase \"$1\" in\nversion) echo 'sing-box version test' ;;\ncheck) grep -q fail_check \"$3\" && exit 1; exit 0 ;;\nrun) trap 'echo hup >> \"$3.hup\"; grep -q crash_on_reload \"$3\" && exit 1' HUP; grep -q crash_on_start \"$3\" && exit 1; while :; do sleep 0.02; done ;;\nesac\n").unwrap();
+        fs::write(&path, "#!/bin/sh\ncase \"$1\" in\nversion) echo 'sing-box version test' ;;\ncheck) grep -q fail_check \"$3\" && exit 1; exit 0 ;;\nrun) trap 'echo hup >> \"$3.hup\"; grep -q crash_on_reload \"$3\" && exit 1' USR1; grep -q crash_on_start \"$3\" && exit 1; while :; do sleep 0.02; done ;;\nesac\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
@@ -1057,7 +1057,7 @@ mod tests {
             supervisor.apply(prior, 1, &hash(prior)).await.phase,
             "applied"
         );
-        fs::write(&binary, "#!/bin/sh\ncase \"$1\" in\ncheck) exit 0 ;;\nrun) trap 'grep -q crash_on_reload \"$3\" && exit 1' HUP; grep -q restore_unhealthy \"$3\" && exit 1; while :; do sleep 0.02; done ;;\nesac\n").unwrap();
+        fs::write(&binary, "#!/bin/sh\ncase \"$1\" in\ncheck) exit 0 ;;\nrun) trap 'grep -q crash_on_reload \"$3\" && exit 1' USR1; grep -q restore_unhealthy \"$3\" && exit 1; while :; do sleep 0.02; done ;;\nesac\n").unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
         let bad = b"crash_on_reload";
         let outcome = supervisor.apply(bad, 2, &hash(bad)).await;

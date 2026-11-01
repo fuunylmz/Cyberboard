@@ -2670,6 +2670,9 @@ async fn rollback_config_revision(
         Err(cyberboard_database::DatabaseError::ConfigConflict("not_published")) => {
             config_conflict_response("not_published", "配置版本尚未发布")
         }
+        Err(cyberboard_database::DatabaseError::ConfigConflict(
+            "rollback_target_hash_mismatch",
+        )) => config_conflict_response("rollback_target_hash_mismatch", "回滚目标配置 hash 无效"),
         Err(_) => internal_database_response(),
     }
 }

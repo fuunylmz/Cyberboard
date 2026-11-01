@@ -24,6 +24,13 @@ const CREATE_ORDER_IDEMPOTENT_SQL: &str = "INSERT INTO orders (tenant_id,user_id
 
 pub type DatabaseResult<T> = Result<T, DatabaseError>;
 
+fn sha256_hex(payload: &[u8]) -> String {
+    Sha256::digest(payload)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn deployment_status_from_phase(phase: &str) -> &'static str {
     match phase {
         "applied" => "applied",
@@ -1757,6 +1764,13 @@ impl Database {
         let new_generation = max_generation + 1;
         let target_payload: serde_json::Value = target.get("payload");
         let target_bytes = serde_json::to_vec(&target_payload).unwrap_or_default();
+        let target_hash: String = target.get("content_hash");
+        if sha256_hex(&target_bytes) != target_hash {
+            tx.rollback().await?;
+            return Err(DatabaseError::ConfigConflict(
+                "rollback_target_hash_mismatch",
+            ));
+        }
         let signed_envelope = (input.sign)(node_id, new_generation as u64, target_bytes);
         let new_id: Uuid = sqlx::query_scalar("INSERT INTO config_revisions(tenant_id,template_id,node_id,generation,core_type,core_version,content_hash,signature,validation_status,publish_status,payload,rollback_of) SELECT $1,template_id,node_id,$2,core_type,core_version,content_hash,$3,'validated','published',payload,$4 FROM config_revisions WHERE tenant_id=$1 AND id=$4 RETURNING id")
             .bind(input.tenant_id).bind(new_generation).bind(signed_envelope).bind(target_id).fetch_one(&mut *tx).await?;

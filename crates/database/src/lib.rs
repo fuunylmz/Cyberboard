@@ -9,7 +9,7 @@ use std::time::Duration;
 use cyberboard_storage::{
     EIGHTH_MIGRATION, ELEVENTH_MIGRATION, FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION,
     NINTH_MIGRATION, SECOND_MIGRATION, SEVENTH_MIGRATION, SIXTH_MIGRATION, TENTH_MIGRATION,
-    THIRD_MIGRATION, THIRTEENTH_MIGRATION, TWELFTH_MIGRATION,
+    THIRD_MIGRATION, THIRTEENTH_MIGRATION, TWELFTH_MIGRATION, FIFTEENTH_MIGRATION,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -469,6 +469,20 @@ impl Database {
                 .await?;
             sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
                 .bind("0013_config_deployment_lifecycle")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        let fifteenth: Option<String> =
+            sqlx::query_scalar("SELECT version FROM cyberboard_schema_migrations WHERE version=$1")
+                .bind("0015_usage_reporting")
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if fifteenth.is_none() {
+            sqlx::raw_sql(FIFTEENTH_MIGRATION)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("INSERT INTO cyberboard_schema_migrations(version) VALUES($1)")
+                .bind("0015_usage_reporting")
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -2150,48 +2164,73 @@ impl Database {
         }
 
         for event in events {
+            let subscription_id = sqlx::query_scalar::<_, Uuid>(
+                "SELECT s.id
+                 FROM users u
+                 JOIN subscriptions s ON s.tenant_id=u.tenant_id AND s.user_id=u.id
+                 JOIN subscription_nodes sn ON sn.tenant_id=s.tenant_id
+                   AND sn.subscription_id=s.id AND sn.node_id=$3
+                 WHERE u.tenant_id=$1 AND u.id=$2 AND u.status NOT IN ('deleted','banned')
+                   AND s.status='active' AND s.expires_at > now()
+                 ORDER BY s.created_at DESC,s.id LIMIT 1",
+            )
+            .bind(tenant_id)
+            .bind(event.user_id)
+            .bind(node_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            let Some(subscription_id) = subscription_id else {
+                tracing::warn!(username = %event.username, node_id = %node_id, "usage counter references an unknown user or an unassigned subscription; skipping");
+                continue;
+            };
             let inserted = sqlx::query(
                 "INSERT INTO usage_events
                     (tenant_id,event_key,user_id,subscription_id,node_id,
                      window_start,window_end,download_bytes,upload_bytes,source_sequence)
-                 SELECT $1,$2,s.user_id,s.id,$3,to_timestamp($4),to_timestamp($5),$6,$7,$8
-                 FROM subscriptions s
-                 JOIN subscription_nodes sn
-                   ON sn.tenant_id=s.tenant_id AND sn.subscription_id=s.id
-                  AND sn.node_id=$3
-                 WHERE s.tenant_id=$1 AND s.id=$9 AND s.user_id=$10
-                   AND s.status <> 'revoked'
+                 VALUES ($1,$2,$3,$4,$5,to_timestamp($6),to_timestamp($7),$8,$9,$10)
                  ON CONFLICT (tenant_id,event_key) DO NOTHING",
             )
             .bind(tenant_id)
             .bind(&event.event_key)
+            .bind(event.user_id)
+            .bind(subscription_id)
             .bind(node_id)
             .bind(event.window_start)
             .bind(event.window_end)
             .bind(event.download_bytes)
             .bind(event.upload_bytes)
             .bind(sequence)
-            .bind(event.subscription_id)
-            .bind(event.user_id)
             .execute(&mut *transaction)
             .await?;
             if inserted.rows_affected() == 0 {
-                let already_recorded: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM usage_events
-                         WHERE tenant_id=$1 AND event_key=$2
-                     )",
-                )
-                .bind(tenant_id)
-                .bind(&event.event_key)
-                .fetch_one(&mut *transaction)
-                .await?;
-                if !already_recorded {
-                    return Err(DatabaseError::InvalidUsagePayload(
-                        "subscription is not assigned to this node or user".to_owned(),
-                    ));
-                }
+                continue;
             }
+            sqlx::query(
+                "UPDATE subscriptions SET traffic_used_bytes=traffic_used_bytes+$3,updated_at=now()
+                 WHERE tenant_id=$1 AND id=$2",
+            )
+            .bind(tenant_id)
+            .bind(subscription_id)
+            .bind(event.download_bytes + event.upload_bytes)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT INTO usage_buckets
+                    (tenant_id,user_id,bucket_start,bucket_end,download_bytes,upload_bytes,event_count,first_received_at,last_received_at)
+                 VALUES ($1,$2,date_trunc('hour',to_timestamp($3)),date_trunc('hour',to_timestamp($3))+interval '1 hour',$4,$5,1,now(),now())
+                 ON CONFLICT (tenant_id,user_id,bucket_start) DO UPDATE SET
+                    download_bytes=usage_buckets.download_bytes+EXCLUDED.download_bytes,
+                    upload_bytes=usage_buckets.upload_bytes+EXCLUDED.upload_bytes,
+                    event_count=usage_buckets.event_count+1,
+                    last_received_at=now()",
+            )
+            .bind(tenant_id)
+            .bind(event.user_id)
+            .bind(event.window_start)
+            .bind(event.download_bytes)
+            .bind(event.upload_bytes)
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         Ok(true)
@@ -2248,29 +2287,25 @@ impl Database {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UsageEventPayload {
-    #[serde(alias = "event_key")]
-    event_key: Option<String>,
-    #[serde(alias = "user_id")]
-    user_id: Uuid,
-    #[serde(alias = "subscription_id")]
-    subscription_id: Uuid,
-    #[serde(default, alias = "window_start")]
-    window_start: Option<i64>,
-    #[serde(default, alias = "window_end")]
-    window_end: Option<i64>,
-    #[serde(alias = "download_bytes")]
-    download_bytes: i64,
-    #[serde(alias = "upload_bytes")]
-    upload_bytes: i64,
+#[serde(deny_unknown_fields)]
+struct UsageCountersPayload {
+    version: u32,
+    counters: Vec<UsageCounterPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UsageCounterPayload {
+    username: String,
+    download_bytes: u64,
+    upload_bytes: u64,
 }
 
 #[derive(Debug)]
 struct ParsedUsageEvent {
     event_key: String,
-    user_id: Uuid,
-    subscription_id: Uuid,
+    username: String,
+    user_id: Option<Uuid>,
     window_start: i64,
     window_end: i64,
     download_bytes: i64,
@@ -2281,53 +2316,41 @@ fn parse_usage_events(
     payload: &serde_json::Value,
     default_window_start: i64,
     default_window_end: i64,
-    agent_id: &str,
+    _agent_id: &str,
     batch_id: &str,
 ) -> DatabaseResult<Vec<ParsedUsageEvent>> {
-    let raw_events: Vec<UsageEventPayload> = match payload.get("events") {
-        Some(events) => serde_json::from_value(events.clone())
-            .map_err(|error| DatabaseError::InvalidUsagePayload(format!("events: {error}")))?,
-        None => vec![
-            serde_json::from_value(payload.clone())
-                .map_err(|error| DatabaseError::InvalidUsagePayload(format!("event: {error}")))?,
-        ],
-    };
-    if raw_events.is_empty() {
+    let payload: UsageCountersPayload = serde_json::from_value(payload.clone())
+        .map_err(|error| DatabaseError::InvalidUsagePayload(format!("counters: {error}")))?;
+    if payload.version != 1 {
         return Err(DatabaseError::InvalidUsagePayload(
-            "at least one usage event is required".to_owned(),
+            "unsupported usage payload version".to_owned(),
         ));
     }
-    raw_events
-        .into_iter()
-        .enumerate()
-        .map(|(index, event)| {
-            let window_start = event.window_start.unwrap_or(default_window_start);
-            let window_end = event.window_end.unwrap_or(default_window_end);
-            if window_end <= window_start {
-                return Err(DatabaseError::InvalidUsagePayload(
-                    "usage window must end after it starts".to_owned(),
-                ));
-            }
-            if event.download_bytes < 0 || event.upload_bytes < 0 {
-                return Err(DatabaseError::InvalidUsagePayload(
-                    "byte counters cannot be negative".to_owned(),
-                ));
-            }
-            let event_key = event
-                .event_key
-                .filter(|key| !key.trim().is_empty())
-                .unwrap_or_else(|| format!("{agent_id}:{batch_id}:{index}"));
-            Ok(ParsedUsageEvent {
-                event_key,
-                user_id: event.user_id,
-                subscription_id: event.subscription_id,
-                window_start,
-                window_end,
-                download_bytes: event.download_bytes,
-                upload_bytes: event.upload_bytes,
-            })
+    if payload.counters.is_empty() {
+        return Err(DatabaseError::InvalidUsagePayload(
+            "at least one usage counter is required".to_owned(),
+        ));
+    }
+    payload.counters.into_iter().map(|counter| {
+        if counter.username.trim().is_empty() || counter.username.len() > 128 {
+            return Err(DatabaseError::InvalidUsagePayload("username is invalid".to_owned()));
+        }
+        let download_bytes = i64::try_from(counter.download_bytes).map_err(|_| {
+            DatabaseError::InvalidUsagePayload("download counter exceeds supported range".to_owned())
+        })?;
+        let upload_bytes = i64::try_from(counter.upload_bytes).map_err(|_| {
+            DatabaseError::InvalidUsagePayload("upload counter exceeds supported range".to_owned())
+        })?;
+        Ok(ParsedUsageEvent {
+            event_key: format!("{batch_id}:{}", counter.username),
+            user_id: Uuid::parse_str(&counter.username).ok(),
+            username: counter.username,
+            window_start: default_window_start,
+            window_end: default_window_end,
+            download_bytes,
+            upload_bytes,
         })
-        .collect()
+    }).collect()
 }
 
 #[derive(Clone, Debug)]

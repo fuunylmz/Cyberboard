@@ -38,6 +38,8 @@ pub const TWELFTH_MIGRATION: &str =
 pub const THIRTEENTH_MIGRATION_NAME: &str = "0013_config_deployment_lifecycle.sql";
 pub const THIRTEENTH_MIGRATION: &str =
     include_str!("../../../deploy/migrations/0013_config_deployment_lifecycle.sql");
+pub const FIFTEENTH_MIGRATION_NAME: &str = "0015_usage_reporting.sql";
+pub const FIFTEENTH_MIGRATION: &str = include_str!("../../../deploy/migrations/0015_usage_reporting.sql");
 
 #[cfg(test)]
 mod tests {
@@ -48,6 +50,7 @@ mod tests {
         SEVENTH_MIGRATION, SEVENTH_MIGRATION_NAME, SIXTH_MIGRATION, TENTH_MIGRATION,
         TENTH_MIGRATION_NAME, THIRD_MIGRATION, THIRD_MIGRATION_NAME, THIRTEENTH_MIGRATION,
         THIRTEENTH_MIGRATION_NAME, TWELFTH_MIGRATION, TWELFTH_MIGRATION_NAME,
+        FIFTEENTH_MIGRATION, FIFTEENTH_MIGRATION_NAME,
     };
 
     #[test]

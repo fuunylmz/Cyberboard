@@ -464,6 +464,81 @@ fn set_private(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+pub async fn binary_has_v2ray_api(binary: &Path) -> bool {
+    let output = timeout(
+        Duration::from_secs(3),
+        Command::new(binary)
+            .arg("version")
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    let Ok(Ok(output)) = output else { return false; };
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout).contains("with_v2ray_api")
+}
+
+pub struct ProcessMetrics {
+    pub memory_bytes: u64,
+    pub cpu_percent: f64,
+}
+
+pub async fn process_metrics(pids: &[u32]) -> Option<ProcessMetrics> {
+    let pid_list = pids
+        .iter()
+        .copied()
+        .filter(|pid| *pid > 0)
+        .map(|pid| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    if pid_list.is_empty() {
+        return None;
+    }
+    let output = timeout(
+        Duration::from_secs(2),
+        Command::new("ps")
+            .args(["-o", "rss=", "-o", "%cpu=", "-p", &pid_list])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut memory_kib = 0_u64;
+    let mut cpu_percent = 0.0_f64;
+    let mut found = false;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(memory), Some(cpu)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let (Ok(memory), Ok(cpu)) = (memory.parse::<u64>(), cpu.parse::<f64>()) else {
+            continue;
+        };
+        if !cpu.is_finite() || cpu < 0.0 {
+            continue;
+        }
+        memory_kib = memory_kib.saturating_add(memory);
+        cpu_percent += cpu;
+        found = true;
+    }
+    found.then_some(ProcessMetrics {
+        memory_bytes: memory_kib.saturating_mul(1024),
+        cpu_percent,
+    })
+}
+
+impl CoreSupervisor {
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.as_ref().and_then(|child| child.id())
+    }
+}
+
 pub fn disk_free_bytes(path: &Path) -> u64 {
     #[cfg(unix)]
     {

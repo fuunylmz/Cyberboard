@@ -20,6 +20,7 @@ use tracing::{info, warn};
 mod identity;
 mod runtime;
 mod tonic_transport;
+mod usage;
 
 #[cfg(unix)]
 struct ShutdownSignals {
@@ -237,6 +238,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(error) => warn!(%error, "control-plane connection failed; serving local config"),
         }
     }
+    let v2ray_api_supported = runtime::binary_has_v2ray_api(std::path::Path::new(&config.core_binary)).await;
+    if !v2ray_api_supported {
+        warn!("sing-box binary lacks with_v2ray_api; configs containing experimental.v2ray_api will fail sing-box check and be rolled back");
+    }
+    if let Some(id) = agent_id.clone() {
+        tokio::spawn(usage::run_reporting_loop(
+            config.clone(),
+            id,
+            node_id.clone(),
+            public_key.clone(),
+            core.config_path().to_path_buf(),
+            v2ray_api_supported,
+        ));
+    } else {
+        warn!("usage reporting is unavailable until the Agent is registered");
+    }
     info!(node_id = %node_id, core_state = core.core_state(), "Cyberboard agent started");
     let mut ticker = interval(Duration::from_secs(config.interval_secs));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -346,6 +363,11 @@ async fn reconcile_once<T: AgentTransport>(
     let trusted_key = *trusted_key;
     let now = unix_now();
     let state = core.state().clone();
+    let mut process_ids = vec![std::process::id()];
+    if let Some(pid) = core.process_id() {
+        process_ids.push(pid);
+    }
+    let metrics = runtime::process_metrics(&process_ids).await;
     let heartbeat = HeartbeatRequest {
         agent_id: agent_id.into(),
         node_id: node_id.into(),
@@ -359,13 +381,13 @@ async fn reconcile_once<T: AgentTransport>(
             state.generation.to_string()
         },
         core_state: core.core_state().into(),
-        memory_bytes: 0,
+        memory_bytes: metrics.as_ref().map(|value| value.memory_bytes),
         disk_free_bytes: runtime::disk_free_bytes(
             core.config_path()
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new(".")),
         ),
-        cpu_percent: 0.0,
+        cpu_percent: metrics.map(|value| value.cpu_percent),
         unix_time: now,
         nonce: uuid::Uuid::new_v4().to_string(),
         agent_public_key: public_key.into(),

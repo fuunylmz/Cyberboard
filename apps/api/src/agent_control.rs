@@ -5,6 +5,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use prost::Message;
 use cyberboard_agent_protocol::{
     PROTOCOL_VERSION,
     generated::{
@@ -300,12 +301,21 @@ impl AgentControl for AgentControlService {
                 "usage batch and window are required",
             ));
         }
-        let payload: Value = if request.usage_payload.is_empty() {
-            Value::Object(Default::default())
-        } else {
-            serde_json::from_slice(&request.usage_payload)
-                .map_err(|_| Status::invalid_argument("usage payload must be JSON"))?
-        };
+        let payload_message = cyberboard_agent_protocol::generated::UsagePayload::decode(
+            request.usage_payload.as_slice(),
+        )
+        .map_err(|_| Status::invalid_argument("usage payload protobuf is invalid"))?;
+        if payload_message.version != 1 {
+            return Err(Status::invalid_argument("unsupported usage payload version"));
+        }
+        let payload = serde_json::json!({
+            "version": payload_message.version,
+            "counters": payload_message.counters.into_iter().map(|counter| serde_json::json!({
+                "username": counter.username,
+                "download_bytes": counter.download_bytes,
+                "upload_bytes": counter.upload_bytes,
+            })).collect::<Vec<_>>(),
+        });
         if let Some(database) = &self.database {
             let _accepted = database
                 .ingest_agent_usage(AgentUsageInput {

@@ -811,6 +811,7 @@ struct NodeSummaryOwnedResponse {
     core_state: Option<String>,
     latency_ms: Option<u64>,
     last_heartbeat_at: Option<String>,
+    traffic_bytes_24h: i64,
 }
 
 #[derive(Serialize)]
@@ -1472,6 +1473,7 @@ fn node_summary_owned(record: NodeRecord) -> NodeSummaryOwnedResponse {
         core_state: record.core_state,
         latency_ms: None,
         last_heartbeat_at: record.last_heartbeat_at,
+        traffic_bytes_24h: record.traffic_bytes_24h,
     }
 }
 
@@ -1947,7 +1949,7 @@ async fn portal_usage(
         Ok(Some(record)) => Json(PortalUsageResponse {
             used_bytes: record.traffic_used_bytes,
             quota_bytes: record.traffic_quota_bytes,
-            today_bytes: 0,
+            today_bytes: usage.today_bytes,
             projected_bytes: record.traffic_used_bytes,
             period_start: String::new(),
             period_end: record.expires_at,

@@ -1057,7 +1057,7 @@ impl Database {
             "SELECT n.id,n.name,n.region,n.address,n.status,n.core_type,n.core_version,n.agent_version,
                     n.current_config_revision,(SELECT generation FROM config_revisions WHERE tenant_id=n.tenant_id AND id=n.current_config_revision) AS desired_generation,
                     n.applied_config_revision,n.applied_generation,n.applied_at::text AS applied_at,n.agent_core_state,
-                    n.last_heartbeat_at::text AS last_heartbeat_at,n.port,n.tags
+                    n.last_heartbeat_at::text AS last_heartbeat_at,COALESCE((SELECT sum(e.download_bytes+e.upload_bytes)::bigint FROM usage_events e WHERE e.tenant_id=n.tenant_id AND e.node_id=n.id AND e.received_at >= now()-interval '24 hours'),0)::bigint AS traffic_bytes_24h,n.port,n.tags
              FROM nodes n WHERE n.tenant_id=$1 AND ($2::text IS NULL OR n.name ILIKE '%' || $2 || '%' OR n.address ILIKE '%' || $2 || '%') AND ($3::text IS NULL OR n.status=$3) ORDER BY n.created_at DESC,n.id LIMIT $4 OFFSET $5",
         )
         .bind(tenant_id).bind(search).bind(status).bind(limit).bind(offset)
@@ -1745,9 +1745,14 @@ impl Database {
         tenant_id: Uuid,
         user_id: Uuid,
     ) -> DatabaseResult<UsageRecord> {
-        let row = sqlx::query("SELECT COALESCE(sum(download_bytes+upload_bytes),0)::bigint AS used_bytes,min(window_start)::text AS period_start,max(window_end)::text AS period_end FROM usage_events WHERE tenant_id=$1 AND user_id=$2").bind(tenant_id).bind(user_id).fetch_one(&self.pool).await?;
+        let row = sqlx::query("SELECT COALESCE(sum(download_bytes+upload_bytes),0)::bigint AS used_bytes,COALESCE(sum(download_bytes+upload_bytes) FILTER (WHERE received_at >= current_date),0)::bigint AS today_bytes,min(window_start)::text AS period_start,max(window_end)::text AS period_end FROM usage_events WHERE tenant_id=$1 AND user_id=$2")
+            .bind(tenant_id)
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(UsageRecord {
             used_bytes: row.get("used_bytes"),
+            today_bytes: row.get("today_bytes"),
             period_start: row.try_get("period_start").ok(),
             period_end: row.try_get("period_end").ok(),
         })
@@ -2921,6 +2926,7 @@ pub struct NodeRecord {
     pub applied_at: Option<String>,
     pub core_state: Option<String>,
     pub last_heartbeat_at: Option<String>,
+    pub traffic_bytes_24h: i64,
     pub port: i32,
     pub tags: serde_json::Value,
 }
@@ -2943,6 +2949,7 @@ impl NodeRecord {
             applied_at: row.try_get("applied_at").ok().flatten(),
             core_state: row.try_get("agent_core_state").ok().flatten(),
             last_heartbeat_at: row.try_get("last_heartbeat_at").ok(),
+            traffic_bytes_24h: row.try_get("traffic_bytes_24h").unwrap_or(0),
             port: row.get("port"),
             tags: row.get("tags"),
         }
@@ -3081,6 +3088,7 @@ impl DeviceRecord {
 #[derive(Clone, Debug)]
 pub struct UsageRecord {
     pub used_bytes: i64,
+    pub today_bytes: i64,
     pub period_start: Option<String>,
     pub period_end: Option<String>,
 }

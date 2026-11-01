@@ -20,7 +20,7 @@ use cyberboard_database::{
     AgentApplyResultInput, AgentHeartbeatInput, AgentUpgradeResultInput, AgentUsageInput, Database,
     DesiredConfigRecord,
 };
-use serde_json::Value;
+use serde_json::json;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
@@ -192,9 +192,9 @@ impl AgentControl for AgentControlService {
                         platform: request.platform.clone(),
                         architecture: request.architecture.clone(),
                         core_state: request.core_state.clone(),
-                        memory_bytes: request.memory_bytes,
+                        memory_bytes: request.memory_bytes.unwrap_or(0),
                         disk_free_bytes: request.disk_free_bytes,
-                        cpu_percent: request.cpu_percent,
+                        cpu_percent: request.cpu_percent.unwrap_or(0.0),
                     },
                 )
                 .await
@@ -308,7 +308,7 @@ impl AgentControl for AgentControlService {
         if payload_message.version != 1 {
             return Err(Status::invalid_argument("unsupported usage payload version"));
         }
-        let payload = serde_json::json!({
+        let payload = json!({
             "version": payload_message.version,
             "counters": payload_message.counters.into_iter().map(|counter| serde_json::json!({
                 "username": counter.username,

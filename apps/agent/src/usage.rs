@@ -10,7 +10,7 @@ use std::{
 };
 
 use cyberboard_agent_protocol::{
-    v2rayapi::{QueryStatsRequest, StatsServiceClient},
+    v2rayapi::{stats_service_client::StatsServiceClient, QueryStatsRequest},
     generated::{ReportUsageRequest, UsageCounter as ProtoUsageCounter, UsagePayload as ProtoUsagePayload},
 };
 use cyberboard_config::AgentConfig;
@@ -225,7 +225,7 @@ impl V2rayCollector {
             .connect()
             .await
             .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error.to_string()))?;
-        Ok(Self { client: StatsServiceClient::new(channel), endpoint })
+        Ok(Self { client: StatsServiceClient::new(channel) })
     }
 }
 
@@ -238,7 +238,7 @@ impl UsageCollector for V2rayCollector {
                 patterns: vec!["user>>>".to_owned()],
                 regexp: false,
             })).await.map_err(|error| io::Error::other(format!("V2Ray QueryStats: {error}")))?;
-            let mut counters = BTreeMap::new();
+            let mut counters: BTreeMap<String, UserCounter> = BTreeMap::new();
             for stat in response.into_inner().stat {
                 let Some(rest) = stat.name.strip_prefix("user>>>") else { continue; };
                 let Some((username, direction)) = rest.rsplit_once(">>>traffic>>>") else { continue; };

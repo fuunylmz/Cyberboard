@@ -5,7 +5,7 @@ use std::{fs, time::Duration};
 use cyberboard_agent_protocol::generated::{
     DesiredStateResponse, GetDesiredStateRequest, GetReleaseManifestRequest, HeartbeatRequest,
     RegisterAgentRequest, ReleaseManifestResponse, ReportApplyResultRequest,
-    ReportUsageRequest, ReportUpgradeResultRequest, agent_control_client::AgentControlClient,
+    ReportUpgradeResultRequest, ReportUsageRequest, agent_control_client::AgentControlClient,
 };
 use cyberboard_config::AgentConfig;
 use tonic::{

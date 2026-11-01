@@ -512,9 +512,10 @@ pub async fn binary_has_v2ray_api(binary: &Path) -> bool {
             .output(),
     )
     .await;
-    let Ok(Ok(output)) = output else { return false; };
-    output.status.success()
-        && String::from_utf8_lossy(&output.stdout).contains("with_v2ray_api")
+    let Ok(Ok(output)) = output else {
+        return false;
+    };
+    output.status.success() && String::from_utf8_lossy(&output.stdout).contains("with_v2ray_api")
 }
 
 pub struct ProcessMetrics {

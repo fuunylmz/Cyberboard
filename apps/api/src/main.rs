@@ -1942,6 +1942,13 @@ async fn portal_usage(
     let Some(database) = state.database.as_ref() else {
         return service_unavailable_response();
     };
+    let usage = match database
+        .usage_summary(state.config.tenant_id, identity.user_id)
+        .await
+    {
+        Ok(usage) => usage,
+        Err(_) => return internal_database_response(),
+    };
     match database
         .find_subscription_for_user(state.config.tenant_id, identity.user_id)
         .await
@@ -1951,8 +1958,8 @@ async fn portal_usage(
             quota_bytes: record.traffic_quota_bytes,
             today_bytes: usage.today_bytes,
             projected_bytes: record.traffic_used_bytes,
-            period_start: String::new(),
-            period_end: record.expires_at,
+            period_start: usage.period_start.unwrap_or_default(),
+            period_end: usage.period_end.unwrap_or(record.expires_at),
             daily: Vec::new(),
         })
         .into_response(),

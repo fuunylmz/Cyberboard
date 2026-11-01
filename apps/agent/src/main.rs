@@ -219,9 +219,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(error) => warn!(%error, "control-plane connection failed; serving local config"),
         }
     }
-    let v2ray_api_supported = runtime::binary_has_v2ray_api(std::path::Path::new(&config.core_binary)).await;
+    let v2ray_api_supported =
+        runtime::binary_has_v2ray_api(std::path::Path::new(&config.core_binary)).await;
     if !v2ray_api_supported {
-        warn!("sing-box binary lacks with_v2ray_api; configs containing experimental.v2ray_api will fail sing-box check and be rolled back");
+        warn!(
+            "sing-box binary lacks with_v2ray_api; configs containing experimental.v2ray_api will fail sing-box check and be rolled back"
+        );
     }
     if let Some(id) = agent_id.clone() {
         tokio::spawn(usage::run_reporting_loop(

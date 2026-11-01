@@ -5,7 +5,6 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use prost::Message;
 use cyberboard_agent_protocol::{
     PROTOCOL_VERSION,
     generated::{
@@ -20,6 +19,7 @@ use cyberboard_database::{
     AgentApplyResultInput, AgentHeartbeatInput, AgentUpgradeResultInput, AgentUsageInput, Database,
     DesiredConfigRecord,
 };
+use prost::Message;
 use serde_json::json;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -306,7 +306,9 @@ impl AgentControl for AgentControlService {
         )
         .map_err(|_| Status::invalid_argument("usage payload protobuf is invalid"))?;
         if payload_message.version != 1 {
-            return Err(Status::invalid_argument("unsupported usage payload version"));
+            return Err(Status::invalid_argument(
+                "unsupported usage payload version",
+            ));
         }
         let payload = json!({
             "version": payload_message.version,

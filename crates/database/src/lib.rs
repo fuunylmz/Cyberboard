@@ -7,9 +7,9 @@
 use std::time::Duration;
 
 use cyberboard_storage::{
-    EIGHTH_MIGRATION, ELEVENTH_MIGRATION, FIFTH_MIGRATION, FOURTH_MIGRATION, INITIAL_MIGRATION,
-    NINTH_MIGRATION, SECOND_MIGRATION, SEVENTH_MIGRATION, SIXTH_MIGRATION, TENTH_MIGRATION,
-    THIRD_MIGRATION, THIRTEENTH_MIGRATION, TWELFTH_MIGRATION, FIFTEENTH_MIGRATION,
+    EIGHTH_MIGRATION, ELEVENTH_MIGRATION, FIFTEENTH_MIGRATION, FIFTH_MIGRATION, FOURTH_MIGRATION,
+    INITIAL_MIGRATION, NINTH_MIGRATION, SECOND_MIGRATION, SEVENTH_MIGRATION, SIXTH_MIGRATION,
+    TENTH_MIGRATION, THIRD_MIGRATION, THIRTEENTH_MIGRATION, TWELFTH_MIGRATION,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -2484,6 +2484,10 @@ impl Database {
         }
 
         for event in events {
+            let Some(user_id) = event.user_id else {
+                tracing::warn!(username = %event.username, node_id = %node_id, "usage counter username is not a UUID; skipping");
+                continue;
+            };
             let subscription_id = sqlx::query_scalar::<_, Uuid>(
                 "SELECT s.id
                  FROM users u
@@ -2495,7 +2499,7 @@ impl Database {
                  ORDER BY s.created_at DESC,s.id LIMIT 1",
             )
             .bind(tenant_id)
-            .bind(event.user_id)
+            .bind(user_id)
             .bind(node_id)
             .fetch_optional(&mut *transaction)
             .await?;
@@ -2512,7 +2516,7 @@ impl Database {
             )
             .bind(tenant_id)
             .bind(&event.event_key)
-            .bind(event.user_id)
+            .bind(user_id)
             .bind(subscription_id)
             .bind(node_id)
             .bind(event.window_start)
@@ -2545,7 +2549,7 @@ impl Database {
                     last_received_at=now()",
             )
             .bind(tenant_id)
-            .bind(event.user_id)
+            .bind(user_id)
             .bind(event.window_start)
             .bind(event.download_bytes)
             .bind(event.upload_bytes)
@@ -2639,6 +2643,11 @@ fn parse_usage_events(
     _agent_id: &str,
     batch_id: &str,
 ) -> DatabaseResult<Vec<ParsedUsageEvent>> {
+    if default_window_end <= default_window_start {
+        return Err(DatabaseError::InvalidUsagePayload(
+            "usage window must end after it starts".to_owned(),
+        ));
+    }
     let payload: UsageCountersPayload = serde_json::from_value(payload.clone())
         .map_err(|error| DatabaseError::InvalidUsagePayload(format!("counters: {error}")))?;
     if payload.version != 1 {
@@ -2651,26 +2660,36 @@ fn parse_usage_events(
             "at least one usage counter is required".to_owned(),
         ));
     }
-    payload.counters.into_iter().map(|counter| {
-        if counter.username.trim().is_empty() || counter.username.len() > 128 {
-            return Err(DatabaseError::InvalidUsagePayload("username is invalid".to_owned()));
-        }
-        let download_bytes = i64::try_from(counter.download_bytes).map_err(|_| {
-            DatabaseError::InvalidUsagePayload("download counter exceeds supported range".to_owned())
-        })?;
-        let upload_bytes = i64::try_from(counter.upload_bytes).map_err(|_| {
-            DatabaseError::InvalidUsagePayload("upload counter exceeds supported range".to_owned())
-        })?;
-        Ok(ParsedUsageEvent {
-            event_key: format!("{batch_id}:{}", counter.username),
-            user_id: Uuid::parse_str(&counter.username).ok(),
-            username: counter.username,
-            window_start: default_window_start,
-            window_end: default_window_end,
-            download_bytes,
-            upload_bytes,
+    payload
+        .counters
+        .into_iter()
+        .map(|counter| {
+            if counter.username.trim().is_empty() || counter.username.len() > 128 {
+                return Err(DatabaseError::InvalidUsagePayload(
+                    "username is invalid".to_owned(),
+                ));
+            }
+            let download_bytes = i64::try_from(counter.download_bytes).map_err(|_| {
+                DatabaseError::InvalidUsagePayload(
+                    "download counter exceeds supported range".to_owned(),
+                )
+            })?;
+            let upload_bytes = i64::try_from(counter.upload_bytes).map_err(|_| {
+                DatabaseError::InvalidUsagePayload(
+                    "upload counter exceeds supported range".to_owned(),
+                )
+            })?;
+            Ok(ParsedUsageEvent {
+                event_key: format!("{batch_id}:{}", counter.username),
+                user_id: Uuid::parse_str(&counter.username).ok(),
+                username: counter.username,
+                window_start: default_window_start,
+                window_end: default_window_end,
+                download_bytes,
+                upload_bytes,
+            })
         })
-    }).collect()
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -3250,15 +3269,16 @@ mod tests {
     }
 
     #[test]
-    fn usage_payload_supports_single_and_batched_events() {
+    fn usage_payload_supports_versioned_user_counters() {
         let user_id = Uuid::from_u128(1);
-        let subscription_id = Uuid::from_u128(2);
-        let single = parse_usage_events(
+        let parsed = parse_usage_events(
             &json!({
-                "userId": user_id,
-                "subscriptionId": subscription_id,
-                "downloadBytes": 12,
-                "uploadBytes": 3
+                "version": 1,
+                "counters": [{
+                    "username": user_id.to_string(),
+                    "download_bytes": 12,
+                    "upload_bytes": 3
+                }]
             }),
             100,
             200,
@@ -3266,41 +3286,31 @@ mod tests {
             "batch-1",
         )
         .unwrap();
-        assert_eq!(single.len(), 1);
-        assert_eq!(single[0].event_key, "agent-1:batch-1:0");
-        let batched = parse_usage_events(
-            &json!({"events": [{
-                "event_key": "event-1",
-                "user_id": user_id,
-                "subscription_id": subscription_id,
-                "download_bytes": 5,
-                "upload_bytes": 1
-            }]}),
-            100,
-            200,
-            "agent-1",
-            "batch-2",
-        )
-        .unwrap();
-        assert_eq!(batched[0].event_key, "event-1");
-        assert_eq!(batched[0].download_bytes, 5);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].event_key, format!("batch-1:{user_id}"));
+        assert_eq!(parsed[0].download_bytes, 12);
+        assert_eq!(parsed[0].upload_bytes, 3);
     }
 
     #[test]
-    fn usage_payload_rejects_negative_counters() {
-        let error = parse_usage_events(
-            &json!({
-                "userId": Uuid::from_u128(1),
-                "subscriptionId": Uuid::from_u128(2),
-                "downloadBytes": -1,
-                "uploadBytes": 0
-            }),
+    fn usage_payload_rejects_invalid_version_and_overflow() {
+        let invalid = parse_usage_events(
+            &json!({"version": 2, "counters": []}),
             100,
             200,
             "agent-1",
             "batch-1",
         )
         .unwrap_err();
-        assert!(matches!(error, DatabaseError::InvalidUsagePayload(_)));
+        assert!(matches!(invalid, DatabaseError::InvalidUsagePayload(_)));
+        let overflow = parse_usage_events(
+            &json!({"version": 1, "counters": [{"username": "user", "download_bytes": 18446744073709551615_u64, "upload_bytes": 0}]}),
+            100,
+            200,
+            "agent-1",
+            "batch-1",
+        )
+        .unwrap_err();
+        assert!(matches!(overflow, DatabaseError::InvalidUsagePayload(_)));
     }
 }

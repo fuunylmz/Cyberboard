@@ -682,10 +682,12 @@ impl Database {
     pub async fn create_user(
         &self,
         tenant_id: Uuid,
+        actor_user_id: Uuid,
         email: &str,
         password_hash: &str,
         display_name: &str,
     ) -> DatabaseResult<UserRecord> {
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "INSERT INTO users (tenant_id, email, password_hash, display_name)
              VALUES ($1, $2, $3, $4)
@@ -695,61 +697,129 @@ impl Database {
         .bind(email)
         .bind(password_hash)
         .bind(display_name)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(UserRecord {
+        let record = UserRecord {
             id: row.get("id"),
             email: row.get("email"),
             display_name: row.get("display_name"),
             status: row.get("status"),
-        })
+        };
+        Self::insert_audit_in_tx(
+            &mut tx,
+            tenant_id,
+            actor_user_id,
+            "user.create",
+            "user",
+            record.id,
+            &serde_json::json!({}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(record)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_user(
         &self,
         tenant_id: Uuid,
+        actor_user_id: Uuid,
         user_id: Uuid,
         email: Option<&str>,
         display_name: Option<&str>,
         status: Option<&str>,
         password_hash: Option<&str>,
     ) -> DatabaseResult<Option<UserRecord>> {
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "UPDATE users
-             SET email = COALESCE($3, email),
-                 display_name = COALESCE($4, display_name),
-                 status = COALESCE($5, status),
-                 password_hash = COALESCE($6, password_hash),
-                 updated_at = now()
+             SET email = COALESCE($3, email), display_name = COALESCE($4, display_name),
+                 status = COALESCE($5, status), password_hash = COALESCE($6, password_hash), updated_at = now()
              WHERE tenant_id = $1 AND id = $2 AND status <> 'deleted'
              RETURNING id, email, display_name, status",
         )
-        .bind(tenant_id)
-        .bind(user_id)
-        .bind(email)
-        .bind(display_name)
-        .bind(status)
-        .bind(password_hash)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|row| UserRecord {
+        .bind(tenant_id).bind(user_id).bind(email).bind(display_name).bind(status).bind(password_hash)
+        .fetch_optional(&mut *tx).await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let record = UserRecord {
             id: row.get("id"),
             email: row.get("email"),
             display_name: row.get("display_name"),
             status: row.get("status"),
-        }))
+        };
+        let mut fields = Vec::new();
+        if email.is_some() {
+            fields.push("email");
+        }
+        if display_name.is_some() {
+            fields.push("displayName");
+        }
+        if status.is_some() {
+            fields.push("status");
+        }
+        if !fields.is_empty() {
+            Self::insert_audit_in_tx(
+                &mut tx,
+                tenant_id,
+                actor_user_id,
+                "user.update",
+                "user",
+                user_id,
+                &serde_json::json!({"fields":fields}),
+            )
+            .await?;
+        }
+        if password_hash.is_some() {
+            Self::insert_audit_in_tx(
+                &mut tx,
+                tenant_id,
+                actor_user_id,
+                "user.password_reset",
+                "user",
+                user_id,
+                &serde_json::json!({}),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(Some(record))
     }
 
-    pub async fn delete_user(&self, tenant_id: Uuid, user_id: Uuid) -> DatabaseResult<bool> {
+    pub async fn delete_user(
+        &self,
+        tenant_id: Uuid,
+        actor_user_id: Uuid,
+        user_id: Uuid,
+    ) -> DatabaseResult<bool> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE users SET status = 'deleted', updated_at = now()
              WHERE tenant_id = $1 AND id = $2 AND status <> 'deleted'",
         )
         .bind(tenant_id)
         .bind(user_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() == 1)
+        if result.rows_affected() == 1 {
+            Self::insert_audit_in_tx(
+                &mut tx,
+                tenant_id,
+                actor_user_id,
+                "user.delete",
+                "user",
+                user_id,
+                &serde_json::json!({}),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(true)
+        } else {
+            tx.rollback().await?;
+            Ok(false)
+        }
     }
 
     pub async fn list_plans(
@@ -811,8 +881,10 @@ impl Database {
     pub async fn create_plan(
         &self,
         tenant_id: Uuid,
+        actor_user_id: Uuid,
         plan: &PlanInput,
     ) -> DatabaseResult<PlanRecord> {
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "INSERT INTO plans (tenant_id, name, description, price_cents, currency,
                     duration_days, traffic_quota_bytes, device_limit, status, node_group_ids)
@@ -830,17 +902,31 @@ impl Database {
         .bind(plan.device_limit)
         .bind(&plan.status)
         .bind(&plan.node_group_ids)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(PlanRecord::from_row(row))
+        let record = PlanRecord::from_row(row);
+        Self::insert_audit_in_tx(
+            &mut tx,
+            tenant_id,
+            actor_user_id,
+            "plan.create",
+            "plan",
+            record.id,
+            &serde_json::json!({}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     pub async fn update_plan(
         &self,
         tenant_id: Uuid,
+        actor_user_id: Uuid,
         plan_id: Uuid,
         plan: &PlanUpdate,
     ) -> DatabaseResult<Option<PlanRecord>> {
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "UPDATE plans SET name=COALESCE($3,name), description=COALESCE($4,description),
                     price_cents=COALESCE($5,price_cents), currency=COALESCE($6,currency),
@@ -862,21 +948,87 @@ impl Database {
         .bind(plan.device_limit)
         .bind(&plan.status)
         .bind(&plan.node_group_ids)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(row.map(PlanRecord::from_row))
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let record = PlanRecord::from_row(row);
+        let mut fields = Vec::new();
+        if plan.name.is_some() {
+            fields.push("name");
+        }
+        if plan.description.is_some() {
+            fields.push("description");
+        }
+        if plan.price_cents.is_some() {
+            fields.push("priceCents");
+        }
+        if plan.currency.is_some() {
+            fields.push("currency");
+        }
+        if plan.duration_days.is_some() {
+            fields.push("durationDays");
+        }
+        if plan.quota_bytes.is_some() {
+            fields.push("quotaBytes");
+        }
+        if plan.device_limit.is_some() {
+            fields.push("deviceLimit");
+        }
+        if plan.status.is_some() {
+            fields.push("status");
+        }
+        if plan.node_group_ids.is_some() {
+            fields.push("nodeGroupIds");
+        }
+        Self::insert_audit_in_tx(
+            &mut tx,
+            tenant_id,
+            actor_user_id,
+            "plan.update",
+            "plan",
+            plan_id,
+            &serde_json::json!({"fields":fields}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(record))
     }
 
-    pub async fn delete_plan(&self, tenant_id: Uuid, plan_id: Uuid) -> DatabaseResult<bool> {
+    pub async fn delete_plan(
+        &self,
+        tenant_id: Uuid,
+        actor_user_id: Uuid,
+        plan_id: Uuid,
+    ) -> DatabaseResult<bool> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE plans SET status='archived', updated_at=now()
              WHERE tenant_id=$1 AND id=$2 AND status <> 'archived'",
         )
         .bind(tenant_id)
         .bind(plan_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() == 1)
+        if result.rows_affected() == 1 {
+            Self::insert_audit_in_tx(
+                &mut tx,
+                tenant_id,
+                actor_user_id,
+                "plan.delete",
+                "plan",
+                plan_id,
+                &serde_json::json!({}),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(true)
+        } else {
+            tx.rollback().await?;
+            Ok(false)
+        }
     }
 
     pub async fn list_nodes(
@@ -917,8 +1069,10 @@ impl Database {
     pub async fn create_node(
         &self,
         tenant_id: Uuid,
+        actor_user_id: Uuid,
         node: &NodeInput,
     ) -> DatabaseResult<NodeRecord> {
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "INSERT INTO nodes (tenant_id,name,region,address,port,core_type,core_version,agent_version,tags)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
@@ -935,17 +1089,42 @@ impl Database {
         .bind(&node.core_version)
         .bind(&node.agent_version)
         .bind(&node.tags)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(NodeRecord::from_row(row))
+        let record = NodeRecord::from_row(row);
+        Self::insert_audit_in_tx(
+            &mut tx,
+            tenant_id,
+            actor_user_id,
+            "node.create",
+            "node",
+            record.id,
+            &serde_json::json!({}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     pub async fn update_node(
         &self,
         tenant_id: Uuid,
+        actor_user_id: Uuid,
         node_id: Uuid,
         node: &NodeUpdate,
     ) -> DatabaseResult<Option<NodeRecord>> {
+        let mut tx = self.pool.begin().await?;
+        let previous =
+            sqlx::query("SELECT status FROM nodes WHERE tenant_id=$1 AND id=$2 FOR UPDATE")
+                .bind(tenant_id)
+                .bind(node_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(previous) = previous else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let from_status: String = previous.get("status");
         let row = sqlx::query(
             "UPDATE nodes SET name=COALESCE($3,name),region=COALESCE($4,region),address=COALESCE($5,address),
                     port=COALESCE($6,port),core_type=COALESCE($7,core_type),core_version=COALESCE($8,core_version),
@@ -958,17 +1137,91 @@ impl Database {
         )
         .bind(tenant_id).bind(node_id).bind(&node.name).bind(&node.region).bind(&node.address)
         .bind(node.port).bind(&node.core).bind(&node.core_version).bind(&node.status).bind(&node.tags)
-        .fetch_optional(&self.pool).await?;
-        Ok(row.map(NodeRecord::from_row))
+        .fetch_optional(&mut *tx).await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let record = NodeRecord::from_row(row);
+        let mut fields = Vec::new();
+        if node.name.is_some() {
+            fields.push("name");
+        }
+        if node.region.is_some() {
+            fields.push("region");
+        }
+        if node.address.is_some() {
+            fields.push("address");
+        }
+        if node.port.is_some() {
+            fields.push("port");
+        }
+        if node.core.is_some() {
+            fields.push("core");
+        }
+        if node.core_version.is_some() {
+            fields.push("coreVersion");
+        }
+        if node.tags.is_some() {
+            fields.push("tags");
+        }
+        if !fields.is_empty() {
+            Self::insert_audit_in_tx(
+                &mut tx,
+                tenant_id,
+                actor_user_id,
+                "node.update",
+                "node",
+                node_id,
+                &serde_json::json!({"fields":fields}),
+            )
+            .await?;
+        }
+        if let Some(to_status) = node.status.as_deref().filter(|to| *to != from_status) {
+            Self::insert_audit_in_tx(
+                &mut tx,
+                tenant_id,
+                actor_user_id,
+                "node.status_change",
+                "node",
+                node_id,
+                &serde_json::json!({"from":from_status,"to":to_status}),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(Some(record))
     }
 
-    pub async fn delete_node(&self, tenant_id: Uuid, node_id: Uuid) -> DatabaseResult<bool> {
+    pub async fn delete_node(
+        &self,
+        tenant_id: Uuid,
+        actor_user_id: Uuid,
+        node_id: Uuid,
+    ) -> DatabaseResult<bool> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query("DELETE FROM nodes WHERE tenant_id=$1 AND id=$2")
             .bind(tenant_id)
             .bind(node_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        Ok(result.rows_affected() == 1)
+        if result.rows_affected() == 1 {
+            Self::insert_audit_in_tx(
+                &mut tx,
+                tenant_id,
+                actor_user_id,
+                "node.delete",
+                "node",
+                node_id,
+                &serde_json::json!({}),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(true)
+        } else {
+            tx.rollback().await?;
+            Ok(false)
+        }
     }
 
     pub async fn list_subscriptions(
@@ -1018,48 +1271,129 @@ impl Database {
     pub async fn create_subscription(
         &self,
         tenant_id: Uuid,
+        actor_user_id: Uuid,
         input: &SubscriptionInput,
     ) -> DatabaseResult<SubscriptionRecord> {
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "INSERT INTO subscriptions (tenant_id,user_id,plan_id,status,traffic_quota_bytes,starts_at,expires_at,subscription_token)
              SELECT $1,$2,p.id,'active',p.traffic_quota_bytes,$4::timestamptz,
                     COALESCE($5::timestamptz, COALESCE($4::timestamptz, now()) + make_interval(days => p.duration_days)),$6
              FROM plans p WHERE p.tenant_id=$1 AND p.id=$3
-             RETURNING id,user_id,plan_id,status,traffic_used_bytes,traffic_quota_bytes,expires_at::text AS expires_at,subscription_token",
+             RETURNING id",
         ).bind(tenant_id).bind(input.user_id).bind(input.plan_id).bind(&input.starts_at).bind(&input.expires_at).bind(&input.subscription_token)
-        .fetch_one(&self.pool).await?;
+        .fetch_optional(&mut *tx).await?.ok_or_else(|| DatabaseError::Sqlx(sqlx::Error::RowNotFound))?;
         let id: Uuid = row.get("id");
-        self.get_subscription(tenant_id, id)
-            .await?
-            .ok_or_else(|| DatabaseError::Sqlx(sqlx::Error::RowNotFound))
+        let record_row = sqlx::query("SELECT s.id,u.email AS user_email,p.name AS plan,s.status,s.traffic_used_bytes,s.traffic_quota_bytes,s.expires_at::text AS expires_at,s.subscription_token,s.subscription_token_version FROM subscriptions s JOIN users u ON u.tenant_id=s.tenant_id AND u.id=s.user_id JOIN plans p ON p.tenant_id=s.tenant_id AND p.id=s.plan_id WHERE s.tenant_id=$1 AND s.id=$2")
+            .bind(tenant_id).bind(id).fetch_one(&mut *tx).await?;
+        let record = SubscriptionRecord::from_row(record_row);
+        Self::insert_audit_in_tx(
+            &mut tx,
+            tenant_id,
+            actor_user_id,
+            "subscription.create",
+            "subscription",
+            id,
+            &serde_json::json!({}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     pub async fn update_subscription(
         &self,
         tenant_id: Uuid,
+        actor_user_id: Uuid,
         id: Uuid,
         input: &SubscriptionUpdate,
     ) -> DatabaseResult<Option<SubscriptionRecord>> {
-        let row = sqlx::query(
-            "UPDATE subscriptions SET plan_id=COALESCE($3,plan_id),status=COALESCE($4,status),
-                    starts_at=COALESCE($5::timestamptz,starts_at),updated_at=now()
-             WHERE tenant_id=$1 AND id=$2
-             RETURNING id,user_id,plan_id,status,traffic_used_bytes,traffic_quota_bytes,expires_at::text AS expires_at,subscription_token",
-        ).bind(tenant_id).bind(id).bind(input.plan_id).bind(&input.status).bind(&input.starts_at)
-        .fetch_optional(&self.pool).await?;
-        match row {
-            Some(row) => {
-                let subscription_id: Uuid = row.get("id");
-                self.get_subscription(tenant_id, subscription_id).await
-            }
-            None => Ok(None),
+        let mut tx = self.pool.begin().await?;
+        let previous = sqlx::query(
+            "SELECT status,plan_id FROM subscriptions WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(previous) = previous else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let from_status: String = previous.get("status");
+        let from_plan: Uuid = previous.get("plan_id");
+        let row = sqlx::query("UPDATE subscriptions SET plan_id=COALESCE($3,plan_id),status=COALESCE($4,status),starts_at=COALESCE($5::timestamptz,starts_at),updated_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING id")
+            .bind(tenant_id).bind(id).bind(input.plan_id).bind(&input.status).bind(&input.starts_at).fetch_one(&mut *tx).await?;
+        let subscription_id: Uuid = row.get("id");
+        let record_row = sqlx::query("SELECT s.id,u.email AS user_email,p.name AS plan,s.status,s.traffic_used_bytes,s.traffic_quota_bytes,s.expires_at::text AS expires_at,s.subscription_token,s.subscription_token_version FROM subscriptions s JOIN users u ON u.tenant_id=s.tenant_id AND u.id=s.user_id JOIN plans p ON p.tenant_id=s.tenant_id AND p.id=s.plan_id WHERE s.tenant_id=$1 AND s.id=$2")
+            .bind(tenant_id).bind(subscription_id).fetch_one(&mut *tx).await?;
+        let record = SubscriptionRecord::from_row(record_row);
+        if let Some(to_status) = input.status.as_deref().filter(|to| *to != from_status) {
+            Self::insert_audit_in_tx(
+                &mut tx,
+                tenant_id,
+                actor_user_id,
+                "subscription.status_change",
+                "subscription",
+                id,
+                &serde_json::json!({"from":from_status,"to":to_status}),
+            )
+            .await?;
         }
+        if let Some(to_plan) = input.plan_id.filter(|to| *to != from_plan) {
+            Self::insert_audit_in_tx(
+                &mut tx,
+                tenant_id,
+                actor_user_id,
+                "subscription.plan_change",
+                "subscription",
+                id,
+                &serde_json::json!({"fromPlanId":from_plan,"toPlanId":to_plan}),
+            )
+            .await?;
+        }
+        if input.starts_at.is_some() {
+            Self::insert_audit_in_tx(
+                &mut tx,
+                tenant_id,
+                actor_user_id,
+                "subscription.update",
+                "subscription",
+                id,
+                &serde_json::json!({"fields":["startsAt"]}),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(Some(record))
     }
 
-    pub async fn delete_subscription(&self, tenant_id: Uuid, id: Uuid) -> DatabaseResult<bool> {
+    pub async fn delete_subscription(
+        &self,
+        tenant_id: Uuid,
+        actor_user_id: Uuid,
+        id: Uuid,
+    ) -> DatabaseResult<bool> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query("UPDATE subscriptions SET status='revoked',updated_at=now() WHERE tenant_id=$1 AND id=$2 AND status <> 'revoked'")
-            .bind(tenant_id).bind(id).execute(&self.pool).await?;
-        Ok(result.rows_affected() == 1)
+            .bind(tenant_id).bind(id).execute(&mut *tx).await?;
+        if result.rows_affected() == 1 {
+            Self::insert_audit_in_tx(
+                &mut tx,
+                tenant_id,
+                actor_user_id,
+                "subscription.delete",
+                "subscription",
+                id,
+                &serde_json::json!({}),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(true)
+        } else {
+            tx.rollback().await?;
+            Ok(false)
+        }
     }
 
     pub async fn rotate_subscription_token(
@@ -1147,25 +1481,6 @@ impl Database {
         .await?;
         tx.commit().await?;
         Ok(true)
-    }
-
-    async fn get_subscription(
-        &self,
-        tenant_id: Uuid,
-        id: Uuid,
-    ) -> DatabaseResult<Option<SubscriptionRecord>> {
-        let row = sqlx::query(
-            "SELECT s.id,u.email AS user_email,p.name AS plan,s.status,s.traffic_used_bytes,
-                    s.traffic_quota_bytes,s.expires_at::text AS expires_at,s.subscription_token,s.subscription_token_version
-             FROM subscriptions s JOIN users u ON u.tenant_id=s.tenant_id AND u.id=s.user_id
-             JOIN plans p ON p.tenant_id=s.tenant_id AND p.id=s.plan_id
-             WHERE s.tenant_id=$1 AND s.id=$2",
-        )
-        .bind(tenant_id)
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(SubscriptionRecord::from_row))
     }
 
     pub async fn subscription_token_active(

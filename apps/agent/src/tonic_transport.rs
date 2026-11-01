@@ -1,4 +1,6 @@
-use std::{fs, path::Path, time::Duration};
+#![allow(clippy::result_large_err)]
+
+use std::{fs, time::Duration};
 
 use cyberboard_agent_protocol::generated::{
     DesiredStateResponse, GetDesiredStateRequest, GetReleaseManifestRequest, HeartbeatRequest,
@@ -62,11 +64,15 @@ impl TonicAgentTransport {
         })
     }
 
-    pub async fn heartbeat(&mut self, request: HeartbeatRequest) -> Result<(), Status> {
-        self.client
+    pub async fn heartbeat_response(
+        &mut self,
+        request: HeartbeatRequest,
+    ) -> Result<cyberboard_agent_protocol::generated::HeartbeatResponse, Status> {
+        Ok(self
+            .client
             .heartbeat(Request::new(request))
-            .await
-            .map(|_| ())
+            .await?
+            .into_inner())
     }
 
     pub async fn register(&mut self, request: RegisterAgentRequest) -> Result<String, Status> {
@@ -115,9 +121,5 @@ impl TonicAgentTransport {
             .report_upgrade_result(Request::new(request))
             .await
             .map(|_| ())
-    }
-
-    pub fn config_path_exists(path: &Path) -> bool {
-        path.exists()
     }
 }

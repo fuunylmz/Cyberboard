@@ -2,10 +2,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
 };
 
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
+use argon2::{Argon2, PasswordHash, PasswordVerifier, password_hash::PasswordHasher};
 use axum::{
     Json, Router,
     extract::{Extension, Path, Query, State},
@@ -22,7 +22,7 @@ use cyberboard_database::hash_session_token;
 use cyberboard_database::{
     ConfigRevisionRecord, ConfigTemplateInput, ConfigTemplateRecord, ConfigTemplateUpdate,
     Database, NodeInput, NodeRecord, NodeUpdate, PlanInput, PlanRecord, PlanUpdate,
-    SubscriptionInput, SubscriptionRecord, SubscriptionUpdate, UserRecord,
+    SubscriptionInput, SubscriptionRecord, SubscriptionUpdate, UserCredentials, UserRecord,
 };
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 use uuid::Uuid;
 
+mod admin_bootstrap;
 mod agent_control;
 
 const DEMO_ACCESS_TOKEN: &str = "cyberboard-dev-token";
@@ -51,10 +52,7 @@ struct AppState {
 }
 
 #[derive(Clone, Debug)]
-struct PortalIdentity {
-    user_id: String,
-    email: String,
-}
+struct PortalIdentity;
 
 #[derive(Clone, Debug)]
 struct AuthIdentity {
@@ -212,10 +210,7 @@ impl AppState {
     fn portal_identity(&self, headers: &HeaderMap) -> Option<PortalIdentity> {
         let token = self.bearer_token(headers)?;
         if token == self.demo_portal_access_token.as_ref() {
-            return Some(PortalIdentity {
-                user_id: "demo-user".to_owned(),
-                email: self.config.demo_user_email.clone(),
-            });
+            return Some(PortalIdentity);
         }
         self.portal_sessions.read().ok()?.get(&token).cloned()
     }
@@ -370,7 +365,7 @@ fn internal_database_response() -> Response {
 }
 
 fn hash_password(password: &str) -> Result<String, Response> {
-    use argon2::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
+    use argon2::password_hash::{SaltString, rand_core::OsRng};
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
@@ -378,43 +373,57 @@ fn hash_password(password: &str) -> Result<String, Response> {
         .map_err(|_| internal_database_response())
 }
 
-async fn credentials_match(
+fn dummy_password_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| {
+        use argon2::password_hash::{SaltString, rand_core::OsRng};
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(b"cyberboard-invalid-account-dummy", &salt)
+            .expect("default Argon2 parameters must hash the dummy password")
+            .to_string()
+    })
+}
+
+fn password_hash_matches(password: &str, password_hash: &str) -> bool {
+    PasswordHash::new(password_hash).ok().is_some_and(|hash| {
+        Argon2::default()
+            .verify_password(password.as_bytes(), &hash)
+            .is_ok()
+    })
+}
+
+async fn database_credentials_match(
+    database: &Database,
+    tenant_id: Uuid,
+    email: &str,
+    password: &str,
+    require_admin: bool,
+) -> Option<UserCredentials> {
+    let credentials = database
+        .find_user_credentials(tenant_id, email)
+        .await
+        .ok()?;
+    let hash = credentials
+        .as_ref()
+        .map_or_else(|| dummy_password_hash(), |user| user.password_hash.as_str());
+    let password_matches = password_hash_matches(password, hash);
+    credentials.filter(|user| {
+        password_matches && user.status == "active" && role_allowed(&user.roles, require_admin)
+    })
+}
+
+fn credentials_match(
     state: &AppState,
     email: &str,
     password: &str,
     fallback_email: &str,
     fallback_password: &str,
-    require_admin: bool,
 ) -> bool {
-    if let Some(database) = state.database.as_ref() {
-        let credentials = match database
-            .find_user_credentials(state.config.tenant_id, email)
-            .await
-        {
-            Ok(Some(credentials)) => credentials,
-            Ok(None) => {
-                return state.config.dev_mode
-                    && email == fallback_email
-                    && password == fallback_password;
-            }
-            Err(_) => return false,
-        };
-        if credentials.status != "active" {
-            return false;
-        }
-        if !role_allowed(&credentials.roles, require_admin) {
-            return false;
-        }
-        return PasswordHash::new(&credentials.password_hash)
-            .ok()
-            .is_some_and(|hash| {
-                Argon2::default()
-                    .verify_password(password.as_bytes(), &hash)
-                    .is_ok()
-            });
-    }
-
-    state.config.dev_mode && email == fallback_email && password == fallback_password
+    state.database.is_none()
+        && state.config.dev_mode
+        && email == fallback_email
+        && password == fallback_password
 }
 
 fn role_allowed(roles: &[String], require_admin: bool) -> bool {
@@ -504,48 +513,60 @@ fn new_access_token(role: &str) -> String {
 }
 
 async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>) -> Response {
-    if !credentials_match(
-        &state,
-        &request.email,
-        &request.password,
-        &state.config.demo_admin_email,
-        &state.config.demo_admin_password,
-        true,
-    )
-    .await
-    {
-        return invalid_credentials_response();
-    }
     let mut refresh_token_response = None;
-    let access_token = if state.database.is_some() {
-        new_access_token("admin")
-    } else {
-        state.demo_access_token.to_string()
-    };
-    if let Some(database) = state.database.as_ref() {
-        if let Ok(Some(user)) = database
-            .find_user_credentials(state.config.tenant_id, &request.email)
+    let (access_token, user) = if let Some(database) = state.database.as_ref() {
+        let Some(credentials) = database_credentials_match(
+            database,
+            state.config.tenant_id,
+            &request.email,
+            &request.password,
+            true,
+        )
+        .await
+        else {
+            return invalid_credentials_response();
+        };
+        let access_token = new_access_token("admin");
+        let refresh_token = new_refresh_token();
+        refresh_token_response = Some(refresh_token.clone());
+        if database
+            .create_session_with_refresh(
+                state.config.tenant_id,
+                credentials.id,
+                &access_token,
+                &refresh_token,
+                "admin",
+                ACCESS_TOKEN_TTL_SECS,
+                REFRESH_TOKEN_TTL_SECS,
+            )
             .await
+            .is_err()
         {
-            let refresh_token = new_refresh_token();
-            refresh_token_response = Some(refresh_token.clone());
-            if database
-                .create_session_with_refresh(
-                    state.config.tenant_id,
-                    user.id,
-                    &access_token,
-                    &refresh_token,
-                    "admin",
-                    ACCESS_TOKEN_TTL_SECS,
-                    REFRESH_TOKEN_TTL_SECS,
-                )
-                .await
-                .is_err()
-            {
-                return internal_database_response();
-            }
+            return internal_database_response();
         }
-    }
+        let user = SessionUserResponse {
+            id: credentials.id.to_string(),
+            email: credentials.email,
+            display_name: credentials.display_name,
+            roles: credentials.roles,
+            permissions: vec!["*".to_owned()],
+        };
+        (access_token, user)
+    } else {
+        if !credentials_match(
+            &state,
+            &request.email,
+            &request.password,
+            &state.config.demo_admin_email,
+            &state.config.demo_admin_password,
+        ) {
+            return invalid_credentials_response();
+        }
+        (
+            state.demo_access_token.to_string(),
+            demo_user(&state.config),
+        )
+    };
 
     Json(LoginResponse {
         access_token,
@@ -556,7 +577,7 @@ async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>)
             DEMO_TOKEN_EXPIRES_IN
         },
         refresh_token: refresh_token_response,
-        user: demo_user(&state.config),
+        user,
     })
     .into_response()
 }
@@ -565,40 +586,22 @@ async fn portal_login(
     State(state): State<AppState>,
     Json(request): Json<PortalLoginRequest>,
 ) -> Response {
-    if !credentials_match(
-        &state,
-        &request.email,
-        &request.password,
-        &state.config.demo_user_email,
-        &state.config.demo_user_password,
-        false,
-    )
-    .await
-    {
-        return invalid_credentials_response();
-    }
-
     let mut refresh_token_response = None;
     let (access_token, portal_user) = if let Some(database) = state.database.as_ref() {
-        let credentials = match database
-            .find_user_credentials(state.config.tenant_id, &request.email)
-            .await
-        {
-            Ok(Some(value)) => value,
-            _ => return invalid_credentials_response(),
+        let Some(credentials) = database_credentials_match(
+            database,
+            state.config.tenant_id,
+            &request.email,
+            &request.password,
+            false,
+        )
+        .await
+        else {
+            return invalid_credentials_response();
         };
         let token = new_access_token("portal");
         let refresh_token = new_refresh_token();
         refresh_token_response = Some(refresh_token.clone());
-        if let Ok(mut sessions) = state.portal_sessions.write() {
-            sessions.insert(
-                token.clone(),
-                PortalIdentity {
-                    user_id: credentials.id.to_string(),
-                    email: credentials.email.clone(),
-                },
-            );
-        }
         if database
             .create_session_with_refresh(
                 state.config.tenant_id,
@@ -614,17 +617,24 @@ async fn portal_login(
         {
             return internal_database_response();
         }
-        (
-            token,
-            SessionUserResponse {
-                id: credentials.id.to_string(),
-                email: credentials.email,
-                display_name: credentials.display_name,
-                roles: vec!["user".to_owned()],
-                permissions: vec!["subscription:read".to_owned()],
-            },
-        )
+        let user = SessionUserResponse {
+            id: credentials.id.to_string(),
+            email: credentials.email,
+            display_name: credentials.display_name,
+            roles: vec!["user".to_owned()],
+            permissions: vec!["subscription:read".to_owned()],
+        };
+        (token, user)
     } else {
+        if !credentials_match(
+            &state,
+            &request.email,
+            &request.password,
+            &state.config.demo_user_email,
+            &state.config.demo_user_password,
+        ) {
+            return invalid_credentials_response();
+        }
         (
             state.demo_portal_access_token.to_string(),
             demo_portal_user(&state.config),
@@ -711,8 +721,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
         let _ = database
             .revoke_session(state.config.tenant_id, &token)
             .await;
-    }
-    if let Ok(mut sessions) = state.portal_sessions.write() {
+    } else if let Ok(mut sessions) = state.portal_sessions.write() {
         sessions.remove(&token);
     }
     StatusCode::NO_CONTENT.into_response()
@@ -3126,6 +3135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let database = Database::connect(database_url).await?;
         database.migrate().await?;
         database.ensure_tenant(config.tenant_id).await?;
+        admin_bootstrap::run(&database, &config).await?;
         Some(Arc::new(database))
     } else {
         None
@@ -3235,6 +3245,178 @@ mod tests {
         assert_eq!(body["message"], "套餐不存在或已下架");
     }
 
+    async fn app_json_request(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        authorization: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(authorization) = authorization {
+            builder = builder.header(header::AUTHORIZATION, authorization);
+        }
+        let request_body = if let Some(body) = body {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            Body::from(body.to_string())
+        } else {
+            Body::empty()
+        };
+        let response = app
+            .clone()
+            .oneshot(builder.body(request_body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn database_authentication_uses_persisted_users_and_sessions() {
+        let Some(database_url) = std::env::var("CYBERBOARD_DATABASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!("skipped API database auth test: CYBERBOARD_DATABASE_URL is not set");
+            return;
+        };
+        let database = cyberboard_database::Database::connect(&database_url)
+            .await
+            .expect("connect postgres");
+        database.migrate().await.expect("apply migrations");
+        let tenant_id = Uuid::new_v4();
+        database
+            .ensure_tenant(tenant_id)
+            .await
+            .expect("create test tenant");
+        let admin_password = "admin-password-for-api-test";
+        let admin_hash = match super::hash_password(admin_password) {
+            Ok(hash) => hash,
+            Err(_) => panic!("hash admin test password"),
+        };
+        let admin_id = database
+            .bootstrap_admin(tenant_id, "real-admin@example.com", &admin_hash)
+            .await
+            .expect("bootstrap API test admin")
+            .expect("new test admin");
+
+        let state = super::AppState::with_database(
+            ApiConfig {
+                bind_addr: "127.0.0.1".to_owned(),
+                port: 8080,
+                agent_grpc_addr: "127.0.0.1:9090".to_owned(),
+                agent_grpc_server_cert: None,
+                agent_grpc_server_key: None,
+                agent_grpc_client_ca: None,
+                database_url: Some(database_url),
+                redis_url: None,
+                demo_admin_email: "admin@example.com".to_owned(),
+                demo_admin_password: "password".to_owned(),
+                demo_user_email: "lin@example.com".to_owned(),
+                demo_user_password: "password".to_owned(),
+                bootstrap_admin: None,
+                dev_mode: true,
+                tenant_id,
+            },
+            Some(std::sync::Arc::new(database)),
+        );
+        let portal_sessions = state.portal_sessions.clone();
+        let app = router(state);
+        let (status, login) = app_json_request(
+            &app,
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            Some(serde_json::json!({"email":"real-admin@example.com","password":admin_password})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(login["user"]["id"], admin_id.to_string());
+        assert_eq!(login["user"]["email"], "real-admin@example.com");
+        assert_eq!(login["user"]["displayName"], "real-admin@example.com");
+        let admin_token = login["accessToken"].as_str().expect("admin access token");
+        let (status, _) = app_json_request(
+            &app,
+            "GET",
+            "/api/v1/admin/dashboard",
+            Some(&format!("Bearer {admin_token}")),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = app_json_request(
+            &app,
+            "POST",
+            "/api/v1/admin/users",
+            Some(&format!("Bearer {admin_token}")),
+            Some(serde_json::json!({
+                "email":"portal-user@example.com",
+                "password":"portal-user-password",
+                "displayName":"Portal User"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        for (uri, email, password) in [
+            (
+                "/api/v1/auth/login",
+                "real-admin@example.com",
+                "wrong-password",
+            ),
+            (
+                "/api/v1/auth/login",
+                "missing@example.com",
+                "wrong-password",
+            ),
+            ("/api/v1/auth/login", "admin@example.com", "password"),
+            ("/api/v1/auth/portal-login", "lin@example.com", "password"),
+            (
+                "/api/v1/auth/portal-login",
+                "real-admin@example.com",
+                admin_password,
+            ),
+        ] {
+            let (status, _) = app_json_request(
+                &app,
+                "POST",
+                uri,
+                None,
+                Some(serde_json::json!({"email":email,"password":password})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} for {email}");
+        }
+
+        let (status, portal_login) = app_json_request(
+            &app,
+            "POST",
+            "/api/v1/auth/portal-login",
+            None,
+            Some(serde_json::json!({
+                "email":"portal-user@example.com",
+                "password":"portal-user-password"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(portal_login["user"]["email"], "portal-user@example.com");
+        assert!(portal_sessions.read().unwrap().is_empty());
+        let portal_token = portal_login["accessToken"].as_str().expect("portal token");
+        let (status, _) = app_json_request(
+            &app,
+            "GET",
+            "/api/v1/admin/dashboard",
+            Some(&format!("Bearer {portal_token}")),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
     fn test_state() -> super::AppState {
         super::AppState::with_token(
             ApiConfig {
@@ -3250,6 +3432,7 @@ mod tests {
                 demo_admin_password: "password".to_owned(),
                 demo_user_email: "lin@example.com".to_owned(),
                 demo_user_password: "password".to_owned(),
+                bootstrap_admin: None,
                 dev_mode: true,
                 tenant_id: uuid::Uuid::from_u128(1),
             },

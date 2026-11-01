@@ -1,8 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -12,7 +12,7 @@ use cyberboard_agent_protocol::generated::{
 };
 use cyberboard_config::AgentConfig;
 use cyberboard_config_compiler::{SignedConfigEnvelope, hex_hash};
-use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand_core::OsRng;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{info, warn};
@@ -21,9 +21,131 @@ mod identity;
 mod runtime;
 mod tonic_transport;
 
+#[cfg(unix)]
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn new() -> Result<Self, std::io::Error> {
+        Ok(Self {
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
+    async fn recv(&mut self) {
+        tokio::select! { _ = self.interrupt.recv() => {}, _ = self.terminate.recv() => {} }
+    }
+}
+
+#[cfg(not(unix))]
+struct ShutdownSignals {
+    ctrl_c: Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send>>,
+}
+
+#[cfg(not(unix))]
+impl ShutdownSignals {
+    fn new() -> Self {
+        Self {
+            ctrl_c: Box::pin(tokio::signal::ctrl_c()),
+        }
+    }
+    async fn recv(&mut self) {
+        let _ = self.ctrl_c.as_mut().await;
+    }
+}
+
+struct RestartBackoff {
+    delay: Duration,
+    next_restart_at: Option<Instant>,
+    healthy_since: Option<Instant>,
+}
+
+impl RestartBackoff {
+    fn new(now: Instant) -> Self {
+        Self {
+            delay: Duration::from_secs(1),
+            next_restart_at: None,
+            healthy_since: Some(now),
+        }
+    }
+    fn on_crash(&mut self, now: Instant) -> Instant {
+        self.healthy_since = None;
+        *self.next_restart_at.get_or_insert(now + self.delay)
+    }
+    fn restart_due(&self, now: Instant) -> bool {
+        self.next_restart_at.is_some_and(|deadline| now >= deadline)
+    }
+    fn on_restart_failed(&mut self, now: Instant) {
+        self.delay = (self.delay * 2).min(Duration::from_secs(60));
+        self.next_restart_at = Some(now + self.delay);
+        self.healthy_since = None;
+    }
+    fn on_restart_started(&mut self, now: Instant) {
+        self.next_restart_at = None;
+        self.healthy_since = Some(now);
+    }
+    fn on_supervisor_tick(&mut self, now: Instant) {
+        if self
+            .healthy_since
+            .is_some_and(|since| now.duration_since(since) >= Duration::from_secs(60))
+        {
+            self.delay = Duration::from_secs(1);
+        }
+    }
+}
+
+struct ReconcileContext<'a> {
+    node_id: &'a str,
+    agent_id: &'a str,
+    public_key: &'a str,
+    core_versions: &'a [String],
+    trusted_key: Option<&'a VerifyingKey>,
+}
+
+#[derive(Default)]
+struct ReconcileState {
+    pending: HashMap<(u64, String, String), ReportApplyResultRequest>,
+    pending_order: VecDeque<(u64, String, String)>,
+    reported_rejections: HashSet<(u64, String, String)>,
+    terminal: HashSet<(u64, String)>,
+}
+
+impl ReconcileState {
+    fn queue(&mut self, report: ReportApplyResultRequest, key: (u64, String, String)) {
+        const MAX_PENDING: usize = 64;
+        if !self.pending.contains_key(&key) {
+            if self.pending.len() == MAX_PENDING {
+                if let Some(oldest) = self.pending_order.pop_front() {
+                    if let Some(dropped) = self.pending.remove(&oldest) {
+                        warn!(generation = %dropped.generation, phase = %dropped.phase, "dropping oldest apply report after pending queue reached capacity");
+                    }
+                }
+            }
+            self.pending_order.push_back(key.clone());
+        }
+        self.pending.insert(key, report);
+    }
+}
+
+fn core_version_list(line: Option<String>) -> Vec<String> {
+    line.and_then(|line| {
+        line.strip_prefix("sing-box version ")
+            .map(|version| format!("sing-box/{version}"))
+    })
+    .map(|version| vec![version])
+    .unwrap_or_default()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     cyberboard_observability::init("cyberboard_agent");
+    #[cfg(unix)]
+    let mut shutdown = ShutdownSignals::new()?;
+    #[cfg(not(unix))]
+    let mut shutdown = ShutdownSignals::new();
     let mut config = AgentConfig::from_env()?;
     let stored_identity = identity::AgentIdentity::load(&config.identity_path)?;
     if let Some(identity) = stored_identity.as_ref() {
@@ -74,11 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await;
     core.initialize().await?;
-    let core_versions = core
-        .check_version()
-        .await
-        .map(|v| vec![v])
-        .unwrap_or_default();
+    let core_versions = core_version_list(core.check_version().await);
     let mut transport = None;
     if transport_configured {
         match tonic_transport::TonicAgentTransport::connect_with_backoff(&config, 5).await {
@@ -124,26 +242,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut supervisor_ticker = interval(Duration::from_secs(2));
     supervisor_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut pending: HashMap<(u64, String), ReportApplyResultRequest> = HashMap::new();
-    let mut terminal: HashSet<(u64, String)> = HashSet::new();
-    let mut backoff = Duration::from_secs(1);
-    let mut healthy_since = Some(std::time::Instant::now());
-    let mut crashed_since = None;
+    let mut reconcile_state = ReconcileState::default();
+    let mut restart = RestartBackoff::new(Instant::now());
+    if core.core_state() != "running" {
+        restart.healthy_since = None;
+        restart.next_restart_at = Some(Instant::now());
+    }
     loop {
         tokio::select! {
             _ = supervisor_ticker.tick() => {
                 core.supervise_once().await;
-                if core.core_state() == "running" {
-                    if healthy_since.is_some_and(|since| since.elapsed() >= Duration::from_secs(60)) { backoff = Duration::from_secs(1); }
-                } else if core.core_state() == "crashed" {
-                    let crashed = *crashed_since.get_or_insert_with(std::time::Instant::now);
-                    healthy_since = None;
-                    tokio::time::sleep(backoff).await;
-                    match core.restart().await {
-                        Ok(true) => { healthy_since = Some(std::time::Instant::now()); crashed_since = None; }
-                        _ => { backoff = (backoff * 2).min(Duration::from_secs(60)); }
+                let now = Instant::now();
+                restart.on_supervisor_tick(now);
+                if core.core_state() == "crashed" {
+                    restart.on_crash(now);
+                    if restart.restart_due(now) {
+                        match core.restart().await {
+                            Ok(()) => restart.on_restart_started(Instant::now()),
+                            Err(_) => restart.on_restart_failed(Instant::now()),
+                        }
                     }
-                    if crashed.elapsed() >= Duration::from_secs(60) { backoff = Duration::from_secs(1); }
                 }
             }
             _ = ticker.tick() => {
@@ -153,12 +271,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 if let Some((client, id)) = transport.as_mut() {
-                    let outcome = reconcile_once(client, &mut core, trusted_key.as_ref(), &node_id, id, &public_key, &core_versions, &mut pending, &mut terminal).await;
+                    let context = ReconcileContext { node_id: &node_id, agent_id: id, public_key: &public_key, core_versions: &core_versions, trusted_key: trusted_key.as_ref() };
+                    let outcome = reconcile_once(client, &mut core, &context, &mut reconcile_state).await;
                     if let Err(error) = outcome { warn!(%error, "agent reconciliation failed"); transport = None; }
                 }
             }
-            signal = shutdown_signal() => {
-                if let Err(error) = signal { warn!(%error, "shutdown signal error"); }
+            _ = shutdown.recv() => {
                 info!("shutdown signal received");
                 core.shutdown().await;
                 break;
@@ -208,18 +326,24 @@ impl AgentTransport for tonic_transport::TonicAgentTransport {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn reconcile_once<T: AgentTransport>(
     client: &mut T,
     core: &mut runtime::CoreSupervisor,
-    trusted_key: Option<&VerifyingKey>,
-    node_id: &str,
-    agent_id: &str,
-    public_key: &str,
-    core_versions: &[String],
-    pending: &mut HashMap<(u64, String), ReportApplyResultRequest>,
-    terminal: &mut HashSet<(u64, String)>,
+    context: &ReconcileContext<'_>,
+    reports: &mut ReconcileState,
 ) -> Result<(), String> {
+    let ReconcileContext {
+        node_id,
+        agent_id,
+        public_key,
+        core_versions,
+        trusted_key,
+    } = context;
+    let node_id = *node_id;
+    let agent_id = *agent_id;
+    let public_key = *public_key;
+    let core_versions = *core_versions;
+    let trusted_key = *trusted_key;
     let now = unix_now();
     let state = core.state().clone();
     let heartbeat = HeartbeatRequest {
@@ -282,14 +406,18 @@ async fn reconcile_once<T: AgentTransport>(
                 .await;
         }
     }
-    for key in pending.keys().cloned().collect::<Vec<_>>() {
-        if let Some(report) = pending.get_mut(&key) {
-            report.retry_count = report.retry_count.saturating_add(1);
-            let delivered = client.report_apply(report.clone()).await.is_ok();
-            let exhausted = !delivered && report.retry_count >= 2;
-            if delivered || exhausted {
-                pending.remove(&key);
-                terminal.insert(key);
+    for key in reports.pending.keys().cloned().collect::<Vec<_>>() {
+        if let Some(report) = reports.pending.get(&key).cloned() {
+            if client.report_apply(report.clone()).await.is_ok() {
+                reports.pending.remove(&key);
+                reports
+                    .pending_order
+                    .retain(|pending_key| pending_key != &key);
+                if report.phase == "rejected" {
+                    reports.reported_rejections.insert(key);
+                } else {
+                    reports.terminal.insert((key.0, key.1));
+                }
             }
         }
     }
@@ -313,23 +441,47 @@ async fn reconcile_once<T: AgentTransport>(
     let envelope: SignedConfigEnvelope = match serde_json::from_slice(&response.signed_config) {
         Ok(value) => value,
         Err(_) => {
-            return report_rejection(
-                client,
-                response,
-                node_id,
-                agent_id,
-                public_key,
-                state,
-                "invalid_envelope",
-                pending,
-                terminal,
-            )
-            .await;
+            let generation = response
+                .generation
+                .parse()
+                .unwrap_or(response.generation_number);
+            let key = (
+                generation,
+                if response.content_hash.is_empty() {
+                    hex_hash(&response.signed_config)
+                } else {
+                    response.content_hash.clone()
+                },
+                "invalid_envelope".to_owned(),
+            );
+            if !reports.reported_rejections.contains(&key) && !reports.pending.contains_key(&key) {
+                let report = ReportApplyResultRequest {
+                    agent_id: (*agent_id).into(),
+                    node_id: (*node_id).into(),
+                    generation: response.generation,
+                    previous_hash: state.content_hash.clone(),
+                    applied_hash: state.content_hash.clone(),
+                    phase: "rejected".into(),
+                    error_code: "invalid_envelope".into(),
+                    error_message: "signed desired state envelope is invalid".into(),
+                    retry_count: 0,
+                    unix_time: unix_now(),
+                    expected_previous_hash: response.expected_previous_hash,
+                    compare_and_swap_ok: true,
+                    agent_public_key: (*public_key).into(),
+                };
+                if client.report_apply(report.clone()).await.is_ok() {
+                    reports.reported_rejections.insert(key);
+                } else {
+                    reports.queue(report, key);
+                }
+            }
+            return Ok(());
         }
     };
     let hash = hex_hash(&envelope.payload);
     let pair = (envelope.generation, hash.clone());
-    if terminal.contains(&pair) || pending.contains_key(&pair) {
+    if reports.terminal.contains(&pair) {
         return Ok(());
     }
     let rejection = validate_envelope(&envelope, &response, node_id, trusted_key, unix_now());
@@ -395,53 +547,24 @@ async fn reconcile_once<T: AgentTransport>(
         agent_public_key: public_key.into(),
     };
     let pair = (envelope.generation, hash);
-    if client.report_apply(report.clone()).await.is_err() {
-        pending.insert(pair, report);
+    let report_key = (
+        envelope.generation,
+        pair.1.clone(),
+        report.error_code.clone(),
+    );
+    if phase == "rejected" {
+        if reports.reported_rejections.contains(&report_key)
+            || reports.pending.contains_key(&report_key)
+        {
+            return Ok(());
+        }
     } else {
-        terminal.insert(pair);
+        reports.terminal.insert(pair);
     }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn report_rejection<T: AgentTransport>(
-    client: &mut T,
-    response: DesiredStateResponse,
-    node_id: &str,
-    agent_id: &str,
-    public_key: &str,
-    state: runtime::AppliedState,
-    code: &str,
-    pending: &mut HashMap<(u64, String), ReportApplyResultRequest>,
-    terminal: &mut HashSet<(u64, String)>,
-) -> Result<(), String> {
-    let generation = response
-        .generation
-        .parse::<u64>()
-        .unwrap_or(response.generation_number);
-    let key = (generation, response.content_hash.clone());
-    if terminal.contains(&key) || pending.contains_key(&key) {
-        return Ok(());
-    }
-    let report = ReportApplyResultRequest {
-        agent_id: agent_id.into(),
-        node_id: node_id.into(),
-        generation: response.generation,
-        previous_hash: state.content_hash.clone(),
-        applied_hash: state.content_hash,
-        phase: "rejected".into(),
-        error_code: code.into(),
-        error_message: "signed desired state envelope is invalid".into(),
-        retry_count: 0,
-        unix_time: unix_now(),
-        expected_previous_hash: response.expected_previous_hash,
-        compare_and_swap_ok: true,
-        agent_public_key: public_key.into(),
-    };
     if client.report_apply(report.clone()).await.is_err() {
-        pending.insert(key, report);
-    } else {
-        terminal.insert(key);
+        reports.queue(report, report_key);
+    } else if phase == "rejected" {
+        reports.reported_rejections.insert(report_key);
     }
     Ok(())
 }
@@ -453,20 +576,30 @@ fn validate_envelope(
     key: Option<&VerifyingKey>,
     now: i64,
 ) -> Option<&'static str> {
-    let hash = hex_hash(&envelope.payload);
-    if hash != envelope.content_hash
-        || (!response.content_hash.is_empty() && response.content_hash != envelope.content_hash)
-    {
+    if !response.content_hash.is_empty() && response.content_hash != envelope.content_hash {
         return Some("content_hash_mismatch");
     }
     let Some(key) = key else {
         return Some("signature_invalid");
     };
-    let Ok(signature) = Signature::from_slice(&envelope.signature) else {
-        return Some("signature_invalid");
-    };
-    if key.verify(&envelope.canonical_bytes(), &signature).is_err() {
-        return Some("signature_invalid");
+    match envelope.verify_with_skew(key, now, 60) {
+        Ok(()) => {}
+        Err(cyberboard_config_compiler::CompileError::InvalidEnvelope) => {
+            return Some("invalid_envelope");
+        }
+        Err(cyberboard_config_compiler::CompileError::ContentHashMismatch) => {
+            return Some("content_hash_mismatch");
+        }
+        Err(cyberboard_config_compiler::CompileError::SignatureMismatch) => {
+            return Some("signature_invalid");
+        }
+        Err(cyberboard_config_compiler::CompileError::EnvelopeNotYetValid) => {
+            return Some("envelope_not_yet_valid");
+        }
+        Err(cyberboard_config_compiler::CompileError::EnvelopeExpired) => {
+            return Some("envelope_expired");
+        }
+        Err(_) => return Some("invalid_envelope"),
     }
     if envelope.target_node.to_string() != node_id {
         return Some("target_mismatch");
@@ -475,12 +608,6 @@ fn validate_envelope(
         || (response.generation_number != 0 && response.generation_number != envelope.generation)
     {
         return Some("generation_mismatch");
-    }
-    if envelope.issued_at > now.saturating_add(60) {
-        return Some("envelope_not_yet_valid");
-    }
-    if envelope.expires_at < now.saturating_sub(60) || envelope.expires_at < envelope.issued_at {
-        return Some("envelope_expired");
     }
     None
 }
@@ -520,16 +647,75 @@ fn validate_release_manifest(
     }
     Ok(())
 }
-async fn shutdown_signal() -> Result<(), std::io::Error> {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! { result = tokio::signal::ctrl_c() => result, _ = terminate.recv() => Ok(()) }
+#[cfg(test)]
+mod restart_backoff_tests {
+    use super::RestartBackoff;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn pending_report_queue_is_bounded_and_evicts_oldest() {
+        let mut state = super::ReconcileState::default();
+        for generation in 0..65 {
+            let report = cyberboard_agent_protocol::generated::ReportApplyResultRequest {
+                generation: generation.to_string(),
+                applied_hash: format!("hash-{generation}"),
+                phase: "failed".into(),
+                ..Default::default()
+            };
+            state.queue(
+                report,
+                (generation, format!("hash-{generation}"), String::new()),
+            );
+        }
+        assert_eq!(state.pending.len(), 64);
+        assert!(
+            !state
+                .pending
+                .contains_key(&(0, "hash-0".into(), String::new()))
+        );
+        assert!(
+            state
+                .pending
+                .contains_key(&(64, "hash-64".into(), String::new()))
+        );
     }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await
+
+    #[test]
+    fn formats_sing_box_version_for_heartbeat() {
+        assert_eq!(
+            super::core_version_list(Some("sing-box version 1.14.4".into())),
+            ["sing-box/1.14.4"]
+        );
+        assert!(super::core_version_list(None).is_empty());
+    }
+
+    #[test]
+    fn backoff_doubles_caps_and_resets_after_healthy_uptime() {
+        let start = Instant::now();
+        let mut policy = RestartBackoff::new(start);
+        let first = policy.on_crash(start);
+        assert_eq!(first.duration_since(start), Duration::from_secs(1));
+        policy.on_restart_failed(first);
+        assert_eq!(policy.delay, Duration::from_secs(2));
+        let second = policy.on_crash(first);
+        policy.on_restart_failed(second);
+        assert_eq!(policy.delay, Duration::from_secs(4));
+        let mut now = second;
+        for _ in 0..8 {
+            let deadline = policy.on_crash(now);
+            policy.on_restart_failed(deadline);
+            now = deadline;
+        }
+        assert_eq!(policy.delay, Duration::from_secs(60));
+        policy.on_restart_started(now);
+        policy.on_supervisor_tick(now + Duration::from_secs(59));
+        assert_eq!(policy.delay, Duration::from_secs(60));
+        policy.on_crash(now + Duration::from_secs(59));
+        policy.on_supervisor_tick(now + Duration::from_secs(120));
+        assert_eq!(policy.delay, Duration::from_secs(60));
+        policy.on_restart_started(now + Duration::from_secs(121));
+        policy.on_supervisor_tick(now + Duration::from_secs(181));
+        assert_eq!(policy.delay, Duration::from_secs(1));
     }
 }
 
@@ -595,6 +781,379 @@ mod reconciliation_tests {
         path
     }
 
+    #[test]
+    fn trust_validation_uses_library_precedence_and_skew_boundaries() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let key = signing.verifying_key();
+        let node = uuid::Uuid::from_u128(44);
+        let now = 1_000;
+        let make = |target, generation, issued, expires| {
+            SignedConfigEnvelope::sign(
+                &signing,
+                "test",
+                target,
+                generation,
+                issued,
+                expires,
+                b"{}".to_vec(),
+            )
+        };
+        let response_for = |envelope: &SignedConfigEnvelope| DesiredStateResponse {
+            generation: envelope.generation.to_string(),
+            content_hash: envelope.content_hash.clone(),
+            generation_number: envelope.generation,
+            ..Default::default()
+        };
+        let mut bad_signature_and_future = make(node, 1, now + 120, now + 300);
+        bad_signature_and_future.signature[0] ^= 1;
+        assert_eq!(
+            validate_envelope(
+                &bad_signature_and_future,
+                &response_for(&bad_signature_and_future),
+                &node.to_string(),
+                Some(&key),
+                now
+            ),
+            Some("signature_invalid")
+        );
+        let mut bad_hash_and_signature = make(node, 1, now, now + 300);
+        bad_hash_and_signature.content_hash = "wrong".into();
+        bad_hash_and_signature.signature[0] ^= 1;
+        assert_eq!(
+            validate_envelope(
+                &bad_hash_and_signature,
+                &response_for(&bad_hash_and_signature),
+                &node.to_string(),
+                Some(&key),
+                now
+            ),
+            Some("content_hash_mismatch")
+        );
+        let expired_wrong_target = make(uuid::Uuid::from_u128(99), 2, now - 300, now - 120);
+        let mut expired_response = response_for(&expired_wrong_target);
+        expired_response.generation = "1".into();
+        assert_eq!(
+            validate_envelope(
+                &expired_wrong_target,
+                &expired_response,
+                &node.to_string(),
+                Some(&key),
+                now
+            ),
+            Some("envelope_expired")
+        );
+        let future_wrong_generation = make(node, 2, now + 120, now + 300);
+        let mut future_response = response_for(&future_wrong_generation);
+        future_response.generation = "1".into();
+        assert_eq!(
+            validate_envelope(
+                &future_wrong_generation,
+                &future_response,
+                &node.to_string(),
+                Some(&key),
+                now
+            ),
+            Some("envelope_not_yet_valid")
+        );
+        let generation_mismatch = make(node, 1, now, now + 300);
+        let mut generation_response = response_for(&generation_mismatch);
+        generation_response.generation = "2".into();
+        assert_eq!(
+            validate_envelope(
+                &generation_mismatch,
+                &generation_response,
+                &node.to_string(),
+                Some(&key),
+                now
+            ),
+            Some("generation_mismatch")
+        );
+        let mut invalid_len = make(node, 1, now, now + 300);
+        invalid_len.signature.clear();
+        assert_eq!(
+            validate_envelope(
+                &invalid_len,
+                &response_for(&invalid_len),
+                &node.to_string(),
+                Some(&key),
+                now
+            ),
+            Some("invalid_envelope")
+        );
+        let future_30 = make(node, 1, now + 30, now + 300);
+        assert_eq!(
+            validate_envelope(
+                &future_30,
+                &response_for(&future_30),
+                &node.to_string(),
+                Some(&key),
+                now
+            ),
+            None
+        );
+        let expiring_30 = make(node, 1, now - 300, now - 30);
+        assert_eq!(
+            validate_envelope(
+                &expiring_30,
+                &response_for(&expiring_30),
+                &node.to_string(),
+                Some(&key),
+                now
+            ),
+            None
+        );
+        let future_120 = make(node, 1, now + 120, now + 300);
+        assert_eq!(
+            validate_envelope(
+                &future_120,
+                &response_for(&future_120),
+                &node.to_string(),
+                Some(&key),
+                now
+            ),
+            Some("envelope_not_yet_valid")
+        );
+        let mut response_hash_mismatch = response_for(&future_30);
+        response_hash_mismatch.content_hash = "different-response-hash".into();
+        assert_eq!(
+            validate_envelope(
+                &future_30,
+                &response_hash_mismatch,
+                &node.to_string(),
+                Some(&key),
+                now
+            ),
+            Some("content_hash_mismatch")
+        );
+        let target_and_generation_mismatch = make(uuid::Uuid::from_u128(99), 2, now, now + 300);
+        let mut target_response = response_for(&target_and_generation_mismatch);
+        target_response.generation = "1".into();
+        assert_eq!(
+            validate_envelope(
+                &target_and_generation_mismatch,
+                &target_response,
+                &node.to_string(),
+                Some(&key),
+                now
+            ),
+            Some("target_mismatch")
+        );
+        let expiring_120 = make(node, 1, now - 300, now - 120);
+        assert_eq!(
+            validate_envelope(
+                &expiring_120,
+                &response_for(&expiring_120),
+                &node.to_string(),
+                Some(&key),
+                now
+            ),
+            Some("envelope_expired")
+        );
+    }
+
+    #[test]
+    fn release_manifest_validation_rejects_missing_integrity_fields() {
+        let manifest = ReleaseManifestResponse {
+            version: "0.2.0".into(),
+            artifact_url: "https://example.invalid/agent".into(),
+            sha256: "bad".into(),
+            signature: String::new(),
+            signing_key_id: String::new(),
+            mandatory: false,
+        };
+        assert!(validate_release_manifest(&manifest).is_err());
+    }
+
+    fn desired_response(
+        envelope: &SignedConfigEnvelope,
+        expected_previous_hash: &str,
+    ) -> DesiredStateResponse {
+        DesiredStateResponse {
+            generation: envelope.generation.to_string(),
+            signed_config: serde_json::to_vec(envelope).unwrap(),
+            content_hash: envelope.content_hash.clone(),
+            generation_number: envelope.generation,
+            expected_previous_hash: expected_previous_hash.into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn generation_decisions_and_rejected_outcome_revalidation() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = uuid::Uuid::from_u128(55);
+        let signing = SigningKey::generate(&mut OsRng);
+        let key = signing.verifying_key();
+        let now = unix_now();
+        let mut core = runtime::CoreSupervisor::new(
+            fake_core(dir.path()),
+            dir.path().join("config.json"),
+            Duration::from_millis(20),
+        )
+        .await;
+        core.initialize().await.unwrap();
+        let first = b"generation-one".to_vec();
+        let first_envelope = SignedConfigEnvelope::sign(
+            &signing,
+            "test",
+            node,
+            1,
+            now - 1,
+            now + 300,
+            first.clone(),
+        );
+        assert_eq!(
+            core.apply(&first, 1, &hex_hash(&first)).await.phase,
+            "applied"
+        );
+        let mut transport = FakeTransport {
+            desired: desired_response(&first_envelope, ""),
+            heartbeats: Vec::new(),
+            reports: Vec::new(),
+            fail_first_report: false,
+        };
+        let node_id = node.to_string();
+        let context = ReconcileContext {
+            node_id: &node_id,
+            agent_id: "agent",
+            public_key: "pub",
+            core_versions: &[],
+            trusted_key: Some(&key),
+        };
+        let mut state = ReconcileState::default();
+        reconcile_once(&mut transport, &mut core, &context, &mut state)
+            .await
+            .unwrap();
+        assert!(
+            transport.reports.is_empty(),
+            "equal generation and hash is a no-op"
+        );
+
+        let conflict_payload = b"different-hash".to_vec();
+        let conflict = SignedConfigEnvelope::sign(
+            &signing,
+            "test",
+            node,
+            1,
+            now - 1,
+            now + 300,
+            conflict_payload,
+        );
+        transport.desired = desired_response(&conflict, "");
+        reconcile_once(&mut transport, &mut core, &context, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            transport.reports.last().unwrap().error_code,
+            "generation_conflict"
+        );
+        let count = transport.reports.len();
+        reconcile_once(&mut transport, &mut core, &context, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            transport.reports.len(),
+            count,
+            "same rejection code is reported once"
+        );
+
+        let stale = SignedConfigEnvelope::sign(
+            &signing,
+            "test",
+            node,
+            0,
+            now - 1,
+            now + 300,
+            b"stale".to_vec(),
+        );
+        transport.desired = desired_response(&stale, "");
+        reconcile_once(&mut transport, &mut core, &context, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            transport.reports.last().unwrap().error_code,
+            "stale_generation"
+        );
+
+        let second_payload = b"generation-two".to_vec();
+        let second = SignedConfigEnvelope::sign(
+            &signing,
+            "test",
+            node,
+            2,
+            now - 1,
+            now + 300,
+            second_payload.clone(),
+        );
+        transport.desired = desired_response(&second, "some-other-previous-hash");
+        reconcile_once(&mut transport, &mut core, &context, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(transport.reports.last().unwrap().phase, "applied");
+        assert!(!transport.reports.last().unwrap().compare_and_swap_ok);
+
+        let third_payload = b"generation-three".to_vec();
+        let mut invalid = SignedConfigEnvelope::sign(
+            &signing,
+            "test",
+            node,
+            3,
+            now - 1,
+            now + 300,
+            third_payload.clone(),
+        );
+        invalid.signature[0] ^= 1;
+        transport.desired = desired_response(&invalid, "");
+        reconcile_once(&mut transport, &mut core, &context, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            transport.reports.last().unwrap().error_code,
+            "signature_invalid"
+        );
+        let report_count = transport.reports.len();
+        let future = SignedConfigEnvelope::sign(
+            &signing,
+            "test",
+            node,
+            3,
+            now + 120,
+            now + 300,
+            third_payload.clone(),
+        );
+        transport.desired = desired_response(&future, "");
+        reconcile_once(&mut transport, &mut core, &context, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            transport.reports.last().unwrap().error_code,
+            "envelope_not_yet_valid"
+        );
+        let after_distinct_rejection = transport.reports.len();
+        reconcile_once(&mut transport, &mut core, &context, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(transport.reports.len(), after_distinct_rejection);
+        assert_eq!(after_distinct_rejection, report_count + 1);
+        let corrected = SignedConfigEnvelope::sign(
+            &signing,
+            "test",
+            node,
+            3,
+            now - 1,
+            now + 300,
+            third_payload.clone(),
+        );
+        transport.desired = desired_response(&corrected, "");
+        reconcile_once(&mut transport, &mut core, &context, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(transport.reports.len(), report_count + 2);
+        assert_eq!(transport.reports.last().unwrap().phase, "applied");
+        assert_eq!(core.state().generation, 3);
+        core.shutdown().await;
+    }
+
     #[tokio::test]
     async fn reports_once_and_retries_delivery_with_applied_heartbeat() {
         let dir = tempfile::tempdir().unwrap();
@@ -635,41 +1194,27 @@ mod reconciliation_tests {
         core.initialize().await.unwrap();
         let node_id = node.to_string();
         let key = signing.verifying_key();
-        let mut pending = HashMap::new();
-        let mut terminal = HashSet::new();
-        reconcile_once(
-            &mut transport,
-            &mut core,
-            Some(&key),
-            &node_id,
-            "agent",
-            "pub",
-            &[],
-            &mut pending,
-            &mut terminal,
-        )
-        .await
-        .unwrap();
+        let mut state = ReconcileState::default();
+        let context = ReconcileContext {
+            node_id: &node_id,
+            agent_id: "agent",
+            public_key: "pub",
+            core_versions: &[],
+            trusted_key: Some(&key),
+        };
+        reconcile_once(&mut transport, &mut core, &context, &mut state)
+            .await
+            .unwrap();
         assert_eq!(core.state().generation, 1);
         assert_eq!(transport.reports.len(), 1);
         assert_eq!(transport.reports[0].phase, "applied");
-        reconcile_once(
-            &mut transport,
-            &mut core,
-            Some(&key),
-            &node_id,
-            "agent",
-            "pub",
-            &[],
-            &mut pending,
-            &mut terminal,
-        )
-        .await
-        .unwrap();
+        reconcile_once(&mut transport, &mut core, &context, &mut state)
+            .await
+            .unwrap();
         assert_eq!(transport.heartbeats[1].current_config_revision, "1");
         assert_eq!(transport.reports.len(), 2);
-        assert_eq!(transport.reports[1].retry_count, 1);
-        assert!(pending.is_empty());
+        assert_eq!(transport.reports[1].retry_count, 0);
+        assert!(state.pending.is_empty());
         core.shutdown().await;
     }
 }

@@ -63,24 +63,42 @@ impl CoreSupervisor {
         ensure_parent(&self.config)?;
         let state_path = self.state_path();
         let restored = if self.config.exists() && state_path.exists() {
-            let state: AppliedState = serde_json::from_slice(&fs::read(&state_path)?)?;
-            if file_hash(&self.config)? == state.content_hash {
-                self.state = state;
-                true
-            } else {
-                false
+            match (fs::read(&state_path), file_hash(&self.config)) {
+                (Ok(bytes), Ok(config_hash)) => {
+                    match serde_json::from_slice::<AppliedState>(&bytes) {
+                        Ok(state) if config_hash == state.content_hash => {
+                            self.state = state;
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
             }
         } else {
             false
         };
         if restored {
-            self.start().await?;
-            if !self.health_check().await {
+            if let Err(error) = self.start().await {
+                self.core_state = "crashed";
+                warn!(%error, "could not start sing-box from persisted config; supervision will retry");
+            } else if !self.health_check().await {
                 warn!("persisted core config failed startup health check");
             }
         } else if self.config.exists() || state_path.exists() {
-            warn!(config = %self.config.display(), "local config/state mismatch; treating applied generation as empty");
+            warn!(config = %self.config.display(), "local config/state mismatch; moving unverified config aside");
+            if self.config.exists() {
+                let unverified = self.unverified_path();
+                if let Err(error) = fs::rename(&self.config, &unverified) {
+                    warn!(%error, path = %unverified.display(), "could not move unverified config");
+                } else if let Err(error) = set_private(&unverified) {
+                    warn!(%error, path = %unverified.display(), "could not restrict unverified config permissions");
+                }
+            }
             self.state = AppliedState::default();
+            if let Err(error) = self.write_state(&self.state) {
+                warn!(%error, "could not persist empty local applied state");
+            }
         }
         Ok(())
     }
@@ -100,6 +118,9 @@ impl CoreSupervisor {
     pub fn previous_path(&self) -> PathBuf {
         PathBuf::from(format!("{}.previous", self.config.display()))
     }
+    pub fn unverified_path(&self) -> PathBuf {
+        PathBuf::from(format!("{}.unverified", self.config.display()))
+    }
 
     pub async fn check_version(&self) -> Option<String> {
         let output = timeout(
@@ -107,6 +128,7 @@ impl CoreSupervisor {
             Command::new(&self.binary)
                 .arg("version")
                 .stdin(Stdio::null())
+                .kill_on_drop(true)
                 .output(),
         )
         .await
@@ -157,6 +179,7 @@ impl CoreSupervisor {
                 .arg("-c")
                 .arg(&temp)
                 .stdin(Stdio::null())
+                .kill_on_drop(true)
                 .status(),
         )
         .await;
@@ -165,8 +188,13 @@ impl CoreSupervisor {
             return fail("core_check_failed", "core config check failed", old_state);
         }
         let previous = self.previous_path();
-        if self.config.exists() {
+        if self.state.generation > 0 && self.config.exists() {
             if let Err(error) = copy_private_sync(&self.config, &previous) {
+                let _ = fs::remove_file(&temp);
+                return fail("install_failed", &error.to_string(), old_state);
+            }
+        } else if previous.exists() {
+            if let Err(error) = fs::remove_file(&previous) {
                 let _ = fs::remove_file(&temp);
                 return fail("install_failed", &error.to_string(), old_state);
             }
@@ -186,18 +214,19 @@ impl CoreSupervisor {
             let _ = self.start().await;
         }
         if self.health_check().await {
-            self.state = AppliedState {
+            let new_state = AppliedState {
                 generation,
                 content_hash: content_hash.into(),
             };
-            if let Err(error) = self.write_state() {
+            if let Err(error) = self.write_state(&new_state) {
                 return fail("install_failed", &error.to_string(), old_state);
             }
+            self.state = new_state.clone();
             return ApplyOutcome {
                 phase: "applied",
                 error_code: String::new(),
                 error_message: String::new(),
-                state: self.state.clone(),
+                state: new_state,
             };
         }
         if previous.exists() {
@@ -222,18 +251,26 @@ impl CoreSupervisor {
             }
             let _ = fs::remove_file(&self.config);
             let _ = self.stop().await;
+            self.state = AppliedState::default();
+            if let Err(error) = self.write_state(&self.state) {
+                warn!(%error, "could not persist empty state after rollback failure");
+            }
             return fail(
                 "rollback_failed",
                 "new config unhealthy and previous config could not be restored",
-                old_state,
+                self.state.clone(),
             );
         }
         let _ = fs::remove_file(&self.config);
         let _ = self.stop().await;
+        self.state = AppliedState::default();
+        if let Err(error) = self.write_state(&self.state) {
+            warn!(%error, "could not persist empty state after unhealthy config removal");
+        }
         fail(
             "health_check_failed",
             "new config unhealthy and no previous config exists",
-            old_state,
+            self.state.clone(),
         )
     }
 
@@ -252,12 +289,11 @@ impl CoreSupervisor {
         }
     }
 
-    pub async fn restart(&mut self) -> io::Result<bool> {
+    pub async fn restart(&mut self) -> io::Result<()> {
         if self.config.exists() && self.state.generation > 0 {
             self.start().await?;
-            return Ok(self.health_check().await);
         }
-        Ok(false)
+        Ok(())
     }
 
     pub async fn shutdown(&mut self) {
@@ -269,7 +305,7 @@ impl CoreSupervisor {
             return Ok(());
         }
         self.core_state = "starting";
-        let mut child = Command::new(&self.binary)
+        let mut child = match Command::new(&self.binary)
             .arg("run")
             .arg("-c")
             .arg(&self.config)
@@ -277,7 +313,14 @@ impl CoreSupervisor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .spawn()?;
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                self.core_state = "crashed";
+                return Err(error);
+            }
+        };
         if let Some(stdout) = child.stdout.take() {
             tokio::spawn(log_lines(stdout, false));
         }
@@ -340,8 +383,8 @@ impl CoreSupervisor {
         Ok(())
     }
 
-    fn write_state(&self) -> io::Result<()> {
-        let data = serde_json::to_vec(&self.state).map_err(io::Error::other)?;
+    fn write_state(&self, state: &AppliedState) -> io::Result<()> {
+        let data = serde_json::to_vec(state).map_err(io::Error::other)?;
         atomic_private_write(&self.state_path(), &data)
     }
 }
@@ -450,7 +493,7 @@ pub fn disk_free_bytes(path: &Path) -> u64 {
 mod tests {
     use super::{AppliedState, CoreSupervisor};
     use sha2::{Digest, Sha256};
-    use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
 
     fn hash(bytes: &[u8]) -> String {
         Sha256::digest(bytes)
@@ -517,7 +560,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("sing-box.json");
         let mut supervisor =
-            CoreSupervisor::new(fake_core(dir.path()), &config, Duration::from_millis(80)).await;
+            CoreSupervisor::new(fake_core(dir.path()), &config, Duration::from_millis(350)).await;
         supervisor.initialize().await.unwrap();
         let first = b"{\"generation\":1}";
         assert_eq!(
@@ -539,7 +582,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("sing-box.json");
         let mut supervisor =
-            CoreSupervisor::new(fake_core(dir.path()), &config, Duration::from_millis(40)).await;
+            CoreSupervisor::new(fake_core(dir.path()), &config, Duration::from_millis(350)).await;
         supervisor.initialize().await.unwrap();
         let bad = b"crash_on_start";
         let outcome = supervisor.apply(bad, 1, &hash(bad)).await;
@@ -551,19 +594,130 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_failure_does_not_replace_config_or_state() {
+    async fn unverified_config_is_quarantined_and_never_becomes_rollback_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("sing-box.json");
+        fs::write(&config, b"unverified old config").unwrap();
+        fs::write(config.with_extension("state"), b"not-json").unwrap();
+        fs::write(
+            PathBuf::from(format!("{}.previous", config.display())),
+            b"stale backup",
+        )
+        .unwrap();
+        let mut supervisor =
+            CoreSupervisor::new(fake_core(dir.path()), &config, Duration::from_millis(350)).await;
+        supervisor.initialize().await.unwrap();
+        assert!(!config.exists());
+        assert_eq!(
+            fs::read(supervisor.unverified_path()).unwrap(),
+            b"unverified old config"
+        );
+        assert_eq!(supervisor.state(), &AppliedState::default());
+        let bad = b"crash_on_start";
+        let result = supervisor.apply(bad, 1, &hash(bad)).await;
+        assert_eq!(result.phase, "failed");
+        assert_eq!(result.state, AppliedState::default());
+        assert!(!config.exists());
+        assert!(!supervisor.previous_path().exists());
+        let persisted: AppliedState =
+            serde_json::from_slice(&fs::read(supervisor.state_path()).unwrap()).unwrap();
+        assert_eq!(persisted, AppliedState::default());
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_local_state_and_core_spawn_failure_do_not_abort_initialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("sing-box.json");
+        let bytes = b"persisted";
+        fs::write(&config, bytes).unwrap();
+        fs::write(
+            config.with_extension("state"),
+            serde_json::to_vec(&AppliedState {
+                generation: 7,
+                content_hash: hash(bytes),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut supervisor = CoreSupervisor::new(
+            dir.path().join("missing-core"),
+            &config,
+            Duration::from_millis(20),
+        )
+        .await;
+        supervisor.initialize().await.unwrap();
+        assert_eq!(supervisor.state().generation, 7);
+        assert_eq!(supervisor.core_state(), "crashed");
+    }
+
+    #[tokio::test]
+    async fn state_write_failure_does_not_advance_memory_state() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("sing-box.json");
         let mut supervisor =
             CoreSupervisor::new(fake_core(dir.path()), &config, Duration::from_millis(20)).await;
         supervisor.initialize().await.unwrap();
+        fs::create_dir(supervisor.state_path()).unwrap();
+        let bytes = b"valid config";
+        let result = supervisor.apply(bytes, 1, &hash(bytes)).await;
+        assert_eq!(result.phase, "failed");
+        assert_eq!(supervisor.state(), &AppliedState::default());
+        assert_eq!(result.state, AppliedState::default());
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rollback_failure_removes_config_and_resets_persisted_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("sing-box.json");
+        let binary = fake_core(dir.path());
+        let mut supervisor =
+            CoreSupervisor::new(&binary, &config, Duration::from_millis(350)).await;
+        supervisor.initialize().await.unwrap();
+        let prior = b"restore_unhealthy";
+        assert_eq!(
+            supervisor.apply(prior, 1, &hash(prior)).await.phase,
+            "applied"
+        );
+        fs::write(&binary, "#!/bin/sh\ncase \"$1\" in\ncheck) exit 0 ;;\nrun) trap 'grep -q crash_on_reload \"$3\" && exit 1' HUP; grep -q restore_unhealthy \"$3\" && exit 1; while :; do sleep 0.02; done ;;\nesac\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let bad = b"crash_on_reload";
+        let outcome = supervisor.apply(bad, 2, &hash(bad)).await;
+        assert_eq!(outcome.phase, "failed");
+        assert_eq!(outcome.error_code, "rollback_failed");
+        assert!(!config.exists());
+        assert_eq!(supervisor.state(), &AppliedState::default());
+        let persisted: AppliedState =
+            serde_json::from_slice(&fs::read(supervisor.state_path()).unwrap()).unwrap();
+        assert_eq!(persisted, AppliedState::default());
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn check_failure_leaves_verified_running_generation_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("sing-box.json");
+        let mut supervisor =
+            CoreSupervisor::new(fake_core(dir.path()), &config, Duration::from_millis(350)).await;
+        supervisor.initialize().await.unwrap();
+        let first = b"{\"generation\":1}";
+        assert_eq!(
+            supervisor.apply(first, 1, &hash(first)).await.phase,
+            "applied"
+        );
+        let previous_path = supervisor.previous_path();
+        fs::write(&previous_path, b"previous sentinel").unwrap();
+        let before_state = fs::read(supervisor.state_path()).unwrap();
         let rejected = supervisor
-            .apply(b"fail_check", 1, &hash(b"fail_check"))
+            .apply(b"fail_check", 2, &hash(b"fail_check"))
             .await;
         assert_eq!(rejected.phase, "failed");
         assert_eq!(rejected.error_code, "core_check_failed");
-        assert!(!config.exists());
-        assert_eq!(supervisor.state(), &AppliedState::default());
+        assert_eq!(fs::read(&config).unwrap(), first);
+        assert_eq!(fs::read(supervisor.state_path()).unwrap(), before_state);
+        assert_eq!(fs::read(previous_path).unwrap(), b"previous sentinel");
+        assert_eq!(supervisor.state().generation, 1);
         supervisor.shutdown().await;
     }
 }

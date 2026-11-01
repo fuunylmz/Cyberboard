@@ -247,6 +247,10 @@ impl SignedConfigEnvelope {
         if hex_hash(&self.payload) != self.content_hash {
             return Err(CompileError::ContentHashMismatch);
         }
+        let signature =
+            Signature::from_slice(&self.signature).map_err(|_| CompileError::InvalidEnvelope)?;
+        key.verify(&self.canonical_bytes(), &signature)
+            .map_err(|_| CompileError::SignatureMismatch)?;
         let skew = skew_secs.max(0);
         if self.issued_at > now.saturating_add(skew) {
             return Err(CompileError::EnvelopeNotYetValid);
@@ -254,10 +258,7 @@ impl SignedConfigEnvelope {
         if self.expires_at < self.issued_at || self.expires_at < now.saturating_sub(skew) {
             return Err(CompileError::EnvelopeExpired);
         }
-        if self.signature.len() != 64 {
-            return Err(CompileError::InvalidEnvelope);
-        }
-        self.verify_signature(key)
+        Ok(())
     }
 
     fn verify_signature(&self, key: &VerifyingKey) -> Result<(), CompileError> {

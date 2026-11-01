@@ -17,6 +17,8 @@ use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod admin_bootstrap;
+
 const CREATE_ORDER_SQL: &str = "INSERT INTO orders (tenant_id,user_id,plan_id,status,amount_cents,currency,idempotency_key) SELECT $1,$2,id,'pending',price_cents,currency,$4 FROM plans WHERE tenant_id=$1 AND id=$3 AND status='active' RETURNING id,status,amount_cents,currency,created_at::text AS created_at,paid_at::text AS paid_at, (SELECT name FROM plans WHERE tenant_id=$1 AND id=$3) AS plan";
 const CREATE_ORDER_IDEMPOTENT_SQL: &str = "INSERT INTO orders (tenant_id,user_id,plan_id,status,amount_cents,currency,provider,idempotency_key) SELECT $1,$2,id,'pending',price_cents,currency,'manual',$3 FROM plans WHERE tenant_id=$1 AND id=$4 AND status='active' RETURNING id,user_id,plan_id,status,amount_cents,currency,provider,provider_payment_id,paid_at::text AS paid_at";
 
@@ -41,6 +43,8 @@ pub enum DatabaseError {
     IdempotencyConflict,
     #[error("usage payload is invalid: {0}")]
     InvalidUsagePayload(String),
+    #[error("bootstrap admin email already belongs to an existing user")]
+    BootstrapAdminEmailConflict,
     #[error("device limit exceeded")]
     DeviceLimitExceeded,
 }
@@ -581,7 +585,7 @@ impl Database {
                 (SELECT count(*) FROM users WHERE tenant_id=$1 AND status <> 'deleted') AS users,
                 (SELECT count(*) FROM subscriptions WHERE tenant_id=$1 AND status='active' AND expires_at > now()) AS active_subscriptions,
                 (SELECT count(*) FROM nodes WHERE tenant_id=$1 AND status='online') AS online_nodes,
-                (SELECT COALESCE(sum(download_bytes + upload_bytes), 0) FROM usage_events WHERE tenant_id=$1 AND received_at >= now() - interval '24 hours') AS traffic_bytes_24h,
+                (SELECT COALESCE(sum(download_bytes + upload_bytes), 0)::bigint FROM usage_events WHERE tenant_id=$1 AND received_at >= now() - interval '24 hours') AS traffic_bytes_24h,
                 (SELECT count(*) FROM config_deployments WHERE tenant_id=$1 AND status='failed' AND updated_at >= now() - interval '24 hours') AS failed_tasks,
                 now()::text AS generated_at",
         )

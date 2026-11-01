@@ -29,6 +29,14 @@ pub enum ConfigError {
 
     #[error("invalid boolean for {field}: {value}")]
     InvalidBoolean { field: &'static str, value: String },
+
+    #[error(
+        "CYBERBOARD_BOOTSTRAP_ADMIN_EMAIL and CYBERBOARD_BOOTSTRAP_ADMIN_PASSWORD must be set together"
+    )]
+    IncompleteBootstrapAdmin,
+
+    #[error("CYBERBOARD_BOOTSTRAP_ADMIN_PASSWORD must contain at least 12 characters")]
+    ShortBootstrapAdminPassword,
 }
 
 fn optional_env(name: &str) -> Option<String> {
@@ -70,6 +78,20 @@ fn env_bind_addr() -> String {
     optional_env("CYBERBOARD_BIND_ADDR").unwrap_or_else(|| "0.0.0.0".to_owned())
 }
 
+fn bootstrap_admin_from_values(
+    email: Option<String>,
+    password: Option<String>,
+) -> Result<(Option<String>, Option<String>), ConfigError> {
+    match (email, password) {
+        (None, None) => Ok((None, None)),
+        (Some(email), Some(password)) if password.chars().count() >= 12 => {
+            Ok((Some(email), Some(password)))
+        }
+        (Some(_), Some(_)) => Err(ConfigError::ShortBootstrapAdminPassword),
+        _ => Err(ConfigError::IncompleteBootstrapAdmin),
+    }
+}
+
 #[derive(Clone)]
 pub struct ApiConfig {
     pub bind_addr: String,
@@ -84,12 +106,17 @@ pub struct ApiConfig {
     pub demo_admin_password: String,
     pub demo_user_email: String,
     pub demo_user_password: String,
+    pub bootstrap_admin: Option<(String, String)>,
     pub dev_mode: bool,
     pub tenant_id: Uuid,
 }
 
 impl ApiConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
+        let (bootstrap_admin_email, bootstrap_admin_password) = bootstrap_admin_from_values(
+            optional_env("CYBERBOARD_BOOTSTRAP_ADMIN_EMAIL"),
+            optional_env("CYBERBOARD_BOOTSTRAP_ADMIN_PASSWORD"),
+        )?;
         Ok(Self {
             bind_addr: env_bind_addr(),
             port: env_u16("CYBERBOARD_API_PORT", 8080)?,
@@ -108,6 +135,7 @@ impl ApiConfig {
                 .unwrap_or_else(|| "lin@example.com".to_owned()),
             demo_user_password: optional_env("CYBERBOARD_DEMO_USER_PASSWORD")
                 .unwrap_or_else(|| "password".to_owned()),
+            bootstrap_admin: bootstrap_admin_email.zip(bootstrap_admin_password),
             dev_mode: env_bool("CYBERBOARD_DEV_MODE", false)?,
             tenant_id: optional_env("CYBERBOARD_TENANT_ID")
                 .map(|value| Uuid::parse_str(&value))
@@ -180,5 +208,59 @@ impl AgentConfig {
                 .unwrap_or_else(|| "/var/lib/cyberboard/agent-identity.json".to_owned()),
             insecure: env_bool("CYBERBOARD_AGENT_INSECURE", false)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfigError, bootstrap_admin_from_values};
+
+    #[test]
+    fn bootstrap_admin_accepts_both_or_neither_values() {
+        assert_eq!(
+            bootstrap_admin_from_values(None, None).unwrap(),
+            (None, None)
+        );
+        assert_eq!(
+            bootstrap_admin_from_values(
+                Some("admin@example.com".to_owned()),
+                Some("long-enough-password".to_owned())
+            )
+            .unwrap(),
+            (
+                Some("admin@example.com".to_owned()),
+                Some("long-enough-password".to_owned())
+            )
+        );
+    }
+
+    #[test]
+    fn bootstrap_admin_rejects_only_one_value() {
+        assert!(matches!(
+            bootstrap_admin_from_values(Some("admin@example.com".to_owned()), None),
+            Err(ConfigError::IncompleteBootstrapAdmin)
+        ));
+        assert!(matches!(
+            bootstrap_admin_from_values(None, Some("long-enough-password".to_owned())),
+            Err(ConfigError::IncompleteBootstrapAdmin)
+        ));
+    }
+
+    #[test]
+    fn bootstrap_admin_counts_password_characters() {
+        assert!(matches!(
+            bootstrap_admin_from_values(
+                Some("admin@example.com".to_owned()),
+                Some("abcdefghijk".to_owned())
+            ),
+            Err(ConfigError::ShortBootstrapAdminPassword)
+        ));
+        assert!(
+            bootstrap_admin_from_values(
+                Some("admin@example.com".to_owned()),
+                Some("密码密码密码密码密码密码".to_owned())
+            )
+            .is_ok()
+        );
     }
 }

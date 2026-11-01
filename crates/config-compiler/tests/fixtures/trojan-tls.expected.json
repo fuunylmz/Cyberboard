@@ -1,0 +1,25 @@
+{
+  "log": { "level": "info", "timestamp": true },
+  "inbounds": [
+    {
+      "type": "trojan",
+      "tag": "trojan-tls-in",
+      "listen": "::",
+      "listen_port": 8443,
+      "users": [{ "name": "bob", "password": "test-password" }],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/etc/cyberboard/tls/trojan.pem",
+        "key_path": "/etc/cyberboard/tls/trojan-key.pem"
+      }
+    }
+  ],
+  "outbounds": [{ "type": "block", "tag": "block" }],
+  "route": { "final": "block" },
+  "experimental": {
+    "v2ray_api": {
+      "listen": "127.0.0.1:10085",
+      "stats": { "enabled": true, "users": ["bob"] }
+    }
+  }
+}

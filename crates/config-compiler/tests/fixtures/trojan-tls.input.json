@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "node_id": "00000000-0000-0000-0000-000000000005",
+  "generation": 3,
+  "inbounds": [
+    {
+      "tag": "trojan-tls-in",
+      "listen": "::",
+      "listen_port": 8443,
+      "type": "trojan",
+      "method": null,
+      "transport": "Tcp",
+      "tls": {
+        "enabled": true,
+        "server_name": null,
+        "certificate_path": "/etc/cyberboard/tls/trojan.pem",
+        "key_path": "/etc/cyberboard/tls/trojan-key.pem"
+      },
+      "credential": {
+        "Users": {
+          "users": [
+            { "name": "bob", "uuid": null, "password": "test-password", "alter_id": null }
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [{ "type": "block", "tag": "block", "method": null, "credential": "None" }],
+  "route": { "final_tag": "block" },
+  "experimental": null
+}

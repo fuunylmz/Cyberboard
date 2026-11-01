@@ -12,6 +12,14 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod adapters;
+use adapters::singbox::SingBoxAdapter;
+
+/// Compile a shared profile into its sing-box JSON representation.
+pub fn compile_config(profile: &ConfigProfile) -> Result<Value, CompileError> {
+    SingBoxAdapter.render_json(profile)
+}
+
 #[derive(Debug, Error)]
 pub enum CompileError {
     #[error("profile must contain at least one inbound")]
@@ -36,6 +44,10 @@ pub enum CompileError {
     UnsupportedOutbound(String),
     #[error("outbound credential fields are invalid for protocol {0}")]
     InvalidOutboundCredential(String),
+    #[error("invalid rendered sing-box configuration")]
+    InvalidRenderedConfig,
+    #[error("sing-box validation failed: {0}")]
+    SingBoxCheckFailed(String),
     #[error("invalid signed envelope")]
     InvalidEnvelope,
     #[error("signature verification failed")]
@@ -180,6 +192,10 @@ impl ConfigProfile {
     }
 
     pub fn render_sing_box(&self) -> Result<Value, CompileError> {
+        SingBoxAdapter.render_json(self)
+    }
+
+    pub(crate) fn render_sing_box_value(&self) -> Result<Value, CompileError> {
         self.validate()?;
         let inbounds = self
             .inbounds
@@ -195,7 +211,7 @@ impl ConfigProfile {
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut rendered = json!({
-            "log": {"level": "info"},
+            "log": {"level": "info", "timestamp": true},
             "inbounds": inbounds,
             "outbounds": outbounds,
             "route": {"final": self.route.final_tag.clone().unwrap_or_else(|| "direct".to_owned())}
@@ -390,12 +406,11 @@ fn render_inbound(inbound: &Inbound) -> Result<Value, CompileError> {
     }
     if let Some(tls) = &inbound.tls {
         if tls.enabled {
-            value["tls"] = json!({
-                "enabled": true,
-                "server_name": tls.server_name,
-                "certificate_path": tls.certificate_path,
-                "key_path": tls.key_path,
-            });
+            value["tls"] = adapters::singbox::tls_value(
+                &tls.server_name,
+                &tls.certificate_path,
+                &tls.key_path,
+            );
         }
     }
     match &inbound.credential {
@@ -412,14 +427,14 @@ fn render_inbound(inbound: &Inbound) -> Result<Value, CompileError> {
         Credential::Uuid { uuid } => match inbound.inbound_type.as_str() {
             "vless" => value["users"] = json!([{"name": uuid.to_string(), "uuid": uuid}]),
             "vmess" => {
-                value["users"] = json!([{"name": uuid.to_string(), "uuid": uuid, "alterId": 0}])
+                value["users"] = json!([{"name": uuid.to_string(), "uuid": uuid, "alter_id": 0}])
             }
             protocol => return Err(CompileError::InvalidInboundCredential(protocol.to_owned())),
         },
         Credential::Users { users } => {
             value["users"] = match inbound.inbound_type.as_str() {
                 "vless" => json!(users.iter().map(|user| json!({"name": user.name, "uuid": user.uuid})).collect::<Vec<_>>()),
-                "vmess" => json!(users.iter().map(|user| json!({"name": user.name, "uuid": user.uuid, "alterId": user.alter_id.unwrap_or(0)})).collect::<Vec<_>>()),
+                "vmess" => json!(users.iter().map(|user| json!({"name": user.name, "uuid": user.uuid, "alter_id": user.alter_id.unwrap_or(0)})).collect::<Vec<_>>()),
                 "trojan" | "shadowsocks" => json!(users.iter().map(|user| json!({"name": user.name, "password": user.password})).collect::<Vec<_>>()),
                 "mixed" => json!(users.iter().map(|user| json!({"username": user.name, "password": user.password})).collect::<Vec<_>>()),
                 protocol => return Err(CompileError::InvalidInboundCredential(protocol.to_owned())),
@@ -742,7 +757,7 @@ mod tests {
                 );
             }
             if protocol == "vmess" {
-                assert_eq!(rendered["inbounds"][0]["users"][0]["alterId"], 0);
+                assert_eq!(rendered["inbounds"][0]["users"][0]["alter_id"], 0);
             }
             check_with_sing_box(&rendered);
         }

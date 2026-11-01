@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "node_id": "00000000-0000-0000-0000-000000000001",
+  "generation": 1,
+  "inbounds": [
+    {
+      "tag": "vless-tls-in",
+      "listen": "0.0.0.0",
+      "listen_port": 443,
+      "type": "vless",
+      "method": null,
+      "transport": "Tcp",
+      "tls": {
+        "enabled": true,
+        "server_name": null,
+        "certificate_path": "/etc/cyberboard/tls/fullchain.pem",
+        "key_path": "/etc/cyberboard/tls/privkey.pem"
+      },
+      "credential": { "Uuid": { "uuid": "00000000-0000-0000-0000-000000000002" } }
+    }
+  ],
+  "outbounds": [],
+  "route": { "final_tag": null },
+  "experimental": null
+}

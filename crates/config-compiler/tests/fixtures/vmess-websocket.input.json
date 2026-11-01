@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "node_id": "00000000-0000-0000-0000-000000000003",
+  "generation": 2,
+  "inbounds": [
+    {
+      "tag": "vmess-ws-in",
+      "listen": "0.0.0.0",
+      "listen_port": 8080,
+      "type": "vmess",
+      "method": null,
+      "transport": { "Websocket": { "path": "/vmess" } },
+      "tls": null,
+      "credential": {
+        "Users": {
+          "users": [
+            { "name": "alice", "uuid": "00000000-0000-0000-0000-000000000004", "password": null, "alter_id": 0 }
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [],
+  "route": { "final_tag": null },
+  "experimental": null
+}

@@ -98,7 +98,7 @@ impl CoreSupervisor {
         self.config.with_extension("state")
     }
     pub fn previous_path(&self) -> PathBuf {
-        self.config.with_extension("previous")
+        PathBuf::from(format!("{}.previous", self.config.display()))
     }
 
     pub async fn check_version(&self) -> Option<String> {
